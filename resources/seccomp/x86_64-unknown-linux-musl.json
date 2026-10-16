@@ -815,6 +815,18 @@
                         "comment": "Ensure PROT_EXEC is not set"
                     }
                 ]
+            },
+            {
+                "syscall": "pread64",
+                "comment": "Reads the statistic blocking of the vCPUs for the checkpoints by need"
+            },
+            {
+                "syscall": "poll",
+                "comment": "The loop of a stopped guest waits for an API request or an event of the checkpoint loop"
+            },
+            {
+                "syscall": "shutdown",
+                "comment": "Ends the stream of the checkpoints, and a line of the hook that waits, at the end of the mode"
             }
         ]
     },
@@ -1606,6 +1618,381 @@
                         "comment": "libc::MADV_POPULATE_WRITE"
                     }
                 ]
+            },
+            {
+                "syscall": "madvise",
+                "comment": "Triggered by musl when it frees memory",
+                "args": [
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 4,
+                        "comment": "libc::MADV_DONTNEED"
+                    }
+                ]
+            },
+            {
+                "syscall": "futex",
+                "comment": "Used for synchronization (the channel of the fill and the lock of its status)",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 128,
+                        "comment": "FUTEX_WAIT_PRIVATE"
+                    }
+                ]
+            },
+            {
+                "syscall": "futex",
+                "comment": "Used for synchronization",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 137,
+                        "comment": "FUTEX_WAIT_BITSET_PRIVATE"
+                    }
+                ]
+            },
+            {
+                "syscall": "futex",
+                "comment": "Used for synchronization",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 129,
+                        "comment": "FUTEX_WAKE_PRIVATE"
+                    }
+                ]
+            },
+            {
+                "syscall": "futex",
+                "comment": "Used for synchronization (during thread teardown)",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 0,
+                        "comment": "FUTEX_WAIT"
+                    }
+                ]
+            },
+            {
+                "syscall": "futex",
+                "comment": "Used for synchronization (during thread teardown)",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1,
+                        "comment": "FUTEX_WAKE"
+                    }
+                ]
+            },
+            {
+                "syscall": "sched_yield",
+                "comment": "Used by the rust standard library in std::sync::mpmc"
+            },
+            {
+                "syscall": "brk",
+                "comment": "Called for expanding the heap"
+            },
+            {
+                "syscall": "mmap",
+                "comment": "Used by the allocator for large buffers",
+                "args": [
+                    {
+                        "index": 3,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 34,
+                        "comment": "libc::MAP_ANONYMOUS | libc::MAP_PRIVATE"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {
+                            "masked_eq": 4
+                        },
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
+                    }
+                ]
+            },
+            {
+                "syscall": "mremap",
+                "comment": "Used for re-allocating large memory regions"
+            },
+            {
+                "syscall": "munmap",
+                "comment": "Used for freeing memory"
+            },
+            {
+                "syscall": "write",
+                "comment": "Used by the logger"
+            },
+            {
+                "syscall": "clock_gettime",
+                "comment": "Used by the logger. It's not called on some platforms, because of vdso optimisations."
+            },
+            {
+                "syscall": "gettid",
+                "comment": "Rust std uses it during panic to print the thread id."
+            },
+            {
+                "syscall": "rt_sigprocmask",
+                "comment": "Used by Rust stdlib during thread teardown."
+            },
+            {
+                "syscall": "sigaltstack",
+                "comment": "Used by Rust stdlib to remove alternative signal stack during thread teardown."
+            },
+            {
+                "syscall": "rt_sigreturn"
+            },
+            {
+                "syscall": "exit",
+                "comment": "The thread ends when the Vmm is dropped"
+            },
+            {
+                "syscall": "exit_group"
+            },
+            {
+                "syscall": "restart_syscall",
+                "comment": "automatically issued by the kernel when specific timing-related syscalls get interrupted by SIGSTOP"
+            },
+            {
+                "syscall": "rt_sigaction",
+                "comment": "rt_sigaction is used by libc::abort during a panic to install the default handler for SIGABRT",
+                "args": [
+                    {
+                        "index": 0,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 6,
+                        "comment": "SIGABRT"
+                    }
+                ]
+            },
+            {
+                "syscall": "tkill",
+                "comment": "tkill is used by libc::abort during a panic to raise SIGABRT",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 6,
+                        "comment": "SIGABRT"
+                    }
+                ]
+            }
+        ]
+    },
+    "checkpoint": {
+        "default_action": "trap",
+        "filter_action": "allow",
+        "filter": [
+            {
+                "syscall": "socket",
+                "comment": "Opens the stream of the checkpoints",
+                "args": [
+                    {
+                        "index": 0,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 2,
+                        "comment": "libc::AF_INET"
+                    },
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 524289,
+                        "comment": "libc::SOCK_STREAM | libc::SOCK_CLOEXEC"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 0
+                    }
+                ]
+            },
+            {
+                "syscall": "socket",
+                "comment": "Opens the socket of the signal of the checkpoints",
+                "args": [
+                    {
+                        "index": 0,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 2,
+                        "comment": "libc::AF_INET"
+                    },
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 524290,
+                        "comment": "libc::SOCK_DGRAM | libc::SOCK_CLOEXEC"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 0
+                    }
+                ]
+            },
+            {
+                "syscall": "socket",
+                "comment": "Opens the stream of the checkpoints",
+                "args": [
+                    {
+                        "index": 0,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 10,
+                        "comment": "libc::AF_INET6"
+                    },
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 524289,
+                        "comment": "libc::SOCK_STREAM | libc::SOCK_CLOEXEC"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 0
+                    }
+                ]
+            },
+            {
+                "syscall": "socket",
+                "comment": "Opens the socket of the signal of the checkpoints",
+                "args": [
+                    {
+                        "index": 0,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 10,
+                        "comment": "libc::AF_INET6"
+                    },
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 524290,
+                        "comment": "libc::SOCK_DGRAM | libc::SOCK_CLOEXEC"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 0
+                    }
+                ]
+            },
+            {
+                "syscall": "connect",
+                "comment": "Connects the stream and the signal to the receiving place"
+            },
+            {
+                "syscall": "bind",
+                "comment": "Binds the signal to the address of the stream"
+            },
+            {
+                "syscall": "getsockname",
+                "comment": "The address of the stream, for the signal"
+            },
+            {
+                "syscall": "getpeername",
+                "comment": "The receiving place, for the signal"
+            },
+            {
+                "syscall": "setsockopt",
+                "comment": "The stream is sent with no delay",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 6,
+                        "comment": "libc::IPPROTO_TCP"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1,
+                        "comment": "libc::TCP_NODELAY"
+                    }
+                ]
+            },
+            {
+                "syscall": "getsockopt",
+                "comment": "The result of a connect with a limit",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1,
+                        "comment": "libc::SOL_SOCKET"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 4,
+                        "comment": "libc::SO_ERROR"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "A connect with a limit makes the socket nonblocking for its time",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 21537,
+                        "comment": "FIONBIO"
+                    }
+                ]
+            },
+            {
+                "syscall": "poll",
+                "comment": "Waits for an answer, an echo or the wake of the signal"
+            },
+            {
+                "syscall": "sendto",
+                "comment": "Sends the stream, the signal and the lines of the hook"
+            },
+            {
+                "syscall": "recvfrom",
+                "comment": "Reads the echoes of the signal"
+            },
+            {
+                "syscall": "read",
+                "comment": "Reads the answers, the lines of the hook and the eventfds"
+            },
+            {
+                "syscall": "close",
+                "comment": "Closes the stream, the signal and the hook"
             },
             {
                 "syscall": "madvise",

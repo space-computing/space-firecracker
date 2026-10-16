@@ -15,6 +15,7 @@ use super::resources::VmResources;
 use super::{Vmm, VmmError};
 use crate::EventManager;
 use crate::builder::StartMicrovmError;
+use crate::checkpoint::CheckpointError;
 use crate::cpu_config::templates::{CustomCpuTemplate, GuestConfigError};
 use crate::device_manager::pci_mngr::PciManagerError;
 use crate::devices::virtio::balloon::device::{HintingStatus, StartHintingCmd};
@@ -31,6 +32,9 @@ use crate::vmm_config::balloon::{
     BalloonUpdateStatsConfig,
 };
 use crate::vmm_config::boot_source::{BootSourceConfig, BootSourceConfigError};
+use crate::vmm_config::checkpoint::{
+    CheckpointFinish, CheckpointInfo, CheckpointSetParams, CheckpointTrackParams,
+};
 use crate::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig, DriveError};
 use crate::vmm_config::entropy::{EntropyDeviceConfig, EntropyDeviceError};
 use crate::vmm_config::instance_info::InstanceInfo;
@@ -162,6 +166,16 @@ pub enum VmmAction {
     StartSpaceFill,
     /// Get what the fill of guest memory is doing (`GET /space/fill`).
     GetSpaceFill,
+    /// Set and start the checkpoint mode (`PUT /space/checkpoint`).
+    SetCheckpoint(CheckpointSetParams),
+    /// Turn the tracking of changed pages on or off (`PUT /space/checkpoint/track`).
+    TrackCheckpoint(CheckpointTrackParams),
+    /// Take the last checkpoint and end the mode (`PUT /space/checkpoint/finish`).
+    FinishCheckpoint,
+    /// Let the held output go and end the mode (`PUT /space/checkpoint/release`).
+    ReleaseCheckpoint,
+    /// Get the state of the checkpoint mode (`GET /space/checkpoint`).
+    GetCheckpoint,
 }
 
 /// Wrapper for all errors associated with VMM actions.
@@ -227,6 +241,8 @@ pub enum VmmActionError {
     PciNotEnabled,
     /// PCI manager error: {0}
     PciManager(#[from] PciManagerError),
+    /// Checkpoints: {0}
+    Checkpoint(#[from] CheckpointError),
 }
 
 /// The enum represents the response sent by the VMM in case of success. The response is either
@@ -258,6 +274,10 @@ pub enum VmmData {
     SpaceMemory(MemoryRegions),
     /// What the fill of guest memory is doing.
     SpaceFill(FillStatus),
+    /// The state of the checkpoint mode.
+    Checkpoint(Box<CheckpointInfo>),
+    /// The last checkpoint of a finish.
+    CheckpointFinish(CheckpointFinish),
 }
 
 fn mmds_patch_data(
@@ -534,7 +554,12 @@ impl<'a> PrebootApiController<'a> {
             | HotUnplugDevice(_)
             | GetSpaceMemory
             | StartSpaceFill
-            | GetSpaceFill => Err(VmmActionError::OperationNotSupportedPreBoot),
+            | GetSpaceFill
+            | SetCheckpoint(_)
+            | TrackCheckpoint(_)
+            | FinishCheckpoint
+            | ReleaseCheckpoint
+            | GetCheckpoint => Err(VmmActionError::OperationNotSupportedPreBoot),
             #[cfg(target_arch = "x86_64")]
             SendCtrlAltDel => Err(VmmActionError::OperationNotSupportedPreBoot),
         }
@@ -876,6 +901,36 @@ impl RuntimeApiController {
             GetSpaceFill => Ok(VmmData::SpaceFill(
                 self.vmm.lock().expect("Poisoned lock").fill_status(),
             )),
+            SetCheckpoint(params) => {
+                self.vmm
+                    .lock()
+                    .expect("Poisoned lock")
+                    .checkpoint_set(&params)?;
+                Ok(VmmData::Empty)
+            }
+            TrackCheckpoint(params) => {
+                self.vmm
+                    .lock()
+                    .expect("Poisoned lock")
+                    .checkpoint_track(&params)?;
+                Ok(VmmData::Empty)
+            }
+            FinishCheckpoint => Ok(VmmData::CheckpointFinish(
+                self.vmm
+                    .lock()
+                    .expect("Poisoned lock")
+                    .checkpoint_finish()?,
+            )),
+            ReleaseCheckpoint => {
+                self.vmm
+                    .lock()
+                    .expect("Poisoned lock")
+                    .checkpoint_release()?;
+                Ok(VmmData::Empty)
+            }
+            GetCheckpoint => Ok(VmmData::Checkpoint(Box::new(
+                self.vmm.lock().expect("Poisoned lock").checkpoint_info(),
+            ))),
             // Operations not allowed post-boot.
             ConfigureBootSource(_)
             | ConfigureLogger(_)
@@ -903,24 +958,27 @@ impl RuntimeApiController {
     /// error, a load with no resume) freezes the devices. `recv` waits at most its argument
     /// for the next request and `respond` answers it. Returns when a resume succeeded (a
     /// refused or failed resume leaves the guest stopped and the loop going on) or when the
-    /// VMM is to exit. Wakes at least each [`STOPPED_LOOP_TICK`] for [`Vmm::stopped_tick`].
+    /// VMM is to exit. Wakes at least each [`STOPPED_LOOP_TICK`] for [`Vmm::stopped_tick`], and
+    /// when one of the descriptors that `recv` gets is ready (the events of the checkpoint loop,
+    /// which a stopped guest keeps).
     pub fn serve_while_stopped<R, S>(
         &mut self,
         event_manager: &mut EventManager,
         mut recv: R,
         mut respond: S,
     ) where
-        R: FnMut(Duration) -> Result<ApiRequest, RecvTimeoutError>,
+        R: FnMut(Duration, &[std::os::fd::RawFd]) -> Result<ApiRequest, RecvTimeoutError>,
         S: FnMut(ApiResponse),
     {
         loop {
-            {
+            let fds = {
                 let vmm = self.vmm.lock().expect("Poisoned lock");
                 if !vmm.is_stopped() || vmm.shutdown_exit_code().is_some() {
                     return;
                 }
-            }
-            match recv(STOPPED_LOOP_TICK) {
+                vmm.stopped_wait_fds()
+            };
+            match recv(STOPPED_LOOP_TICK, &fds) {
                 Ok(request) => {
                     let response = self.handle_request(*request, event_manager);
                     respond(Box::new(response));
@@ -994,6 +1052,14 @@ impl RuntimeApiController {
         }
 
         let mut locked_vmm = self.vmm.lock().unwrap();
+        if create_params.mem_file_path.is_some() && locked_vmm.checkpoint_owns_dirty_pages() {
+            // Such a snapshot reads and resets the dirty bitmaps that the checkpoints rely on.
+            return Err(VmmActionError::Checkpoint(CheckpointError::Refused(
+                "A snapshot with memory is refused while the checkpoint mode or its tracking \
+                 runs"
+                    .into(),
+            )));
+        }
         let vm_info = VmInfo::from(&*locked_vmm);
         let create_start_us = get_time_us(ClockType::Monotonic);
 
@@ -1378,7 +1444,7 @@ mod tests {
         let loop_vmm = vmm.clone();
         runtime.serve_while_stopped(
             &mut event_manager,
-            |timeout| {
+            |timeout, _| {
                 assert_eq!(timeout, STOPPED_LOOP_TICK);
                 calls += 1;
                 match calls {
@@ -1422,7 +1488,7 @@ mod tests {
         let mut event_manager = EventManager::new().unwrap();
         runtime.serve_while_stopped(
             &mut event_manager,
-            |_| panic!("a running guest waits for no request here"),
+            |_, _| panic!("a running guest waits for no request here"),
             |_| {},
         );
     }

@@ -13,6 +13,8 @@ use crate::vmm_config::pmem::PmemConfig;
 pub mod balloon;
 /// Wrapper for configuring the microVM boot source.
 pub mod boot_source;
+/// The bodies of the `/space/checkpoint` endpoints.
+pub mod checkpoint;
 /// Wrapper for configuring the block devices.
 pub mod drive;
 /// Wrapper for configuring the entropy device attached to the microVM.

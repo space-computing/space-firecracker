@@ -895,6 +895,115 @@ paths:
           schema:
             $ref: "#/definitions/Error"
 
+  /space/checkpoint:
+    put:
+      summary: Sets and starts the checkpoint mode, or changes its interval and limit. Post-boot only.
+      description:
+        The members of the QMP command x-checkpoint-set of the QEMU fork, spelled as there, and
+        uri, the receiving place. With uri the mode starts - a new stream (the full copy, then
+        frame 0 and on) or a stream that continues the stream of another VMM (continue, epoch).
+        While the mode runs only interval-ms and lost-ms can change; fault can be given at any
+        time.
+      operationId: putSpaceCheckpoint
+      parameters:
+        - name: body
+          in: body
+          required: true
+          schema:
+            $ref: "#/definitions/CheckpointSet"
+      responses:
+        204:
+          description: The mode is set
+        400:
+          description: The mode cannot be set so
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/Error"
+    get:
+      summary: Gets the state of the checkpoint mode. Post-boot only.
+      description:
+        The fields of the QMP command x-query-checkpoint of the QEMU fork, but incoming and
+        incoming-pages.
+      operationId: getSpaceCheckpoint
+      responses:
+        200:
+          description: The state of the checkpoint mode
+          schema:
+            $ref: "#/definitions/CheckpointInfo"
+        default:
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/Error"
+
+  /space/checkpoint/track:
+    put:
+      summary: Turns the tracking of changed pages on (on a stopped guest) or off. Post-boot only.
+      description:
+        The members of x-checkpoint-track. With hold the frames of the guest are held from now
+        on; with lease-ms the first lease begins at the resume.
+      operationId: putSpaceCheckpointTrack
+      parameters:
+        - name: body
+          in: body
+          required: true
+          schema:
+            $ref: "#/definitions/CheckpointTrack"
+      responses:
+        204:
+          description: The tracking is set
+        400:
+          description: The tracking cannot be set so
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/Error"
+
+  /space/checkpoint/finish:
+    put:
+      summary: Takes the last checkpoint of a stopped guest and ends the mode. Post-boot only.
+      description:
+        A checkpoint on its way is answered first, then the last checkpoint is taken and
+        answered, within two times lost-ms and 1 s; the hold stays on. With no answer the call
+        fails and the mode is as it was. The body is empty or an empty object.
+      operationId: putSpaceCheckpointFinish
+      responses:
+        200:
+          description: The last checkpoint
+          schema:
+            $ref: "#/definitions/CheckpointFinish"
+        400:
+          description: No finish
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/Error"
+
+  /space/checkpoint/release:
+    put:
+      summary: Lets the held output go and ends the hold, the lease and the mode. Post-boot only.
+      description:
+        For the management program that has the guest for good. A guest that the end of the
+        lease stopped continues. The body is empty or an empty object.
+      operationId: putSpaceCheckpointRelease
+      responses:
+        204:
+          description: Released
+        400:
+          description: Not released
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/Error"
+
   /space/fill:
     put:
       summary: Starts the fill of guest memory. Post-boot only.
@@ -2048,6 +2157,121 @@ definitions:
         type: array
         items:
           $ref: "#/definitions/SpaceMemoryRegion"
+
+  CheckpointSet:
+    type: object
+    description: The members of x-checkpoint-set of the QEMU fork, and uri.
+    required:
+      - interval-ms
+    properties:
+      interval-ms:
+        type: integer
+        description: The time between two checkpoints (with need, when nothing waits); 0 is off.
+      lost-ms:
+        type: integer
+      hook:
+        type: string
+      stats:
+        type: string
+      hold:
+        type: boolean
+      cpus-only:
+        type: boolean
+      fault:
+        type: string
+        enum: ["", stale-clock, zero-cpu, internal-error, lease-clock-held, stop-held]
+      continue:
+        type: boolean
+      epoch:
+        type: integer
+      lease-ms:
+        type: integer
+      need:
+        type: boolean
+      budget-pct:
+        type: integer
+      cap-ms:
+        type: integer
+      page-ns:
+        type: integer
+      first:
+        type: string
+        enum: [time, budget]
+      look-us:
+        type: integer
+      busy-us:
+        type: integer
+      packets:
+        type: string
+      stream-id:
+        type: string
+      signal-ms:
+        type: integer
+      uri:
+        type: string
+        description: The receiving place, tcp:ADDRESS:PORT with an IP address; it starts the mode.
+
+  CheckpointTrack:
+    type: object
+    required:
+      - enable
+    properties:
+      enable:
+        type: boolean
+      hold:
+        type: boolean
+      lease-ms:
+        type: integer
+
+  CheckpointFinish:
+    type: object
+    required:
+      - epoch
+      - acked
+    properties:
+      epoch:
+        type: integer
+      acked:
+        type: boolean
+
+  CheckpointInfo:
+    type: object
+    description: The fields of x-query-checkpoint of the QEMU fork, but incoming and incoming-pages.
+    properties:
+      enabled: {type: boolean}
+      active: {type: boolean}
+      interval-ms: {type: integer}
+      hold: {type: boolean}
+      sent: {type: integer}
+      acked: {type: integer}
+      lost: {type: boolean}
+      reason: {type: string}
+      since-ack-ms: {type: integer}
+      stop-us: {type: integer}
+      ack-us: {type: integer}
+      pages: {type: integer}
+      bytes: {type: integer}
+      packets-held: {type: integer}
+      packets-dropped: {type: integer}
+      tracking: {type: boolean}
+      checkpoints: {type: integer}
+      total-pages: {type: integer}
+      total-bytes: {type: integer}
+      total-stop-us: {type: integer}
+      final-epoch: {type: integer}
+      packets-discarded: {type: integer}
+      holding: {type: boolean}
+      lease-ms: {type: integer}
+      lease-over: {type: boolean}
+      lease-left-ms: {type: integer}
+      late: {type: integer}
+      need: {type: boolean}
+      first: {type: string, enum: [time, budget]}
+      account-us: {type: integer}
+      stream-id: {type: string}
+      signal-ms: {type: integer}
+      since-echo-ms: {type: integer}
+      unanswered-ms: {type: integer}
 
   SpaceFillStatus:
     type: object

@@ -75,6 +75,8 @@ pub mod rate_limiter;
 pub mod acpi;
 /// Handles setup and initialization a `Vmm` object.
 pub mod builder;
+/// The checkpoint loop (`/space/checkpoint`): the stream, the held output, the lease.
+pub mod checkpoint;
 /// Types for guest configuration.
 pub mod cpu_config;
 pub(crate) mod device_manager;
@@ -305,6 +307,9 @@ pub enum DumpCpuConfigError {
 /// Contains the state and associated methods required for the Firecracker VMM.
 #[derive(Debug)]
 pub struct Vmm {
+    // The checkpoint loop. First, so that it is dropped (its threads ended) before the guest
+    // memory that its sender may read.
+    checkpoint: checkpoint::Checkpointer,
     /// The [`InstanceInfo`] state of this [`Vmm`].
     pub instance_info: InstanceInfo,
     /// Machine config
@@ -493,6 +498,9 @@ impl Vmm {
     /// the clock of the stop is set, and the vCPUs run. A refused or failed resume leaves the
     /// guest stopped, with its reason.
     pub fn resume_vm(&mut self) -> Result<(), VmmError> {
+        // The lease is checked against its clock too: its timer cannot fire while the guest is
+        // stopped by a long call.
+        self.lease_check();
         let kvm_vm = self
             .vm
             .as_kvm()
@@ -513,6 +521,8 @@ impl Vmm {
             self.stopped_clock = None;
         }
         self.instance_info.set_running();
+        // An armed lease of the checkpoints begins at the resume.
+        self.checkpoint_resumed();
         Ok(())
     }
 
@@ -584,7 +594,26 @@ impl Vmm {
     /// Called at least every 100 ms while the guest is stopped and the loop of the VMM thread
     /// serves only API requests: the place for work that must go on in a stop (the stamp of
     /// the main loop, the events of the checkpoint loop).
-    pub fn stopped_tick(&mut self) {}
+    pub fn stopped_tick(&mut self) {
+        self.checkpoint_service();
+    }
+
+    /// The descriptors that wake the loop of a stopped guest besides an API request: those of
+    /// the checkpoint loop.
+    pub fn stopped_wait_fds(&self) -> Vec<std::os::fd::RawFd> {
+        self.checkpoint.fds()
+    }
+
+    /// The state of the checkpoint mode (`GET /space/checkpoint`).
+    pub fn checkpoint_info(&self) -> vmm_config::checkpoint::CheckpointInfo {
+        self.checkpoint.info()
+    }
+
+    /// Whether the checkpoint mode or its tracking runs: a snapshot with memory, which reads
+    /// and resets the dirty bitmaps, is refused then.
+    pub fn checkpoint_owns_dirty_pages(&self) -> bool {
+        self.checkpoint.owns_dirty_pages()
+    }
 
     /// The clock of the stopped guest, if it is stopped.
     #[cfg(target_arch = "x86_64")]
@@ -1010,6 +1039,8 @@ impl MutEventSubscriber for Vmm {
                 } else if source == DISK_ERROR_EVT.as_raw_fd() && event_set == EventSet::IN {
                     let _ = DISK_ERROR_EVT.read();
                     self.handle_disk_error();
+                } else if self.checkpoint.owns(source) {
+                    self.checkpoint_service();
                 } else {
                     error!("Spurious EventManager event for handler: Vmm");
                 }
@@ -1025,6 +1056,19 @@ impl MutEventSubscriber for Vmm {
                 }
                 if let Err(err) = ops.add(Events::new(&*DISK_ERROR_EVT, EventSet::IN)) {
                     error!("Failed to register the disk error event: {}", err);
+                }
+                let fds = self.checkpoint.fds();
+                for fd in fds
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(checkpoint::hold::HOLD.wake.as_raw_fd()))
+                {
+                    if let Err(err) = ops.add(Events::new_raw(fd, EventSet::IN)) {
+                        error!(
+                            "Failed to register an event of the checkpoint loop: {}",
+                            err
+                        );
+                    }
                 }
             }
         }

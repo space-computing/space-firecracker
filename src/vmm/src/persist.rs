@@ -470,7 +470,6 @@ pub fn restore_from_snapshot(
                 guest_memory_from_file(
                     mem_backend_path,
                     mem_state,
-                    track_dirty_pages,
                     vm_resources.machine_config.huge_pages,
                 )
                 .map_err(RestoreFromSnapshotGuestMemoryError::File)?,
@@ -480,7 +479,6 @@ pub fn restore_from_snapshot(
         MemBackendType::Uffd => guest_memory_from_uffd(
             mem_backend_path,
             mem_state,
-            track_dirty_pages,
             vm_resources.machine_config.huge_pages,
         )
         .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
@@ -531,15 +529,15 @@ pub enum GuestMemoryFromFileError {
     HugetlbfsSnapshot,
 }
 
+// Firecracker's own bitmap of changed pages exists for every guest from its load: the
+// checkpoint loop may track a guest that was loaded with no `track_dirty_pages`.
 fn guest_memory_from_file(
     mem_file_path: &Path,
     mem_state: &GuestMemoryState,
-    track_dirty_pages: bool,
     huge_pages: HugePageConfig,
 ) -> Result<Vec<GuestRegionMmap>, GuestMemoryFromFileError> {
     let mem_file = File::open(mem_file_path)?;
-    let guest_mem =
-        memory::snapshot_file(mem_file, mem_state.regions(), track_dirty_pages, huge_pages)?;
+    let guest_mem = memory::snapshot_file(mem_file, mem_state.regions(), true, huge_pages)?;
     Ok(guest_mem)
 }
 
@@ -561,11 +559,9 @@ pub enum GuestMemoryFromUffdError {
 fn guest_memory_from_uffd(
     mem_uds_path: &Path,
     mem_state: &GuestMemoryState,
-    track_dirty_pages: bool,
     huge_pages: HugePageConfig,
 ) -> Result<(Vec<GuestRegionMmap>, Option<Uffd>), GuestMemoryFromUffdError> {
-    let (guest_memory, backend_mappings) =
-        create_guest_memory(mem_state, track_dirty_pages, huge_pages)?;
+    let (guest_memory, backend_mappings) = create_guest_memory(mem_state, huge_pages)?;
 
     let mut uffd_builder = UffdBuilder::new();
 
@@ -594,10 +590,9 @@ fn guest_memory_from_uffd(
 
 fn create_guest_memory(
     mem_state: &GuestMemoryState,
-    track_dirty_pages: bool,
     huge_pages: HugePageConfig,
 ) -> Result<(Vec<GuestRegionMmap>, Vec<GuestRegionUffdMapping>), GuestMemoryFromUffdError> {
-    let guest_memory = memory::anonymous(mem_state.regions(), track_dirty_pages, huge_pages)?;
+    let guest_memory = memory::anonymous(mem_state.regions(), true, huge_pages)?;
     let mut backend_mappings = Vec::with_capacity(guest_memory.len());
     let mut offset = 0;
     for mem_region in guest_memory.iter() {
@@ -807,8 +802,7 @@ mod tests {
             }],
         };
 
-        let (_, uffd_regions) =
-            create_guest_memory(&mem_state, false, HugePageConfig::None).unwrap();
+        let (_, uffd_regions) = create_guest_memory(&mem_state, HugePageConfig::None).unwrap();
 
         assert_eq!(uffd_regions.len(), 1);
         assert_eq!(uffd_regions[0].size, 0x20000);

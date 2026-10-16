@@ -216,6 +216,8 @@ impl ParsedRequest {
                 VmmData::FullVmConfig(config) => Self::success_response_with_data(config),
                 VmmData::SpaceMemory(regions) => Self::success_response_with_data(regions),
                 VmmData::SpaceFill(status) => Self::success_response_with_data(status),
+                VmmData::Checkpoint(info) => Self::success_response_with_data(info),
+                VmmData::CheckpointFinish(finish) => Self::success_response_with_data(finish),
             },
             Err(vmm_action_error) => {
                 let mut response = match vmm_action_error {
@@ -641,6 +643,12 @@ pub mod tests {
                 VmmData::SpaceFill(status) => {
                     http_response(&serde_json::to_string(status).unwrap(), 200)
                 }
+                VmmData::Checkpoint(info) => {
+                    http_response(&serde_json::to_string(info).unwrap(), 200)
+                }
+                VmmData::CheckpointFinish(finish) => {
+                    http_response(&serde_json::to_string(finish).unwrap(), 200)
+                }
             };
             let response = ParsedRequest::convert_to_response(&data);
             response.write_all(&mut buf).unwrap();
@@ -671,6 +679,13 @@ pub mod tests {
             }],
         }));
         verify_ok_response_with(VmmData::SpaceFill(FillStatus::default()));
+        verify_ok_response_with(VmmData::Checkpoint(Box::default()));
+        verify_ok_response_with(VmmData::CheckpointFinish(
+            vmm::vmm_config::checkpoint::CheckpointFinish {
+                epoch: 3,
+                acked: true,
+            },
+        ));
 
         // Error.
         let error = VmmActionError::StartMicrovm(StartMicrovmError::MissingKernelConfig);
@@ -701,6 +716,19 @@ pub mod tests {
             ("GET", "/space/memory", None, VmmAction::GetSpaceMemory),
             ("GET", "/space/fill", None, VmmAction::GetSpaceFill),
             ("PUT", "/space/fill", Some("{}"), VmmAction::StartSpaceFill),
+            ("GET", "/space/checkpoint", None, VmmAction::GetCheckpoint),
+            (
+                "PUT",
+                "/space/checkpoint/finish",
+                Some("{}"),
+                VmmAction::FinishCheckpoint,
+            ),
+            (
+                "PUT",
+                "/space/checkpoint/release",
+                Some("{}"),
+                VmmAction::ReleaseCheckpoint,
+            ),
         ] {
             let (mut sender, receiver) = UnixStream::pair().unwrap();
             let mut connection = HttpConnection::new(receiver);

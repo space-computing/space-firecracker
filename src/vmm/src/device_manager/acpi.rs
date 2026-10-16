@@ -58,6 +58,22 @@ impl ACPIDeviceManager {
         self.vmclock.as_ref().expect("Missing VMClock device")
     }
 
+    /// The guest memory that VMGenID and VMClock write at a load (the identity and the page of
+    /// the clock), with no write of the guest.
+    pub fn written_at_load(&self) -> Vec<(vm_memory::GuestAddress, usize)> {
+        let mut out = Vec::new();
+        if let Some(vmgenid) = &self.vmgenid {
+            out.push((vmgenid.guest_address, 16));
+        }
+        if let Some(vmclock) = &self.vmclock {
+            out.push((
+                vmclock.guest_address,
+                crate::devices::acpi::vmclock::VMCLOCK_SIZE as usize,
+            ));
+        }
+        out
+    }
+
     pub fn activate_vmgenid(&self, vm: &KvmVm) -> Result<(), ACPIDeviceError> {
         vm.register_irq(&self.vmgenid().interrupt_evt, self.vmgenid().gsi)?;
         self.vmgenid().activate(vm.guest_memory())?;

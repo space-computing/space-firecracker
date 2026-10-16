@@ -21,6 +21,7 @@ use crate::StoppedClock;
 #[cfg(target_arch = "aarch64")]
 use crate::Vcpu;
 use crate::arch::{ConfigurationError, configure_system_for_boot, load_kernel};
+use crate::checkpoint::Checkpointer;
 #[cfg(target_arch = "aarch64")]
 use crate::construct_kvm_mpidrs;
 use crate::cpu_config::templates::{GetCpuTemplate, GetCpuTemplateError, GuestConfigError};
@@ -130,6 +131,8 @@ pub enum StartMicrovmError {
     KvmVm(#[from] VmError),
     /// Cannot start the fill thread: {0}
     FillThread(io::Error),
+    /// Cannot start the threads of the checkpoint loop: {0}
+    CheckpointThreads(io::Error),
 }
 
 /// It's convenient to automatically convert `linux_loader::cmdline::Error`s
@@ -182,6 +185,7 @@ pub fn build_microvm_for_boot(
     // Build custom CPU config if a custom template is provided.
     let mut vm = KvmVm::new(kvm)?;
     let mut vcpus = vm.create_vcpus(vm_resources.machine_config.vcpu_count)?;
+    vm.set_log_dirty_at_start(vm_resources.machine_config.track_dirty_pages);
     vm.register_dram_memory_regions(guest_memory)?;
 
     // Allocate memory as soon as possible to make hotpluggable memory available to all consumers,
@@ -332,8 +336,16 @@ pub fn build_microvm_for_boot(
             .clone(),
     )
     .map_err(StartMicrovmError::FillThread)?;
+    let checkpoint = Checkpointer::spawn(
+        seccomp_filters
+            .get("checkpoint")
+            .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("checkpoint".to_string()))?
+            .clone(),
+    )
+    .map_err(StartMicrovmError::CheckpointThreads)?;
 
     let vmm = Vmm {
+        checkpoint,
         instance_info: instance_info.clone(),
         machine_config: vm_resources.machine_config.clone(),
         boot_source_config: vm_resources.boot_source.config.clone(),
@@ -442,6 +454,10 @@ pub enum BuildMicrovmFromSnapshotError {
     MissingFillSeccompFilter,
     /// Cannot start the fill thread: {0}
     FillThread(io::Error),
+    /// Failed to start the threads of the checkpoint loop as no checkpoint seccomp filter found.
+    MissingCheckpointSeccompFilter,
+    /// Cannot start the threads of the checkpoint loop: {0}
+    CheckpointThreads(io::Error),
 }
 
 /// Builds and starts a microVM based on the provided MicrovmState.
@@ -472,6 +488,7 @@ pub fn build_microvm_from_snapshot(
         .create_vcpus(vm_resources.machine_config.vcpu_count)
         .map_err(StartMicrovmError::KvmVm)?;
 
+    vm.set_log_dirty_at_start(vm_resources.machine_config.track_dirty_pages);
     vm.restore_memory_regions(guest_memory, &microvm_state.vm_state.memory)
         .map_err(StartMicrovmError::KvmVm)?;
 
@@ -542,8 +559,16 @@ pub fn build_microvm_from_snapshot(
             .clone(),
     )
     .map_err(BuildMicrovmFromSnapshotError::FillThread)?;
+    let checkpoint = Checkpointer::spawn(
+        seccomp_filters
+            .get("checkpoint")
+            .ok_or(BuildMicrovmFromSnapshotError::MissingCheckpointSeccompFilter)?
+            .clone(),
+    )
+    .map_err(BuildMicrovmFromSnapshotError::CheckpointThreads)?;
 
     let vmm = Vmm {
+        checkpoint,
         instance_info: instance_info.clone(),
         machine_config: vm_resources.machine_config.clone(),
         boot_source_config: vm_resources.boot_source.config.clone(),
@@ -894,6 +919,7 @@ pub(crate) mod tests {
         let _ = vm.create_vcpus(1).unwrap();
 
         Vmm {
+            checkpoint: Default::default(),
             instance_info: InstanceInfo::default(),
             machine_config: MachineConfig::default(),
             boot_source_config: BootSourceConfig::default(),
@@ -916,6 +942,7 @@ pub(crate) mod tests {
         let device_manager = default_device_manager_with_pci(&vm);
 
         Vmm {
+            checkpoint: Default::default(),
             instance_info: InstanceInfo::default(),
             machine_config: MachineConfig::default(),
             boot_source_config: BootSourceConfig::default(),

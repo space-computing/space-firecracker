@@ -3,7 +3,7 @@
 
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -124,10 +124,32 @@ impl ApiServerAdapter {
         let to_api = &self.to_api;
         self.controller.serve_while_stopped(
             event_manager,
-            |timeout| {
+            |timeout, fds| {
+                // The API event and the events of the checkpoint loop wake the loop.
+                let mut polled: Vec<libc::pollfd> = std::iter::once(api_event_fd.as_raw_fd())
+                    .chain(fds.iter().copied())
+                    .map(|fd| libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    })
+                    .collect();
+                let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+                // SAFETY: `polled` holds valid pollfds for its length.
+                let ready = unsafe {
+                    libc::poll(
+                        polled.as_mut_ptr(),
+                        libc::nfds_t::try_from(polled.len()).unwrap(),
+                        timeout_ms,
+                    )
+                };
+                if ready <= 0 || polled[0].revents & libc::POLLIN == 0 {
+                    return Err(RecvTimeoutError::Timeout);
+                }
+                // The API thread writes the event right after the request.
                 let request = from_api.recv_timeout(timeout)?;
                 // Also consume the API event that goes with the request, as the loop before
-                // the boot does. The API thread writes it right after the request.
+                // the boot does.
                 api_event_fd
                     .read()
                     .expect("VMM: Failed to read the API event_fd");

@@ -18,5 +18,10 @@
         "default_action": "allow",
         "filter_action": "trap",
         "filter": []
+    },
+    "checkpoint": {
+        "default_action": "allow",
+        "filter_action": "trap",
+        "filter": []
     }
 }

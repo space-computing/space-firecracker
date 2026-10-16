@@ -393,6 +393,40 @@ impl DeviceManager {
         self.for_each_virtio_device_mut(|_, device| device.quiesce());
     }
 
+    /// Lets the held frames of each network device go out, up to the mark `upto`.
+    pub fn release_held(&self, upto: u64) {
+        self.for_each_virtio_device_mut(|device_type, device| {
+            if device_type == VirtioDeviceType::Net
+                && let Some(net) = device.as_mut_any().downcast_mut::<Net>()
+            {
+                net.release_held(upto);
+            }
+        });
+    }
+
+    /// Throws away the held frames of each network device.
+    pub fn discard_held(&self) {
+        self.for_each_virtio_device_mut(|device_type, device| {
+            if device_type == VirtioDeviceType::Net
+                && let Some(net) = device.as_mut_any().downcast_mut::<Net>()
+            {
+                net.discard_held();
+            }
+        });
+    }
+
+    /// After the stop of a checkpoint of a running guest: each network device parses its
+    /// receive buffers again (it rewound them for the state), as if the guest had posted them.
+    pub fn kick_net_receive(&self) {
+        self.for_each_virtio_device_mut(|device_type, device| {
+            if device_type == VirtioDeviceType::Net
+                && let Some(net) = device.as_mut_any().downcast_mut::<Net>()
+            {
+                net.kick_receive();
+            }
+        });
+    }
+
     /// The id of a drive whose disk error waits for the Vmm to stop the guest, if one does.
     pub fn take_disk_error(&self) -> Option<String> {
         let mut failed = None;

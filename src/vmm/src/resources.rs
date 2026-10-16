@@ -501,15 +501,14 @@ impl VmResources {
         // a single way of backing guest memory for vhost-user and non-vhost-user cases,
         // that would not be worth the effort.
         if vhost_user_device_used {
-            memory::memfd_backed(
-                regions,
-                self.machine_config.track_dirty_pages,
-                self.machine_config.huge_pages,
-            )
+            // Firecracker's own bitmap of changed pages exists for every guest from its boot:
+            // the checkpoint loop may track a guest that was booted with no
+            // `track_dirty_pages`, which sets only KVM's dirty log.
+            memory::memfd_backed(regions, true, self.machine_config.huge_pages)
         } else {
             memory::anonymous(
                 regions.iter().copied(),
-                self.machine_config.track_dirty_pages,
+                true,
                 self.machine_config.huge_pages,
             )
         }

@@ -83,6 +83,10 @@ pub struct VmCommon {
     pub vcpus_handles: Mutex<Vec<VcpuHandle>>,
     /// Event fd written to by vCPUs on exit.
     pub vcpus_exit_evt: EventFd,
+    /// KVM's dirty log is on for the memory slots: from the start with `track_dirty_pages`, or
+    /// while the checkpoint mode or its tracking runs. Firecracker's own bitmap exists for every
+    /// guest.
+    log_dirty: std::sync::atomic::AtomicBool,
     /// Test-only countdown that forces the Nth-next `set_user_memory_region` call to fail, used
     /// to exercise partial-failure handling. 0 means never fail.
     #[cfg(test)]
@@ -195,6 +199,7 @@ impl KvmVm {
             uffd: None,
             vcpus_handles: Mutex::new(Vec::new()),
             vcpus_exit_evt,
+            log_dirty: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_set_user_memory_region_in: AtomicU32::new(0),
         })
@@ -465,7 +470,7 @@ impl KvmVm {
             .slots()
             .try_for_each(|(ref slot, plugged)| match plugged {
                 // if the slot is plugged, add it to kvm user memory regions
-                true => self.set_user_memory_region(slot.into()),
+                true => self.set_user_memory_region(slot.kvm_region(self.log_dirty())),
                 // if the slot is not plugged, protect accesses to it
                 false => slot.protect(true).map_err(VmError::MemoryError),
             })?;
@@ -560,6 +565,33 @@ impl KvmVm {
             .expect("Poisoned lock")
     }
 
+    /// Whether KVM's dirty log is on.
+    pub fn log_dirty(&self) -> bool {
+        self.common
+            .log_dirty
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Sets whether KVM's dirty log is on for the slots that are registered from now on (before
+    /// the memory is registered).
+    pub fn set_log_dirty_at_start(&mut self, on: bool) {
+        self.common
+            .log_dirty
+            .store(on, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Turns KVM's dirty log on or off for every plugged slot. Turned on, it begins with no page
+    /// in it.
+    pub fn set_dirty_log(&self, on: bool) -> Result<(), VmError> {
+        self.common
+            .log_dirty
+            .store(on, std::sync::atomic::Ordering::Release);
+        self.guest_memory()
+            .iter()
+            .flat_map(|region| region.plugged_slots())
+            .try_for_each(|slot| self.set_user_memory_region(slot.kvm_region(on)))
+    }
+
     /// Resets the KVM dirty bitmap for each of the guest's memory regions.
     pub fn reset_dirty_bitmap(&self) {
         self.guest_memory()
@@ -576,12 +608,12 @@ impl KvmVm {
             .iter()
             .flat_map(|region| region.plugged_slots())
             .map(|mem_slot| {
-                let bitmap = match mem_slot.slice.bitmap() {
-                    Some(_) => self
+                let bitmap = match self.log_dirty() {
+                    true => self
                         .fd()
                         .get_dirty_log(mem_slot.slot, mem_slot.slice.len())
                         .map_err(VmError::GetDirtyLog)?,
-                    None => mincore_bitmap(
+                    false => mincore_bitmap(
                         mem_slot.slice.ptr_guard_mut().as_ptr(),
                         mem_slot.slice.len(),
                     )?,

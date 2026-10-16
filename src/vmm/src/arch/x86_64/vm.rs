@@ -274,6 +274,12 @@ impl VmState {
     pub fn clock(&self) -> &kvm_clock_data {
         &self.clock
     }
+
+    /// Puts `clock` in the place of the guest's clock of this state (the fault `stale-clock` of
+    /// the checkpoint loop, for tests).
+    pub fn replace_clock(&mut self, clock: kvm_clock_data) {
+        self.clock = clock;
+    }
 }
 
 impl fmt::Debug for VmState {
