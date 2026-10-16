@@ -17,6 +17,7 @@ use vmm::persist::{
 use vmm::resources::VmResources;
 use vmm::rpc_interface::{
     LoadSnapshotError, PrebootApiController, RuntimeApiController, VmmAction, VmmActionError,
+    VmmData,
 };
 use vmm::seccomp::get_empty_filters;
 use vmm::snapshot::Snapshot;
@@ -249,7 +250,7 @@ fn verify_create_snapshot(
     let snapshot_params = CreateSnapshotParams {
         snapshot_type,
         snapshot_path: snapshot_file.as_path().to_path_buf(),
-        mem_file_path: memory_file.as_path().to_path_buf(),
+        mem_file_path: Some(memory_file.as_path().to_path_buf()),
         sync_snapshot_files: true,
     };
 
@@ -530,4 +531,182 @@ fn test_preboot_load_snap_disallowed_after_boot_resources() {
     let req =
         VmmAction::UpdateMachineConfiguration(MachineConfigUpdate::from(MachineConfig::default()));
     verify_load_snap_disallowed_after_boot_resources(req, "SetVmConfiguration");
+}
+
+fn count_dirty_pages(vmm: &Arc<Mutex<Vmm>>) -> u32 {
+    vmm.lock()
+        .unwrap()
+        .vm
+        .as_kvm()
+        .unwrap()
+        .get_dirty_bitmap()
+        .unwrap()
+        .values()
+        .map(|bitmap| bitmap.iter().map(|n| n.count_ones()).sum::<u32>())
+        .sum()
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn test_state_only_snapshot_keeps_the_dirty_bitmap() {
+    let (vmm, _) = vmm::test_utils::dirty_tracking_vmm(Some(NOISY_KERNEL_IMAGE));
+    let mut controller = RuntimeApiController::new(vmm.clone());
+    let mut event_manager = EventManager::new().unwrap();
+    thread::sleep(Duration::from_millis(200));
+    controller
+        .handle_request(VmmAction::Pause, &mut event_manager)
+        .unwrap();
+
+    // A snapshot of the state only: the state is written and no dirty bitmap is reset.
+    let snapshot_file = TempFile::new().unwrap();
+    controller
+        .handle_request(
+            VmmAction::CreateSnapshot(CreateSnapshotParams {
+                snapshot_type: SnapshotType::Diff,
+                snapshot_path: snapshot_file.as_path().to_path_buf(),
+                mem_file_path: None,
+                sync_snapshot_files: false,
+            }),
+            &mut event_manager,
+        )
+        .unwrap();
+    let state: MicrovmState = Snapshot::load(&mut snapshot_file.as_file()).unwrap().data;
+    assert_eq!(state.vcpu_states.len(), 1);
+    assert!(count_dirty_pages(&vmm) > 0);
+
+    // A snapshot with memory resets it (the guest is stopped and writes nothing more).
+    let memory_file = TempFile::new().unwrap();
+    controller
+        .handle_request(
+            VmmAction::CreateSnapshot(CreateSnapshotParams {
+                snapshot_type: SnapshotType::Diff,
+                snapshot_path: snapshot_file.as_path().to_path_buf(),
+                mem_file_path: Some(memory_file.as_path().to_path_buf()),
+                sync_snapshot_files: false,
+            }),
+            &mut event_manager,
+        )
+        .unwrap();
+    assert_eq!(count_dirty_pages(&vmm), 0);
+
+    // The regions of guest memory, with the offsets of the memory file.
+    let regions = match controller
+        .handle_request(VmmAction::GetSpaceMemory, &mut event_manager)
+        .unwrap()
+    {
+        VmmData::SpaceMemory(regions) => regions.regions,
+        other => panic!("{other:?}"),
+    };
+    let mut offset = 0;
+    for region in &regions {
+        assert_eq!(region.offset, offset);
+        assert_ne!(region.host_addr, 0);
+        offset += region.size;
+    }
+    assert_eq!(
+        offset,
+        memory_file.as_file().metadata().unwrap().len(),
+        "the regions cover the memory file"
+    );
+
+    vmm.lock().unwrap().stop(FcExitCode::Ok);
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn test_load_sets_the_clock_at_the_resume() {
+    use vmm::vmm_config::instance_info::PausedReason;
+
+    // A guest that ran for a while, so that its clock is well ahead of a new VM's.
+    let snapshot_file = TempFile::new().unwrap();
+    let memory_file = TempFile::new().unwrap();
+    {
+        let (vmm, _) = create_vmm(Some(NOISY_KERNEL_IMAGE), false, true, false, false);
+        let mut controller = RuntimeApiController::new(vmm.clone());
+        let mut event_manager = EventManager::new().unwrap();
+        thread::sleep(Duration::from_millis(1000));
+        controller
+            .handle_request(VmmAction::Pause, &mut event_manager)
+            .unwrap();
+        controller
+            .handle_request(
+                VmmAction::CreateSnapshot(CreateSnapshotParams {
+                    snapshot_type: SnapshotType::Full,
+                    snapshot_path: snapshot_file.as_path().to_path_buf(),
+                    mem_file_path: Some(memory_file.as_path().to_path_buf()),
+                    sync_snapshot_files: false,
+                }),
+                &mut event_manager,
+            )
+            .unwrap();
+        vmm.lock().unwrap().stop(FcExitCode::Ok);
+    }
+    let state: MicrovmState = Snapshot::load(&mut snapshot_file.as_file()).unwrap().data;
+    let state_clock = state.vm_state.clock().clock;
+    assert!(state_clock >= 1_000_000_000);
+
+    let mut event_manager = EventManager::new().unwrap();
+    let empty_seccomp_filters = get_empty_filters();
+    let mut vm_resources = VmResources::default();
+    let mut preboot_api_controller = PrebootApiController::new(
+        &empty_seccomp_filters,
+        InstanceInfo::default(),
+        &mut vm_resources,
+        &mut event_manager,
+    );
+    preboot_api_controller
+        .handle_preboot_request(VmmAction::LoadSnapshot(LoadSnapshotParams {
+            snapshot_path: snapshot_file.as_path().to_path_buf(),
+            mem_backend: MemBackendConfig {
+                backend_path: memory_file.as_path().to_path_buf(),
+                backend_type: MemBackendType::File,
+            },
+            track_dirty_pages: false,
+            resume_vm: false,
+            network_overrides: vec![],
+            vsock_override: None,
+            clock_realtime: false,
+            huge_pages: SnapshotLoadHugePageConfig::Snapshot,
+        }))
+        .unwrap();
+    let vmm = preboot_api_controller.built_vmm.take().unwrap();
+    let kvm_clock = |vmm: &Arc<Mutex<Vmm>>| {
+        vmm.lock()
+            .unwrap()
+            .vm
+            .as_kvm()
+            .unwrap()
+            .get_clock()
+            .unwrap()
+            .clock
+    };
+
+    {
+        let locked = vmm.lock().unwrap();
+        assert_eq!(locked.instance_info.state, VmState::Paused);
+        assert_eq!(locked.instance_info.paused_reason, Some(PausedReason::Load));
+        assert!(!locked.instance_info.ran_since_load);
+        assert_eq!(locked.stopped_clock().unwrap().clock.clock, state_clock);
+    }
+    // The load did not set the clock of the state: KVM's clock is a new VM's.
+    assert!(kvm_clock(&vmm) < state_clock);
+    // The guest waits loaded; that time is not time of the guest.
+    thread::sleep(Duration::from_millis(500));
+
+    let mut controller = RuntimeApiController::new(vmm.clone());
+    controller
+        .handle_request(VmmAction::Resume, &mut event_manager)
+        .unwrap();
+    let after = kvm_clock(&vmm);
+    assert!(
+        after >= state_clock && after < state_clock + 100_000_000,
+        "{after} {state_clock}"
+    );
+    {
+        let locked = vmm.lock().unwrap();
+        assert_eq!(locked.instance_info.state, VmState::Running);
+        assert!(locked.instance_info.ran_since_load);
+        assert!(locked.stopped_clock().is_none());
+    }
+    vmm.lock().unwrap().stop(FcExitCode::Ok);
 }

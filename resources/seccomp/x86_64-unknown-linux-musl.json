@@ -635,6 +635,19 @@
             },
             {
                 "syscall": "ioctl",
+                "comment": "Sets the guest's clock of a stop when the guest is resumed",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1076932219,
+                        "comment": "KVM_SET_CLOCK"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
                 "args": [
                     {
                         "index": 1,
@@ -1572,6 +1585,201 @@
                         "op": "eq",
                         "val": 1075883638,
                         "comment": "KVM_IRQFD"
+                    }
+                ]
+            }
+        ]
+    },
+    "fill": {
+        "default_action": "trap",
+        "filter_action": "allow",
+        "filter": [
+            {
+                "syscall": "madvise",
+                "comment": "Populates guest memory for writing",
+                "args": [
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 23,
+                        "comment": "libc::MADV_POPULATE_WRITE"
+                    }
+                ]
+            },
+            {
+                "syscall": "madvise",
+                "comment": "Triggered by musl when it frees memory",
+                "args": [
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 4,
+                        "comment": "libc::MADV_DONTNEED"
+                    }
+                ]
+            },
+            {
+                "syscall": "futex",
+                "comment": "Used for synchronization (the channel of the fill and the lock of its status)",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 128,
+                        "comment": "FUTEX_WAIT_PRIVATE"
+                    }
+                ]
+            },
+            {
+                "syscall": "futex",
+                "comment": "Used for synchronization",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 137,
+                        "comment": "FUTEX_WAIT_BITSET_PRIVATE"
+                    }
+                ]
+            },
+            {
+                "syscall": "futex",
+                "comment": "Used for synchronization",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 129,
+                        "comment": "FUTEX_WAKE_PRIVATE"
+                    }
+                ]
+            },
+            {
+                "syscall": "futex",
+                "comment": "Used for synchronization (during thread teardown)",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 0,
+                        "comment": "FUTEX_WAIT"
+                    }
+                ]
+            },
+            {
+                "syscall": "futex",
+                "comment": "Used for synchronization (during thread teardown)",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1,
+                        "comment": "FUTEX_WAKE"
+                    }
+                ]
+            },
+            {
+                "syscall": "sched_yield",
+                "comment": "Used by the rust standard library in std::sync::mpmc"
+            },
+            {
+                "syscall": "brk",
+                "comment": "Called for expanding the heap"
+            },
+            {
+                "syscall": "mmap",
+                "comment": "Used by the allocator for large buffers",
+                "args": [
+                    {
+                        "index": 3,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 34,
+                        "comment": "libc::MAP_ANONYMOUS | libc::MAP_PRIVATE"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {
+                            "masked_eq": 4
+                        },
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
+                    }
+                ]
+            },
+            {
+                "syscall": "mremap",
+                "comment": "Used for re-allocating large memory regions"
+            },
+            {
+                "syscall": "munmap",
+                "comment": "Used for freeing memory"
+            },
+            {
+                "syscall": "write",
+                "comment": "Used by the logger"
+            },
+            {
+                "syscall": "clock_gettime",
+                "comment": "Used by the logger. It's not called on some platforms, because of vdso optimisations."
+            },
+            {
+                "syscall": "gettid",
+                "comment": "Rust std uses it during panic to print the thread id."
+            },
+            {
+                "syscall": "rt_sigprocmask",
+                "comment": "Used by Rust stdlib during thread teardown."
+            },
+            {
+                "syscall": "sigaltstack",
+                "comment": "Used by Rust stdlib to remove alternative signal stack during thread teardown."
+            },
+            {
+                "syscall": "rt_sigreturn"
+            },
+            {
+                "syscall": "exit",
+                "comment": "The thread ends when the Vmm is dropped"
+            },
+            {
+                "syscall": "exit_group"
+            },
+            {
+                "syscall": "restart_syscall",
+                "comment": "automatically issued by the kernel when specific timing-related syscalls get interrupted by SIGSTOP"
+            },
+            {
+                "syscall": "rt_sigaction",
+                "comment": "rt_sigaction is used by libc::abort during a panic to install the default handler for SIGABRT",
+                "args": [
+                    {
+                        "index": 0,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 6,
+                        "comment": "SIGABRT"
+                    }
+                ]
+            },
+            {
+                "syscall": "tkill",
+                "comment": "tkill is used by libc::abort during a panic to raise SIGABRT",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 6,
+                        "comment": "SIGABRT"
                     }
                 ]
             }

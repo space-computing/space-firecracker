@@ -108,6 +108,14 @@ impl Block {
         }
     }
 
+    /// Whether a disk error of this drive waits for the Vmm to stop the guest (given once).
+    pub fn take_disk_error(&mut self) -> bool {
+        match self {
+            Self::Virtio(b) => b.take_disk_error(),
+            Self::VhostUser(_) => false,
+        }
+    }
+
     pub fn is_vhost_user(&self) -> bool {
         match self {
             Self::Virtio(_) => false,
@@ -225,6 +233,28 @@ impl VirtioDevice for Block {
         match self {
             Self::Virtio(b) => b.prepare_save(),
             Self::VhostUser(b) => b.prepare_save(),
+        }
+    }
+
+    fn prepare_checkpoint(&mut self) {
+        match self {
+            Self::Virtio(b) => b.drain(),
+            // A guest with a vhost-user drive cannot be saved.
+            Self::VhostUser(_) => {}
+        }
+    }
+
+    fn quiesce(&mut self) {
+        match self {
+            Self::Virtio(b) => b.drain(),
+            Self::VhostUser(_) => {}
+        }
+    }
+
+    fn kick(&mut self) {
+        match self {
+            Self::Virtio(b) => b.kick(),
+            Self::VhostUser(b) => b.kick(),
         }
     }
 }

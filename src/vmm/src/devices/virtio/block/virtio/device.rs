@@ -6,15 +6,16 @@
 // found in the THIRD-PARTY file.
 
 use std::cmp;
+use std::collections::VecDeque;
 use std::convert::From;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom};
 use std::ops::Deref;
 use std::os::fd::AsRawFd;
 use std::os::linux::fs::MetadataExt;
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use block_io::FileEngine;
 use serde::{Deserialize, Serialize};
@@ -56,6 +57,15 @@ pub enum FileEngineType {
     Sync,
 }
 
+/// Woken by a block device whose disk failed a request of the `Async` engine. The [`Vmm`]
+/// then stops the guest (`paused_reason: disk-error`). One VMM runs in a process, so one
+/// event serves every drive; the Vmm asks the drives which one failed.
+///
+/// [`Vmm`]: crate::Vmm
+pub static DISK_ERROR_EVT: LazyLock<EventFd> = LazyLock::new(|| {
+    EventFd::new(libc::EFD_NONBLOCK).expect("Cannot create the disk error eventfd")
+});
+
 /// Helper object for setting up all `Block` fields derived from its backing file.
 #[derive(Debug)]
 pub struct DiskProperties {
@@ -66,11 +76,20 @@ pub struct DiskProperties {
 }
 
 impl DiskProperties {
-    // Helper function that opens the file with the proper access permissions
-    fn open_file(disk_image_path: &str, is_disk_read_only: bool) -> Result<File, VirtioBlockError> {
-        OpenOptions::new()
-            .read(true)
-            .write(!is_disk_read_only)
+    // Helper function that opens the file with the proper access permissions. A drive of the
+    // `Async` engine opens its file with `O_DIRECT`, so that the page cache of the host is not
+    // between the guest and the disk; the `Sync` engine opens it as before.
+    fn open_file(
+        disk_image_path: &str,
+        is_disk_read_only: bool,
+        file_engine_type: FileEngineType,
+    ) -> Result<File, VirtioBlockError> {
+        let mut options = OpenOptions::new();
+        options.read(true).write(!is_disk_read_only);
+        if file_engine_type == FileEngineType::Async {
+            options.custom_flags(libc::O_DIRECT);
+        }
+        options
             .open(PathBuf::from(&disk_image_path))
             .map_err(|x| VirtioBlockError::BackingFile(x, disk_image_path.to_string()))
     }
@@ -100,7 +119,8 @@ impl DiskProperties {
         is_disk_read_only: bool,
         file_engine_type: FileEngineType,
     ) -> Result<Self, VirtioBlockError> {
-        let mut disk_image = Self::open_file(&disk_image_path, is_disk_read_only)?;
+        let mut disk_image =
+            Self::open_file(&disk_image_path, is_disk_read_only, file_engine_type)?;
         let disk_size = Self::file_size(&disk_image_path, &mut disk_image)?;
         let image_id = Self::build_disk_image_id(&disk_image);
 
@@ -119,7 +139,12 @@ impl DiskProperties {
         disk_image_path: String,
         is_disk_read_only: bool,
     ) -> Result<(), VirtioBlockError> {
-        let mut disk_image = Self::open_file(&disk_image_path, is_disk_read_only)?;
+        let file_engine_type = match self.file_engine {
+            FileEngine::Sync(_) => FileEngineType::Sync,
+            FileEngine::Async(_) => FileEngineType::Async,
+        };
+        let mut disk_image =
+            Self::open_file(&disk_image_path, is_disk_read_only, file_engine_type)?;
         let disk_size = Self::file_size(&disk_image_path, &mut disk_image)?;
 
         self.image_id = Self::build_disk_image_id(&disk_image);
@@ -404,6 +429,14 @@ pub struct VirtioBlock {
     pub rate_limiter: RateLimiter,
     pub is_io_engine_throttled: bool,
     pub metrics: Arc<BlockDeviceMetrics>,
+
+    // The stop on a disk error (the `Async` engine). A request that the disk failed is kept,
+    // not answered, and runs again from its start when the guest is resumed. While a request
+    // is kept, the device takes no new request from the queue.
+    pub kept: VecDeque<PendingRequest>,
+    pub stopped_on_error: bool,
+    // A disk error that the Vmm has not yet taken to stop the guest.
+    pub error_pending: bool,
 }
 
 macro_rules! unwrap_async_file_engine_or_return {
@@ -425,10 +458,6 @@ impl VirtioBlock {
     pub fn new(config: VirtioBlockConfig) -> Result<VirtioBlock, VirtioBlockError> {
         if config.discard && config.is_read_only {
             return Err(VirtioBlockError::DiscardReadOnlyUnsupported);
-        }
-
-        if config.discard && config.file_engine_type == FileEngineType::Async {
-            return Err(VirtioBlockError::DiscardAsyncUnsupported);
         }
 
         let disk_properties = DiskProperties::new(
@@ -505,6 +534,10 @@ impl VirtioBlock {
             rate_limiter,
             is_io_engine_throttled: false,
             metrics: BlockMetricsPerDevice::alloc(config.drive_id),
+
+            kept: VecDeque::new(),
+            stopped_on_error: false,
+            error_pending: false,
         })
     }
 
@@ -539,9 +572,99 @@ impl VirtioBlock {
             self.metrics.rate_limiter_throttled_events.inc();
         } else if self.is_io_engine_throttled {
             self.metrics.io_engine_throttled_events.inc();
+        } else if self.stopped_on_error {
+            // The queue is taken again when the guest is resumed.
         } else {
             self.process_virtio_queues().unwrap()
         }
+    }
+
+    /// Keeps a request that the disk failed: it is not answered, the device takes no new
+    /// request, and the Vmm is woken to stop the guest.
+    fn keep_failed(&mut self, request: PendingRequest) {
+        error!(
+            "Block device {}: the disk failed a request; the guest stops and the request is \
+             kept",
+            self.id
+        );
+        self.metrics.execute_fails.inc();
+        self.kept.push_back(request);
+        self.stopped_on_error = true;
+        if !self.error_pending {
+            self.error_pending = true;
+            if let Err(err) = DISK_ERROR_EVT.write(1) {
+                error!("Failed to signal the disk error: {:?}", err);
+            }
+        }
+    }
+
+    /// Whether a disk error waits for the Vmm to stop the guest. The answer is given once.
+    pub fn take_disk_error(&mut self) -> bool {
+        std::mem::take(&mut self.error_pending)
+    }
+
+    /// Runs the kept requests again from their start, in their order. Returns whether the
+    /// queue may be taken (no request is kept any more).
+    fn run_kept(&mut self) -> bool {
+        let active_state = self.device_state.active_state().unwrap();
+        let mut used_any = false;
+        while let Some(pending) = self.kept.pop_front() {
+            let desc_idx = pending.desc_idx();
+            match pending.to_request().process(
+                &mut self.disk,
+                desc_idx,
+                &active_state.mem,
+                &self.metrics,
+                self.acked_features & (1u64 << VIRTIO_BLK_F_DISCARD) != 0,
+            ) {
+                ProcessingResult::Submitted => {}
+                ProcessingResult::Throttled => {
+                    self.kept.push_front(pending);
+                    self.is_io_engine_throttled = true;
+                    break;
+                }
+                ProcessingResult::Executed(finished) => {
+                    used_any = true;
+                    self.queues[0]
+                        .add_used(finished.desc_idx, finished.num_bytes_to_mem)
+                        .unwrap_or_else(|err| {
+                            error!(
+                                "Failed to add available descriptor head {}: {}",
+                                finished.desc_idx, err
+                            )
+                        });
+                }
+                ProcessingResult::Failed(failed) => {
+                    self.kept.push_front(failed);
+                    self.stopped_on_error = true;
+                    if !self.error_pending {
+                        self.error_pending = true;
+                        if let Err(err) = DISK_ERROR_EVT.write(1) {
+                            error!("Failed to signal the disk error: {:?}", err);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        if used_any {
+            let queue = &mut self.queues[0];
+            queue.advance_used_ring_idx();
+            if queue.prepare_kick() {
+                active_state
+                    .interrupt
+                    .trigger(VirtioInterruptType::Queue(0))
+                    .unwrap_or_else(|_| {
+                        self.metrics.event_fails.inc();
+                    });
+            }
+        }
+        if let FileEngine::Async(ref mut engine) = self.disk.file_engine
+            && let Err(err) = engine.kick_submission_queue()
+        {
+            error!("BlockError submitting pending block requests: {:?}", err);
+        }
+        self.kept.is_empty()
     }
 
     /// Process device virtio queue(s).
@@ -560,11 +683,19 @@ impl VirtioBlock {
 
     /// Device specific function for peaking inside a queue and processing descriptors.
     pub fn process_queue(&mut self, queue_index: usize) -> Result<(), InvalidAvailIdx> {
+        if self.stopped_on_error {
+            return Ok(());
+        }
+        if !self.kept.is_empty() && !self.run_kept() {
+            return Ok(());
+        }
+
         // This is safe since we checked in the event handler that the device is activated.
         let active_state = self.device_state.active_state().unwrap();
 
         let queue = &mut self.queues[queue_index];
         let mut used_any = false;
+        let mut failed_request = None;
 
         while let Some(head) = queue.pop_or_enable_notification()? {
             self.metrics.remaining_reqs_count.add(queue.len().into());
@@ -615,6 +746,11 @@ impl VirtioBlock {
                             )
                         });
                 }
+                ProcessingResult::Failed(failed) => {
+                    // The request was popped and stays with the device; no other is taken.
+                    failed_request = Some(failed);
+                    break;
+                }
             }
         }
         queue.advance_used_ring_idx();
@@ -638,6 +774,10 @@ impl VirtioBlock {
             self.metrics.no_avail_buffer.inc();
         }
 
+        if let Some(failed) = failed_request {
+            self.keep_failed(failed);
+        }
+
         Ok(())
     }
 
@@ -647,6 +787,7 @@ impl VirtioBlock {
         // This is safe since we checked in the event handler that the device is activated.
         let active_state = self.device_state.active_state().unwrap();
         let queue = &mut self.queues[0];
+        let mut failed_requests = Vec::new();
 
         loop {
             match engine.pop(&active_state.mem) {
@@ -668,6 +809,12 @@ impl VirtioBlock {
                             ))),
                         ),
                     };
+                    // A request that the disk failed is kept and stops the guest. (A read or
+                    // a write that moved fewer bytes than asked is answered as before.)
+                    if res.is_err() {
+                        failed_requests.push(pending);
+                        continue;
+                    }
                     let finished = pending.finish(&active_state.mem, res, &self.metrics);
                     queue
                         .add_used(finished.desc_idx, finished.num_bytes_to_mem)
@@ -689,6 +836,10 @@ impl VirtioBlock {
                 .unwrap_or_else(|_| {
                     self.metrics.event_fails.inc();
                 });
+        }
+
+        for failed in failed_requests {
+            self.keep_failed(failed);
         }
     }
 
@@ -750,6 +901,22 @@ impl VirtioBlock {
 
         self.drain_and_flush(false);
         if let FileEngine::Async(ref _engine) = self.disk.file_engine {
+            self.process_async_completion_queue();
+        }
+    }
+
+    /// Ends the requests in flight with no `fsync`: at a stop of the guest and at a
+    /// checkpoint. Their answers are written (or they are kept, when the disk failed them), so
+    /// that after it the device writes nothing into guest memory until it is kicked.
+    pub fn drain(&mut self) {
+        if !self.is_activated() {
+            return;
+        }
+
+        if let FileEngine::Async(ref mut engine) = self.disk.file_engine {
+            if let Err(err) = engine.drain(false) {
+                error!("Failed to drain block requests: {:?}", err);
+            }
             self.process_async_completion_queue();
         }
     }
@@ -848,7 +1015,27 @@ impl VirtioDevice for VirtioBlock {
             return false;
         }
         self.is_io_engine_throttled = false;
+        self.kept.clear();
+        self.stopped_on_error = false;
+        self.error_pending = false;
         true
+    }
+
+    fn kick(&mut self) {
+        // A resume: the kept requests run again from their start when the queue is taken.
+        self.stopped_on_error = false;
+        self.error_pending = false;
+        if self.is_activated() {
+            self.notify_queue_events();
+        }
+    }
+
+    fn quiesce(&mut self) {
+        self.drain();
+    }
+
+    fn prepare_checkpoint(&mut self) {
+        self.drain();
     }
 }
 
@@ -881,13 +1068,16 @@ mod tests {
     use crate::check_metric_after_block;
     use crate::devices::virtio::block::virtio::IO_URING_NUM_ENTRIES;
     use crate::devices::virtio::block::virtio::test_utils::{
-        RequestDescriptorChain, default_block, read_blk_req_descriptors, set_queue,
-        set_rate_limiter, simulate_async_completion_event,
+        RequestDescriptorChain, default_block, default_block_with_path, read_blk_req_descriptors,
+        set_queue, set_rate_limiter, simulate_async_completion_event,
         simulate_queue_and_async_completion_events, simulate_queue_event,
     };
-    use crate::devices::virtio::queue::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
+    use crate::devices::virtio::queue::{
+        FIRECRACKER_MAX_QUEUE_SIZE, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE,
+    };
     use crate::devices::virtio::test_utils::{VirtQueue, default_interrupt, default_mem};
     use crate::rate_limiter::TokenType;
+    use crate::snapshot::Persist;
     use crate::vstate::memory::{Address, Bytes, GuestAddress};
 
     #[test]
@@ -1072,10 +1262,12 @@ mod tests {
             blk_size: None,
             topology: None,
         };
-        assert!(matches!(
-            VirtioBlock::new(async_config),
-            Err(VirtioBlockError::DiscardAsyncUnsupported)
-        ));
+        // Discard is supported with the Async engine too.
+        let block = VirtioBlock::new(async_config).unwrap();
+        assert_eq!(
+            block.avail_features & (1u64 << VIRTIO_BLK_F_DISCARD),
+            1u64 << VIRTIO_BLK_F_DISCARD
+        );
 
         let f = TempFile::new().unwrap();
         f.as_file().set_len(0x1000).unwrap();
@@ -2171,6 +2363,309 @@ mod tests {
                 mdata.st_ino()
             );
             assert_eq!(block.disk.image_id, id.as_slice());
+        }
+    }
+
+    /// Completes the requests of an Async drive that are in flight, as the event loop would.
+    fn complete_async(block: &mut VirtioBlock) {
+        if let FileEngine::Async(ref mut engine) = block.disk.file_engine {
+            engine.drain(false).unwrap();
+        }
+        thread::sleep(Duration::from_millis(150));
+        block.process_async_completion_event();
+    }
+
+    fn async_engine(block: &mut VirtioBlock) -> &mut block_io::AsyncFileEngine {
+        match block.disk.file_engine {
+            FileEngine::Async(ref mut engine) => engine,
+            FileEngine::Sync(_) => panic!("not an Async drive"),
+        }
+    }
+
+    /// Writes `data` at `offset` of the drive's file through a descriptor of its own (the
+    /// drive's descriptor has `O_DIRECT`).
+    fn write_file_at(block: &VirtioBlock, offset: u64, data: &[u8]) {
+        use std::os::unix::fs::FileExt;
+        OpenOptions::new()
+            .write(true)
+            .open(&block.disk.file_path)
+            .unwrap()
+            .write_all_at(data, offset)
+            .unwrap();
+    }
+
+    fn read_file_at(block: &VirtioBlock, offset: u64, len: usize) -> Vec<u8> {
+        use std::os::unix::fs::FileExt;
+        let mut buf = vec![0u8; len];
+        File::open(&block.disk.file_path)
+            .unwrap()
+            .read_exact_at(&mut buf, offset)
+            .unwrap();
+        buf
+    }
+
+    /// An Async drive with a read of its first sector in the queue, that its disk fails. The
+    /// file is the drive's for as long as the returned `TempFile` lives.
+    fn async_block_with_failed_read(
+        mem: &GuestMemoryMmap,
+    ) -> (VirtioBlock, VirtQueue<'_>, TempFile) {
+        let f = TempFile::new().unwrap();
+        f.as_file().set_len(0x1000).unwrap();
+        let mut block = default_block_with_path(
+            f.as_path().to_str().unwrap().to_string(),
+            FileEngineType::Async,
+        );
+        // A queue of the size that a restore checks, after the buffers of the request.
+        let vq = VirtQueue::new(GuestAddress(0x8000), mem, FIRECRACKER_MAX_QUEUE_SIZE);
+        set_queue(&mut block, 0, vq.create_queue());
+        block.activate(mem.clone(), default_interrupt()).unwrap();
+        read_blk_req_descriptors(&vq);
+        vq.dtable[1].len.set(512);
+        mem.write_obj::<u32>(VIRTIO_BLK_T_IN, GuestAddress(vq.dtable[0].addr.get()))
+            .unwrap();
+        mem.write_obj::<u8>(0xff, GuestAddress(vq.dtable[2].addr.get()))
+            .unwrap();
+        write_file_at(&block, 0, &[0x5a; 512]);
+
+        async_engine(&mut block).fail_completions = 1;
+        simulate_queue_event(&mut block, None);
+        complete_async(&mut block);
+        (block, vq, f)
+    }
+
+    #[test]
+    fn test_async_disk_error_keeps_the_request() {
+        let mem = default_mem();
+        let (mut block, vq, _file) = async_block_with_failed_read(&mem);
+        let status_addr = GuestAddress(vq.dtable[2].addr.get());
+        let data_addr = GuestAddress(vq.dtable[1].addr.get());
+
+        // The request is kept, not answered, and the Vmm is told once.
+        assert_eq!(vq.used.idx.get(), 0);
+        assert_eq!(mem.read_obj::<u8>(status_addr).unwrap(), 0xff);
+        assert_eq!(block.kept.len(), 1);
+        assert!(block.stopped_on_error);
+        assert!(block.take_disk_error());
+        assert!(!block.take_disk_error());
+
+        // No request is taken while the device is stopped on the error.
+        vq.avail.idx.set(2);
+        vq.avail.ring[1].set(0);
+        simulate_queue_event(&mut block, None);
+        complete_async(&mut block);
+        assert_eq!(vq.used.idx.get(), 0);
+        vq.avail.idx.set(1);
+
+        // The resume kicks the device: the kept request runs again from its start.
+        block.kick();
+        block.process_queue_event();
+        complete_async(&mut block);
+        assert_eq!(vq.used.idx.get(), 1);
+        assert_eq!(vq.used.ring[0].get().id, 0);
+        assert_eq!(
+            u32::from(mem.read_obj::<u8>(status_addr).unwrap()),
+            VIRTIO_BLK_S_OK
+        );
+        let mut buf = [0u8; 512];
+        mem.read_slice(&mut buf, data_addr).unwrap();
+        assert_eq!(buf, [0x5a; 512]);
+        assert!(block.kept.is_empty());
+        assert!(!block.stopped_on_error);
+    }
+
+    #[test]
+    fn test_async_disk_error_again_at_the_resume() {
+        let mem = default_mem();
+        let (mut block, vq, _file) = async_block_with_failed_read(&mem);
+        assert!(block.take_disk_error());
+
+        // The disk fails the request again after the resume: it is kept again.
+        block.kick();
+        async_engine(&mut block).fail_completions = 1;
+        block.process_queue_event();
+        complete_async(&mut block);
+        assert_eq!(vq.used.idx.get(), 0);
+        assert_eq!(block.kept.len(), 1);
+        assert!(block.take_disk_error());
+    }
+
+    #[test]
+    fn test_kept_request_across_save_and_load() {
+        let mem = default_mem();
+        let (block, vq, _file) = async_block_with_failed_read(&mem);
+        let status_addr = GuestAddress(vq.dtable[2].addr.get());
+        let data_addr = GuestAddress(vq.dtable[1].addr.get());
+
+        let state = block.save();
+        let bytes = bitcode::serialize(&state).unwrap();
+        drop(block);
+
+        let state = bitcode::deserialize(&bytes).unwrap();
+        let mut restored = VirtioBlock::restore(
+            crate::devices::virtio::block::persist::BlockConstructorArgs { mem: mem.clone() },
+            &state,
+        )
+        .unwrap();
+        assert_eq!(restored.kept.len(), 1);
+        assert!(restored.stopped_on_error);
+        restored.activate(mem.clone(), default_interrupt()).unwrap();
+
+        // Nothing runs before the resume.
+        restored.process_queue_event();
+        assert_eq!(vq.used.idx.get(), 0);
+
+        // At the resume the kept request runs again from its start.
+        restored.kick();
+        restored.process_queue_event();
+        complete_async(&mut restored);
+        assert_eq!(vq.used.idx.get(), 1);
+        assert_eq!(
+            u32::from(mem.read_obj::<u8>(status_addr).unwrap()),
+            VIRTIO_BLK_S_OK
+        );
+        let mut buf = [0u8; 512];
+        mem.read_slice(&mut buf, data_addr).unwrap();
+        assert_eq!(buf, [0x5a; 512]);
+    }
+
+    #[test]
+    fn test_async_discard() {
+        let f = TempFile::new().unwrap();
+        f.as_file().write_all(&[0x5a; 0x1000]).unwrap();
+        let config = VirtioBlockConfig {
+            drive_id: "async_discard".to_string(),
+            path_on_host: f.as_path().to_str().unwrap().to_string(),
+            is_root_device: false,
+            partuuid: None,
+            is_read_only: false,
+            discard: true,
+            cache_type: CacheType::Writeback,
+            rate_limiter: None,
+            file_engine_type: FileEngineType::Async,
+            blk_size: None,
+            topology: None,
+        };
+        let mut block = VirtioBlock::new(config).unwrap();
+        block.acked_features = block.avail_features;
+        let mem = default_mem();
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        set_queue(&mut block, 0, vq.create_queue());
+        block.activate(mem.clone(), default_interrupt()).unwrap();
+
+        // A write of sector 0, and after it in the queue a discard of sectors 2 and 3.
+        read_blk_req_descriptors(&vq);
+        mem.write_obj(
+            RequestHeader::new(VIRTIO_BLK_T_OUT, 0),
+            GuestAddress(0x1000),
+        )
+        .unwrap();
+        vq.dtable[1].flags.set(VIRTQ_DESC_F_NEXT);
+        vq.dtable[1].len.set(512);
+        mem.write_slice(&[0x11; 512], GuestAddress(0x2000)).unwrap();
+
+        vq.dtable[3].set(0x4000, 16, VIRTQ_DESC_F_NEXT, 4);
+        vq.dtable[4].set(0x5000, 16, VIRTQ_DESC_F_NEXT, 5);
+        vq.dtable[5].set(0x6000, 1, VIRTQ_DESC_F_WRITE, 0);
+        mem.write_obj(
+            RequestHeader::new(VIRTIO_BLK_T_DISCARD, 0),
+            GuestAddress(0x4000),
+        )
+        .unwrap();
+        let mut range = [0u8; 16];
+        range[0..8].copy_from_slice(&2u64.to_le_bytes());
+        range[8..12].copy_from_slice(&2u32.to_le_bytes());
+        mem.write_slice(&range, GuestAddress(0x5000)).unwrap();
+        vq.avail.ring[1].set(3);
+        vq.avail.idx.set(2);
+
+        simulate_queue_event(&mut block, None);
+        complete_async(&mut block);
+
+        // Both are answered: the discard first, at once; the write when its completion is taken.
+        assert_eq!(vq.used.idx.get(), 2);
+        assert_eq!(vq.used.ring[0].get().id, 3);
+        assert_eq!(vq.used.ring[1].get().id, 0);
+        assert_eq!(
+            u32::from(mem.read_obj::<u8>(GuestAddress(0x3000)).unwrap()),
+            VIRTIO_BLK_S_OK
+        );
+        assert_eq!(
+            u32::from(mem.read_obj::<u8>(GuestAddress(0x6000)).unwrap()),
+            VIRTIO_BLK_S_OK
+        );
+        assert!(block.kept.is_empty());
+
+        let data = read_file_at(&block, 0, 0x1000);
+        assert_eq!(&data[0..512], &[0x11; 512]);
+        assert_eq!(&data[512..1024], &[0x5a; 512]);
+        assert_eq!(&data[1024..2048], &[0u8; 1024]);
+        assert_eq!(&data[2048..], &[0x5a; 2048]);
+    }
+
+    #[test]
+    fn test_drain_for_a_stop_and_a_checkpoint_has_no_fsync() {
+        let f = TempFile::new().unwrap();
+        f.as_file().set_len(0x1000).unwrap();
+        let config = VirtioBlockConfig {
+            drive_id: "drain".to_string(),
+            path_on_host: f.as_path().to_str().unwrap().to_string(),
+            is_root_device: false,
+            partuuid: None,
+            is_read_only: false,
+            discard: false,
+            cache_type: CacheType::Writeback,
+            rate_limiter: None,
+            file_engine_type: FileEngineType::Async,
+            blk_size: None,
+            topology: None,
+        };
+        let mut block = VirtioBlock::new(config).unwrap();
+        let mem = default_mem();
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        block.queues[0] = vq.create_queue();
+        block.activate(mem.clone(), default_interrupt()).unwrap();
+
+        // The stop of the guest ends the requests in flight and answers them, with no fsync.
+        add_flush_requests_batch(&mut block, &vq, 5);
+        simulate_queue_event(&mut block, None);
+        VirtioDevice::quiesce(&mut block);
+        check_flush_requests_batch(5, &vq);
+        assert_eq!(async_engine(&mut block).sync_all_calls, 0);
+
+        // So does the checkpoint variant of prepare_save.
+        add_flush_requests_batch(&mut block, &vq, 5);
+        simulate_queue_event(&mut block, None);
+        VirtioDevice::prepare_checkpoint(&mut block);
+        check_flush_requests_batch(5, &vq);
+        assert_eq!(async_engine(&mut block).sync_all_calls, 0);
+
+        // A snapshot's prepare_save syncs the drive.
+        add_flush_requests_batch(&mut block, &vq, 5);
+        simulate_queue_event(&mut block, None);
+        block.prepare_save();
+        check_flush_requests_batch(5, &vq);
+        assert_eq!(async_engine(&mut block).sync_all_calls, 1);
+    }
+
+    #[test]
+    fn test_async_drive_opens_with_o_direct() {
+        for (engine, direct) in [(FileEngineType::Async, true), (FileEngineType::Sync, false)] {
+            let mut block = default_block(engine);
+            let fd = block.disk.file_engine.file().as_raw_fd();
+            // SAFETY: fcntl on a descriptor of this test.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            assert_eq!(flags & libc::O_DIRECT != 0, direct);
+
+            // A new path of the drive (PATCH /drives) is opened the same way.
+            let f = TempFile::new().unwrap();
+            f.as_file().set_len(0x1000).unwrap();
+            block
+                .update_disk_image(f.as_path().to_str().unwrap().to_string())
+                .unwrap();
+            let fd = block.disk.file_engine.file().as_raw_fd();
+            // SAFETY: fcntl on a descriptor of this test.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            assert_eq!(flags & libc::O_DIRECT != 0, direct);
         }
     }
 }

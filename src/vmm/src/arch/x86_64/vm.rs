@@ -126,11 +126,14 @@ impl KvmVm {
 
     /// Restores the KVM VM state.
     ///
+    /// The guest's clock is not set here: the clock of the state is set by the resume that
+    /// follows the load (see [`KvmVm::set_clock`]), so that the time for which the guest waits
+    /// loaded is not time of the guest. `clock_realtime` is only checked against the state.
+    ///
     /// # Errors
     ///
     /// When:
     /// - [`kvm_ioctls::VmFd::set_pit`] errors.
-    /// - [`kvm_ioctls::VmFd::set_clock`] errors.
     /// - [`kvm_ioctls::VmFd::set_irqchip`] errors.
     /// - [`kvm_ioctls::VmFd::set_irqchip`] errors.
     /// - [`kvm_ioctls::VmFd::set_irqchip`] errors.
@@ -142,17 +145,10 @@ impl KvmVm {
         self.fd()
             .set_pit2(&state.pitstate)
             .map_err(KvmVmError::SetPit2)?;
-        let mut clock = state.clock;
-        clock.flags = if clock_realtime {
-            // clock_realtime needs to be present in the snapshot
-            if clock.flags & KVM_CLOCK_REALTIME == 0 {
-                return Err(KvmVmError::ClockRealtimeNotInState);
-            }
-            KVM_CLOCK_REALTIME
-        } else {
-            0
-        };
-        self.fd().set_clock(&clock).map_err(KvmVmError::SetClock)?;
+        // clock_realtime needs to be present in the snapshot
+        if clock_realtime && state.clock.flags & KVM_CLOCK_REALTIME == 0 {
+            return Err(KvmVmError::ClockRealtimeNotInState);
+        }
         self.fd()
             .set_irqchip(&state.pic_master)
             .map_err(KvmVmError::SetIrqChipPicMaster)?;
@@ -183,11 +179,33 @@ impl KvmVm {
             .map_err(KvmVmError::VmSetIrqChip)
     }
 
+    /// Reads the guest's clock (`KVM_GET_CLOCK`).
+    pub fn get_clock(&self) -> Result<kvm_clock_data, KvmVmError> {
+        self.fd().get_clock().map_err(KvmVmError::VmGetClock)
+    }
+
+    /// Sets the guest's clock (`KVM_SET_CLOCK`) to `clock`. With `realtime`, KVM adds the
+    /// wall-clock time that passed since the clock was read (`clock_realtime` of a load).
+    pub fn set_clock(&self, clock: &kvm_clock_data, realtime: bool) -> Result<(), KvmVmError> {
+        let mut clock = *clock;
+        clock.flags = if realtime { KVM_CLOCK_REALTIME } else { 0 };
+        self.fd().set_clock(&clock).map_err(KvmVmError::SetClock)
+    }
+
     /// Saves and returns the KVM VM state.
-    pub fn save_state(&self) -> Result<VmState, KvmVmError> {
+    ///
+    /// `stopped_clock` is the clock that was saved when the guest stopped; a guest that is
+    /// stopped holds that clock in its state. With none, the clock is read now.
+    pub fn save_state(
+        &self,
+        stopped_clock: Option<&kvm_clock_data>,
+    ) -> Result<VmState, KvmVmError> {
         let pitstate = self.fd().get_pit2().map_err(KvmVmError::VmGetPit2)?;
 
-        let clock = self.fd().get_clock().map_err(KvmVmError::VmGetClock)?;
+        let clock = match stopped_clock {
+            Some(clock) => *clock,
+            None => self.get_clock()?,
+        };
 
         let mut pic_master = kvm_irqchip {
             chip_id: KVM_IRQCHIP_PIC_MASTER,
@@ -251,6 +269,13 @@ pub struct VmState {
     ioapic: kvm_irqchip,
 }
 
+impl VmState {
+    /// The guest's clock in this state.
+    pub fn clock(&self) -> &kvm_clock_data {
+        &self.clock
+    }
+}
+
 impl fmt::Debug for VmState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VmState")
@@ -281,12 +306,12 @@ mod tests {
     fn test_vm_save_restore_state() {
         let vm = setup_vm();
         // Irqchips, clock and pitstate are not configured so trying to save state should fail.
-        vm.save_state().unwrap_err();
+        vm.save_state(None).unwrap_err();
 
         let vm = setup_vm_with_memory(0x1000);
         vm.setup_irqchip().unwrap();
 
-        let vm_state = vm.save_state().unwrap();
+        let vm_state = vm.save_state(None).unwrap();
         assert_eq!(
             vm_state.pitstate.flags | KVM_PIT_SPEAKER_DUMMY,
             KVM_PIT_SPEAKER_DUMMY
@@ -316,7 +341,7 @@ mod tests {
             != 0;
 
         // mock a state without realtime information
-        let mut vm_state = vm.save_state().unwrap();
+        let mut vm_state = vm.save_state(None).unwrap();
         vm_state.clock.flags &= !KVM_CLOCK_REALTIME;
 
         let mut vm = setup_vm_with_memory(0x1000);
@@ -337,7 +362,9 @@ mod tests {
         let mut vm = setup_vm_with_memory(0x1000);
         vm.setup_irqchip().unwrap();
 
-        let res = vm.restore_state(&vm_state, true);
+        vm.restore_state(&vm_state, true).unwrap();
+        // The clock is set by the resume that follows the load.
+        let res = vm.set_clock(vm_state.clock(), true);
         if clock_realtime_supported {
             res.unwrap()
         } else {
@@ -347,12 +374,45 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
+    fn test_vm_restore_state_keeps_clock_unset() {
+        // A state whose clock is far ahead of a new VM's clock.
+        let vm = setup_vm_with_memory(0x1000);
+        vm.setup_irqchip().unwrap();
+        let mut ahead = vm.get_clock().unwrap();
+        ahead.clock += 1_000_000_000_000;
+        let vm_state = vm.save_state(Some(&ahead)).unwrap();
+        // A state saved with the clock of a stop holds that clock.
+        assert_eq!(vm_state.clock().clock, ahead.clock);
+
+        let mut vm = setup_vm_with_memory(0x1000);
+        vm.setup_irqchip().unwrap();
+        vm.restore_state(&vm_state, false).unwrap();
+        // The load does not set the clock of the state.
+        assert!(vm.get_clock().unwrap().clock < 1_000_000_000_000);
+        vm.set_clock(vm_state.clock(), false).unwrap();
+        let now = vm.get_clock().unwrap().clock;
+        assert!(now >= ahead.clock && now < ahead.clock + 1_000_000_000);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_vm_save_state_reads_clock_of_now() {
+        let vm = setup_vm_with_memory(0x1000);
+        vm.setup_irqchip().unwrap();
+        let before = vm.get_clock().unwrap().clock;
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let state = vm.save_state(None).unwrap();
+        assert!(state.clock().clock >= before + 20_000_000);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
     fn test_vm_save_restore_state_bad_irqchip() {
         use kvm_bindings::KVM_NR_IRQCHIPS;
 
         let vm = setup_vm_with_memory(0x1000);
         vm.setup_irqchip().unwrap();
-        let mut vm_state = vm.save_state().unwrap();
+        let mut vm_state = vm.save_state(None).unwrap();
 
         let mut vm = setup_vm_with_memory(0x1000);
         vm.setup_irqchip().unwrap();
@@ -379,7 +439,7 @@ mod tests {
     fn test_vmstate_serde() {
         let mut vm = setup_vm_with_memory(0x1000);
         vm.setup_irqchip().unwrap();
-        let state = vm.save_state().unwrap();
+        let state = vm.save_state(None).unwrap();
 
         // Test direct bitcode serialization
         let serialized_data = bitcode::serialize(&state).unwrap();

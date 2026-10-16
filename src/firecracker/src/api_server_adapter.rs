@@ -67,6 +67,22 @@ impl ApiServerAdapter {
         }));
         event_manager.add_subscriber(api_adapter.clone());
         loop {
+            // A stopped guest (a pause request, the end of a lease, a disk error, a load with no
+            // resume) freezes the devices: the event loop does not turn until a resume succeeds.
+            let stopped = vmm.lock().unwrap().is_stopped();
+            if stopped {
+                api_adapter
+                    .lock()
+                    .expect("Poisoned lock")
+                    .serve_while_stopped(event_manager);
+            }
+
+            match vmm.lock().unwrap().shutdown_exit_code() {
+                Some(FcExitCode::Ok) => break,
+                Some(exit_code) => return Err(ApiServerError::MicroVMStoppedWithError(exit_code)),
+                None => {}
+            }
+
             event_manager
                 .run()
                 .expect("EventManager events driver fatal error");
@@ -95,27 +111,35 @@ impl ApiServerAdapter {
 
     fn handle_request(&mut self, event_manager: &mut EventManager) {
         if let Some(api_request) = self.request.take() {
-            let request_is_pause = *api_request == VmmAction::Pause;
             self._handle_request(*api_request, event_manager);
-
-            // If the latest req is a pause request, temporarily switch to a mode where we
-            // do blocking `recv`s on the `from_api` receiver in a loop, until we get
-            // unpaused. The device emulation is implicitly paused since we do not
-            // relinquish control to the event manager because we're not returning from
-            // `process`.
-            if request_is_pause {
-                // This loop only attempts to process API requests, so things like the
-                // metric flush timerfd handling are frozen as well.
-                loop {
-                    let req = self.from_api.recv().expect("Error receiving API request.");
-                    let req_is_resume = *req == VmmAction::Resume;
-                    self._handle_request(*req, event_manager);
-                    if req_is_resume {
-                        break;
-                    }
-                }
-            }
         }
+    }
+
+    /// Serves API requests while the guest is stopped, with no turn of the event loop, so that
+    /// device emulation (and things like the metric flush timerfd) is frozen. Returns when a
+    /// resume succeeded or the VMM is to exit.
+    fn serve_while_stopped(&mut self, event_manager: &mut EventManager) {
+        let from_api = &self.from_api;
+        let api_event_fd = &self.api_event_fd;
+        let to_api = &self.to_api;
+        self.controller.serve_while_stopped(
+            event_manager,
+            |timeout| {
+                let request = from_api.recv_timeout(timeout)?;
+                // Also consume the API event that goes with the request, as the loop before
+                // the boot does. The API thread writes it right after the request.
+                api_event_fd
+                    .read()
+                    .expect("VMM: Failed to read the API event_fd");
+                Ok(request)
+            },
+            |response| {
+                to_api
+                    .send(response)
+                    .map_err(|_| ())
+                    .expect("one-shot channel closed")
+            },
+        );
     }
 }
 impl MutEventSubscriber for ApiServerAdapter {

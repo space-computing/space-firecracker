@@ -266,12 +266,10 @@ impl<'a> Persist<'a> for MMIOPlatformDevices {
     }
 }
 
-impl<'a> Persist<'a> for MMIOVirtioDevices {
-    type State = DeviceStates;
-    type ConstructorArgs = MMIODevManagerConstructorArgs<'a>;
-    type Error = DevicePersistError;
-
-    fn save(&self) -> Self::State {
+impl MMIOVirtioDevices {
+    /// Saves the state of the devices; `prepare` readies each device first (`prepare_save`
+    /// for a snapshot, `prepare_checkpoint` for a checkpoint).
+    pub(crate) fn save_with(&self, prepare: &dyn Fn(&mut dyn VirtioDevice)) -> DeviceStates {
         let mut states = DeviceStates::default();
 
         let _: Result<(), ()> = self.for_each_virtio_mmio_device(|_, devid, device| {
@@ -280,7 +278,7 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
             // We need to call `prepare_save()` on the device before saving the transport
             // so that, if we modify the transport state while preparing the device, e.g. sending
             // an interrupt to the guest, this is correctly captured in the saved transport state.
-            locked_device.prepare_save();
+            prepare(&mut *locked_device);
             let transport_state = mmio_transport_locked.save();
             let device_info = device.resources;
             let device_id = devid.clone();
@@ -396,6 +394,16 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
             Ok(())
         });
         states
+    }
+}
+
+impl<'a> Persist<'a> for MMIOVirtioDevices {
+    type State = DeviceStates;
+    type ConstructorArgs = MMIODevManagerConstructorArgs<'a>;
+    type Error = DevicePersistError;
+
+    fn save(&self) -> Self::State {
+        self.save_with(&|device| device.prepare_save())
     }
 
     fn restore(

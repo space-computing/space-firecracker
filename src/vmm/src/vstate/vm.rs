@@ -1191,7 +1191,7 @@ pub(crate) mod tests {
             (gsi, range.start())
         };
 
-        let state = vm.save_state().unwrap();
+        let state = vm.save_state(None).unwrap();
         let serialized_data = bitcode::serialize(&state).unwrap();
 
         let restored_state: VmState = bitcode::deserialize(&serialized_data).unwrap();

@@ -64,6 +64,8 @@ pub struct VirtioBlockState {
     blk_size: u32,
     topology: VirtioBlkTopology,
     discard_sector_alignment: u32,
+    /// The requests that a disk error kept, in their order; they run again at the resume.
+    kept_requests: Vec<KeptRequestState>,
 }
 
 impl Persist<'_> for VirtioBlock {
@@ -85,6 +87,7 @@ impl Persist<'_> for VirtioBlock {
             blk_size: self.config_space.blk_size,
             topology: self.config_space.topology,
             discard_sector_alignment: self.config_space.discard_sector_alignment,
+            kept_requests: self.kept.iter().map(KeptRequestState::from).collect(),
         }
     }
 
@@ -145,6 +148,14 @@ impl Persist<'_> for VirtioBlock {
             rate_limiter,
             is_io_engine_throttled: false,
             metrics: BlockMetricsPerDevice::alloc(state.id.clone()),
+
+            kept: state
+                .kept_requests
+                .iter()
+                .map(PendingRequest::from)
+                .collect(),
+            stopped_on_error: !state.kept_requests.is_empty(),
+            error_pending: false,
         })
     }
 }

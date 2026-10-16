@@ -767,7 +767,8 @@ paths:
       summary: Creates a full or diff snapshot. Post-boot only.
       description:
         Creates a snapshot of the microVM state. The microVM should be
-        in the `Paused` state.
+        in the `Paused` state. With no mem_file_path, only the state is
+        written; no memory is written and no dirty bitmap is read or reset.
       operationId: createSnapshot
       parameters:
         - name: body
@@ -866,6 +867,63 @@ paths:
           description: OK
           schema:
             $ref: "#/definitions/FullVmConfiguration"
+        default:
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/Error"
+
+  /space/memory:
+    get:
+      summary: Gets the regions of guest memory. Post-boot only.
+      description:
+        For each region of guest memory, its address in the Firecracker
+        process, its size, its guest physical address, and its offset in the
+        memory file of a snapshot (the same offset that a UFFD handler gets at
+        a load). Numbers are in bytes.
+      operationId: getSpaceMemory
+      responses:
+        200:
+          description: The memory regions
+          schema:
+            $ref: "#/definitions/SpaceMemoryRegions"
+        400:
+          description: The regions cannot be read
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/Error"
+
+  /space/fill:
+    put:
+      summary: Starts the fill of guest memory. Post-boot only.
+      description:
+        Populates every page of the plugged guest memory for writing
+        (madvise MADV_POPULATE_WRITE) on a thread of its own, while the guest
+        runs on. Afterwards no page of the guest is a page of the page cache.
+        The body is empty or an empty object. A fill that runs is not started
+        again.
+      operationId: putSpaceFill
+      responses:
+        204:
+          description: The fill started
+        400:
+          description: The fill cannot start (one runs already)
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/Error"
+    get:
+      summary: Gets what the fill of guest memory is doing. Post-boot only.
+      operationId: getSpaceFill
+      responses:
+        200:
+          description: The state of the fill
+          schema:
+            $ref: "#/definitions/SpaceFillStatus"
         default:
           description: Internal server error
           schema:
@@ -1243,7 +1301,8 @@ definitions:
         description:
           Enables virtio-blk discard support. When enabled, the guest can issue
           discard/TRIM requests for this drive. Only supported for writable
-          virtio-block devices using the Sync IO engine.
+          virtio-block devices. With the Async IO engine, a discard lets the
+          requests in flight end first.
           This field is optional for virtio-block config and should be omitted for vhost-user-block configuration.
         default: false
       path_on_host:
@@ -1257,7 +1316,10 @@ definitions:
         type: string
         description:
           Type of the IO engine used by the device. "Async" is supported on
-          host kernels newer than 5.10.51.
+          host kernels newer than 5.10.51. An "Async" drive opens its file with
+          O_DIRECT, and a request that its disk fails stops the guest
+          (paused_reason disk-error) and is kept, not answered; it runs again
+          from its start when the guest is resumed, and a snapshot carries it.
           This field is optional for virtio-block config and should be omitted for vhost-user-block configuration.
         enum: ["Sync", "Async"]
         default: "Sync"
@@ -1415,6 +1477,26 @@ definitions:
           - Paused
       vmm_version:
         description: MicroVM hypervisor build version.
+        type: string
+      ran_since_load:
+        description:
+          Whether a resume succeeded since the microVM was booted or loaded
+          from a snapshot.
+        type: boolean
+      paused_reason:
+        description:
+          Why the microVM is paused; absent while it is not paused. api - a
+          pause request; load - loaded from a snapshot and not resumed yet;
+          lease - the lease of the checkpoints ended; disk-error - a request
+          of the drive paused_drive_id failed.
+        type: string
+        enum:
+          - api
+          - load
+          - lease
+          - disk-error
+      paused_drive_id:
+        description: The drive whose error paused the microVM (with paused_reason disk-error).
         type: string
 
   Logger:
@@ -1664,12 +1746,13 @@ definitions:
   SnapshotCreateParams:
     type: object
     required:
-      - mem_file_path
       - snapshot_path
     properties:
       mem_file_path:
         type: string
-        description: Path to the file that will contain the guest memory.
+        description:
+          Path to the file that will contain the guest memory. Optional; with
+          none, the snapshot holds the state only.
       snapshot_path:
         type: string
         description: Path to the file that will contain the microVM state.
@@ -1930,6 +2013,61 @@ definitions:
       firecracker_version:
         description: Firecracker build version.
         type: string
+
+  SpaceMemoryRegion:
+    type: object
+    required:
+      - host_addr
+      - size
+      - guest_addr
+      - offset
+    properties:
+      host_addr:
+        type: integer
+        format: int64
+        description: The address of the region in the Firecracker process.
+      size:
+        type: integer
+        format: int64
+        description: The size of the region in bytes.
+      guest_addr:
+        type: integer
+        format: int64
+        description: The guest physical address where the region starts.
+      offset:
+        type: integer
+        format: int64
+        description: The offset of the region in the memory file of a snapshot.
+
+  SpaceMemoryRegions:
+    type: object
+    required:
+      - regions
+    properties:
+      regions:
+        type: array
+        items:
+          $ref: "#/definitions/SpaceMemoryRegion"
+
+  SpaceFillStatus:
+    type: object
+    required:
+      - state
+    properties:
+      state:
+        type: string
+        description:
+          idle - no fill was asked for; running - a fill runs; done - the last
+          fill populated every page; failed - the last fill stopped with an
+          error.
+        enum:
+          - idle
+          - running
+          - done
+          - failed
+      error:
+        type: string
+        description: Why the last fill failed.
 
   Vsock:
     type: object

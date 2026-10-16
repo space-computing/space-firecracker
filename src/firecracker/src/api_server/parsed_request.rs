@@ -27,6 +27,7 @@ use super::request::mmds::{parse_get_mmds, parse_patch_mmds, parse_put_mmds};
 use super::request::net::{parse_patch_net, parse_put_net};
 use super::request::pmem::{parse_patch_pmem, parse_put_pmem};
 use super::request::snapshot::{parse_patch_vm_state, parse_put_snapshot};
+use super::request::space::{parse_get_space, parse_put_space};
 use super::request::version::parse_get_version;
 use super::request::vsock::parse_put_vsock;
 use crate::api_server::request::hotplug::memory::{
@@ -93,7 +94,9 @@ impl TryFrom<&Request> for ParsedRequest {
             (Method::Get, "hotplug", None) if path_tokens.next() == Some("memory") => {
                 parse_get_memory_hotplug()
             }
+            (Method::Get, "space", None) => parse_get_space(path_tokens),
             (Method::Get, _, Some(_)) => method_to_error(Method::Get),
+            (Method::Put, "space", body) => parse_put_space(body, path_tokens),
             (Method::Put, "actions", Some(body)) => parse_put_actions(body),
             (Method::Put, "balloon", Some(body)) => parse_put_balloon(body),
             (Method::Put, "boot-source", Some(body)) => parse_put_boot_source(body),
@@ -211,6 +214,8 @@ impl ParsedRequest {
                     &serde_json::json!({ "firecracker_version": version.as_str() }),
                 ),
                 VmmData::FullVmConfig(config) => Self::success_response_with_data(config),
+                VmmData::SpaceMemory(regions) => Self::success_response_with_data(regions),
+                VmmData::SpaceFill(status) => Self::success_response_with_data(status),
             },
             Err(vmm_action_error) => {
                 let mut response = match vmm_action_error {
@@ -366,6 +371,7 @@ pub mod tests {
     use vmm::vmm_config::balloon::{BalloonDeviceConfig, BalloonStats};
     use vmm::vmm_config::instance_info::InstanceInfo;
     use vmm::vmm_config::machine_config::MachineConfig;
+    use vmm::vmm_config::space::{FillStatus, MemoryRegion, MemoryRegions};
 
     use super::*;
 
@@ -629,6 +635,12 @@ pub mod tests {
                     &serde_json::json!({ "firecracker_version": version.as_str() }).to_string(),
                     200,
                 ),
+                VmmData::SpaceMemory(regions) => {
+                    http_response(&serde_json::to_string(regions).unwrap(), 200)
+                }
+                VmmData::SpaceFill(status) => {
+                    http_response(&serde_json::to_string(status).unwrap(), 200)
+                }
             };
             let response = ParsedRequest::convert_to_response(&data);
             response.write_all(&mut buf).unwrap();
@@ -650,6 +662,15 @@ pub mod tests {
         verify_ok_response_with(VmmData::MmdsValue(serde_json::from_str("{}").unwrap()));
         verify_ok_response_with(VmmData::InstanceInformation(InstanceInfo::default()));
         verify_ok_response_with(VmmData::VmmVersion(String::default()));
+        verify_ok_response_with(VmmData::SpaceMemory(MemoryRegions {
+            regions: vec![MemoryRegion {
+                host_addr: 1 << 40,
+                size: 1 << 30,
+                guest_addr: 0,
+                offset: 0,
+            }],
+        }));
+        verify_ok_response_with(VmmData::SpaceFill(FillStatus::default()));
 
         // Error.
         let error = VmmActionError::StartMicrovm(StartMicrovmError::MissingKernelConfig);
@@ -672,6 +693,36 @@ pub mod tests {
         connection.try_read().unwrap();
         let req = connection.pop_parsed_request().unwrap();
         ParsedRequest::try_from(&req).unwrap();
+    }
+
+    #[test]
+    fn test_try_from_space() {
+        for (method, path, body, action) in [
+            ("GET", "/space/memory", None, VmmAction::GetSpaceMemory),
+            ("GET", "/space/fill", None, VmmAction::GetSpaceFill),
+            ("PUT", "/space/fill", Some("{}"), VmmAction::StartSpaceFill),
+        ] {
+            let (mut sender, receiver) = UnixStream::pair().unwrap();
+            let mut connection = HttpConnection::new(receiver);
+            sender
+                .write_all(http_request(method, path, body).as_bytes())
+                .unwrap();
+            connection.try_read().unwrap();
+            let req = connection.pop_parsed_request().unwrap();
+            assert_eq!(
+                vmm_action_from_request(ParsedRequest::try_from(&req).unwrap()),
+                action
+            );
+        }
+
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        let mut connection = HttpConnection::new(receiver);
+        sender
+            .write_all(http_request("GET", "/space/other", None).as_bytes())
+            .unwrap();
+        connection.try_read().unwrap();
+        let req = connection.pop_parsed_request().unwrap();
+        ParsedRequest::try_from(&req).unwrap_err();
     }
 
     #[test]

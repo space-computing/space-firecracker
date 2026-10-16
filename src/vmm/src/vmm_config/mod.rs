@@ -34,6 +34,8 @@ pub mod pmem;
 /// Wrapper for configuring microVM snapshots and the microVM state.
 pub mod serial;
 pub mod snapshot;
+/// The bodies of the `/space/` endpoints.
+pub mod space;
 /// Wrapper for configuring the vsock devices attached to the microVM.
 pub mod vsock;
 

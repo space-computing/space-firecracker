@@ -345,12 +345,10 @@ impl<'a> Debug for PciDevicesConstructorArgs<'a> {
     }
 }
 
-impl<'a> Persist<'a> for PciDevices {
-    type State = PciDevicesState;
-    type ConstructorArgs = PciDevicesConstructorArgs<'a>;
-    type Error = DevicePersistError;
-
-    fn save(&self) -> Self::State {
+impl PciDevices {
+    /// Saves the state of the devices; `prepare` readies each device first (`prepare_save`
+    /// for a snapshot, `prepare_checkpoint` for a checkpoint).
+    pub(crate) fn save_with(&self, prepare: &dyn Fn(&mut dyn VirtioDevice)) -> PciDevicesState {
         let mut state = PciDevicesState::default();
 
         for pci_dev in self.virtio_devices.values() {
@@ -360,7 +358,7 @@ impl<'a> Persist<'a> for PciDevices {
             // so that, if we modify the transport state while preparing the device, e.g. sending
             // an interrupt to the guest, this is correctly captured in the saved transport state.
             let mut locked_virtio_dev = virtio_dev.lock().expect("Poisoned lock");
-            locked_virtio_dev.prepare_save();
+            prepare(&mut *locked_virtio_dev);
             let transport_state = locked_pci_dev.state();
 
             let sbdf = transport_state.sbdf;
@@ -488,6 +486,16 @@ impl<'a> Persist<'a> for PciDevices {
         }
 
         state
+    }
+}
+
+impl<'a> Persist<'a> for PciDevices {
+    type State = PciDevicesState;
+    type ConstructorArgs = PciDevicesConstructorArgs<'a>;
+    type Error = DevicePersistError;
+
+    fn save(&self) -> Self::State {
+        self.save_with(&|device| device.prepare_save())
     }
 
     fn restore(

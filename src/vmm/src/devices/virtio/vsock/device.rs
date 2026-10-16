@@ -473,6 +473,9 @@ where
             });
         }
     }
+    fn prepare_checkpoint(&mut self) {
+        // A checkpoint keeps the connections of the guest: the guest goes on with them.
+    }
 }
 
 #[cfg(test)]

@@ -257,6 +257,17 @@ pub trait VirtioDevice: AsAny + MutEventSubscriber + Send {
 
     /// Prepare the device for saving its state
     fn prepare_save(&mut self) {}
+
+    /// Prepare the device for saving its state at a checkpoint, while the guest is stopped for a
+    /// moment only: as `prepare_save`, but with no work that a checkpoint must not do (the block
+    /// device ends its requests in flight with no `fsync`; vsock keeps its connections).
+    fn prepare_checkpoint(&mut self) {
+        self.prepare_save()
+    }
+
+    /// Ends the work in flight when the guest stops (a pause request, the end of a lease, a
+    /// disk error): after it the device writes nothing into guest memory until it is kicked.
+    fn quiesce(&mut self) {}
 }
 
 impl fmt::Debug for dyn VirtioDevice {

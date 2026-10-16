@@ -40,6 +40,12 @@ impl BlockIoError {
             _ => false,
         }
     }
+
+    /// Whether the disk failed the request (an error of the `Async` engine's I/O). Such a
+    /// request stops the guest and is kept; every other error is answered to the guest.
+    pub fn is_disk_error(&self) -> bool {
+        matches!(self, BlockIoError::Async(AsyncIoError::IO(_)))
+    }
 }
 
 #[derive(Debug)]

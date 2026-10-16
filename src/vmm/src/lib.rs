@@ -104,6 +104,8 @@ pub mod seccomp;
 pub mod signal_handler;
 /// Serialization and deserialization facilities
 pub mod snapshot;
+/// The parts of the `/space/` endpoints that run beside the VMM: the fill of guest memory.
+pub mod space;
 /// Utility functions for integration and benchmark testing
 pub mod test_utils;
 /// Utility functions and struct
@@ -137,6 +139,7 @@ use crate::devices::virtio::balloon::{
 };
 use crate::devices::virtio::block::BlockError;
 use crate::devices::virtio::block::device::Block;
+use crate::devices::virtio::block::virtio::device::DISK_ERROR_EVT;
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceId, VirtioDeviceType};
 use crate::devices::virtio::mem::device::VirtioMem;
 use crate::devices::virtio::mem::{VIRTIO_MEM_DEV_ID, VirtioMemError, VirtioMemStatus};
@@ -154,11 +157,12 @@ use crate::vmm_config::HotplugDeviceConfig;
 use crate::vmm_config::balloon::BalloonDeviceConfig;
 use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::entropy::EntropyDeviceConfig;
-use crate::vmm_config::instance_info::{InstanceInfo, VmState};
+use crate::vmm_config::instance_info::{InstanceInfo, PausedReason, VmState};
 use crate::vmm_config::machine_config::MachineConfig;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vmm_config::mmds::MmdsConfig;
 use crate::vmm_config::net::NetworkInterfaceConfig;
+use crate::vmm_config::space::{FillStatus, MemoryRegion, MemoryRegions};
 use crate::vmm_config::vsock::VsockDeviceConfig;
 pub use crate::vstate::kvm::Kvm;
 use crate::vstate::memory::{GuestMemoryMmap, GuestMemoryRegion};
@@ -271,6 +275,10 @@ pub enum VmmError {
     NotSupported,
     /// Failed to create memory hotplug device: {0}
     VirtioMem(#[from] VirtioMemError),
+    /// The resume is refused: {0}
+    ResumeRefused(String),
+    /// Fill of guest memory: {0}
+    Fill(#[from] space::FillError),
 }
 
 /// Shorthand type for KVM dirty page bitmap.
@@ -308,6 +316,28 @@ pub struct Vmm {
     pub vm: Vm,
     // Device manager
     device_manager: DeviceManager,
+
+    // The guest's clock while the guest is stopped: saved when it stopped (a pause request,
+    // the end of a lease, a disk error), or taken from the state at a load. It is set again
+    // just before the vCPUs run, so that the time for which the guest stands stopped or waits
+    // loaded is not time of the guest.
+    #[cfg(target_arch = "x86_64")]
+    stopped_clock: Option<StoppedClock>,
+    // Why a resume is refused, while one is.
+    resume_refused: Option<String>,
+    // The thread that populates guest memory (`PUT /space/fill`).
+    filler: space::Filler,
+}
+
+/// The guest's clock of a stopped guest, and whether KVM adds the wall-clock time since it was
+/// read when it is set (`clock_realtime` of a load).
+#[cfg(target_arch = "x86_64")]
+#[derive(Debug, Clone, Copy)]
+pub struct StoppedClock {
+    /// The clock.
+    pub clock: kvm_bindings::kvm_clock_data,
+    /// Whether the time since it was read is added when it is set.
+    pub realtime: bool,
 }
 
 impl Vmm {
@@ -459,27 +489,159 @@ impl Vmm {
         }
     }
 
-    /// Sends a resume command to the vCPUs.
+    /// Resumes a stopped guest: the devices are kicked (a drive runs its kept requests again),
+    /// the clock of the stop is set, and the vCPUs run. A refused or failed resume leaves the
+    /// guest stopped, with its reason.
     pub fn resume_vm(&mut self) -> Result<(), VmmError> {
         let kvm_vm = self
             .vm
             .as_kvm()
             .ok_or_else(|| VmmError::NotSupportedOnVmType(self.vm.type_name()))?;
+        if let Some(why) = &self.resume_refused {
+            return Err(VmmError::ResumeRefused(why.clone()));
+        }
         self.device_manager.kick_virtio_devices();
+        #[cfg(target_arch = "x86_64")]
+        if let Some(stopped) = &self.stopped_clock {
+            kvm_vm
+                .set_clock(&stopped.clock, stopped.realtime)
+                .map_err(vstate::vm::VmError::Arch)?;
+        }
         kvm_vm.resume_vcpus()?;
-        self.instance_info.state = VmState::Running;
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.stopped_clock = None;
+        }
+        self.instance_info.set_running();
         Ok(())
     }
 
-    /// Sends a pause command to the vCPUs.
+    /// Stops the guest for a pause request of the API. See [`Vmm::stop_vm`].
     pub fn pause_vm(&mut self) -> Result<(), VmmError> {
+        self.stop_vm(PausedReason::Api)
+    }
+
+    /// Stops the guest for `reason`: the vCPUs stop, the guest's clock is saved, and the
+    /// devices end their work in flight (the disk requests of the `Async` engine end). The
+    /// loop of the VMM thread then serves only API requests until a resume succeeds, so that no
+    /// device writes into guest memory while the guest is stopped.
+    ///
+    /// A guest that is stopped already keeps the reason of its first stop; the end of a lease
+    /// replaces it, because it decides whether a resume is taken.
+    pub fn stop_vm(&mut self, reason: PausedReason) -> Result<(), VmmError> {
         let kvm_vm = self
             .vm
             .as_kvm()
             .ok_or_else(|| VmmError::NotSupportedOnVmType(self.vm.type_name()))?;
+        if self.instance_info.state == VmState::Paused {
+            if reason == PausedReason::Lease {
+                self.instance_info.set_paused(reason);
+            }
+            return Ok(());
+        }
         kvm_vm.pause_vcpus()?;
-        self.instance_info.state = VmState::Paused;
+        // The vCPUs are stopped: the stop goes on also when the clock cannot be read (the
+        // resume then sets no clock, as before).
+        #[cfg(target_arch = "x86_64")]
+        if self.stopped_clock.is_none() {
+            match kvm_vm.get_clock() {
+                Ok(clock) => {
+                    self.stopped_clock = Some(StoppedClock {
+                        clock,
+                        realtime: false,
+                    })
+                }
+                Err(err) => error!("Failed to save the guest's clock at a stop: {}", err),
+            }
+        }
+        self.device_manager.quiesce_virtio_devices();
+        info!("The guest stopped: {}", reason.name());
+        self.instance_info.set_paused(reason);
         Ok(())
+    }
+
+    /// Stops a running guest whose drive failed a request (`paused_reason: disk-error`). A
+    /// stopped guest stays as it is: its drive runs the kept requests again at the resume.
+    pub fn handle_disk_error(&mut self) {
+        if let Some(drive_id) = self.device_manager.take_disk_error()
+            && self.instance_info.state == VmState::Running
+            && let Err(err) = self.stop_vm(PausedReason::DiskError(drive_id))
+        {
+            error!("Failed to stop the guest on a disk error: {}", err);
+        }
+    }
+
+    /// Whether the guest is stopped; the loop of the VMM thread then serves only API requests.
+    pub fn is_stopped(&self) -> bool {
+        self.instance_info.state == VmState::Paused
+    }
+
+    /// Refuses every resume with `why`, or takes resumes again with `None`.
+    pub fn refuse_resume(&mut self, why: Option<String>) {
+        self.resume_refused = why;
+    }
+
+    /// Called at least every 100 ms while the guest is stopped and the loop of the VMM thread
+    /// serves only API requests: the place for work that must go on in a stop (the stamp of
+    /// the main loop, the events of the checkpoint loop).
+    pub fn stopped_tick(&mut self) {}
+
+    /// The clock of the stopped guest, if it is stopped.
+    #[cfg(target_arch = "x86_64")]
+    pub fn stopped_clock(&self) -> Option<&StoppedClock> {
+        self.stopped_clock.as_ref()
+    }
+
+    /// Sets the clock that the next resume sets (the clock of a loaded state).
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_stopped_clock(&mut self, clock: Option<StoppedClock>) {
+        self.stopped_clock = clock;
+    }
+
+    /// The regions of guest memory: where each lies in the process, its size, its guest
+    /// address, and its offset in a memory file (the same offsets as a UFFD handler gets).
+    pub fn memory_regions(&self) -> MemoryRegions {
+        let mut regions = Vec::new();
+        if let Some(kvm_vm) = self.vm.as_kvm() {
+            let mut offset = 0;
+            for region in kvm_vm.guest_memory().iter() {
+                let size = region.len();
+                regions.push(MemoryRegion {
+                    host_addr: region.as_ptr() as u64,
+                    size,
+                    guest_addr: region.start_addr().0,
+                    offset,
+                });
+                offset += size;
+            }
+        }
+        MemoryRegions { regions }
+    }
+
+    /// Starts the fill of every plugged region of guest memory on the fill thread.
+    pub fn start_fill(&mut self) -> Result<(), VmmError> {
+        let kvm_vm = self
+            .vm
+            .as_kvm()
+            .ok_or_else(|| VmmError::NotSupportedOnVmType(self.vm.type_name()))?;
+        let ranges = kvm_vm
+            .guest_memory()
+            .iter()
+            .flat_map(|region| region.plugged_slots())
+            .map(|slot| {
+                (
+                    slot.slice.ptr_guard_mut().as_ptr() as usize,
+                    slot.slice.len(),
+                )
+            })
+            .collect();
+        self.filler.start(ranges)?;
+        Ok(())
+    }
+
+    /// What the fill of guest memory is doing.
+    pub fn fill_status(&self) -> FillStatus {
+        self.filler.status()
     }
 
     /// Injects CTRL+ALT+DEL keystroke combo in the i8042 device.
@@ -498,6 +660,26 @@ impl Vmm {
 
     /// Saves the state of a paused Microvm.
     pub fn save_state(&mut self, vm_info: &VmInfo) -> Result<MicrovmState, MicrovmStateError> {
+        self.save_state_with(vm_info, false)
+    }
+
+    /// Saves the state of a Microvm whose vCPUs are paused, for a checkpoint: as
+    /// [`Vmm::save_state`], but each device is readied by `prepare_checkpoint` in the place of
+    /// `prepare_save` (a drive ends its requests in flight with no `fsync`; vsock keeps its
+    /// connections). A guest that runs holds the clock of now, one that is stopped the clock of
+    /// its stop.
+    pub fn save_checkpoint_state(
+        &mut self,
+        vm_info: &VmInfo,
+    ) -> Result<MicrovmState, MicrovmStateError> {
+        self.save_state_with(vm_info, true)
+    }
+
+    fn save_state_with(
+        &mut self,
+        vm_info: &VmInfo,
+        checkpoint: bool,
+    ) -> Result<MicrovmState, MicrovmStateError> {
         self.check_unsnapshottable_devices()?;
 
         // We need to save device state before saving KVM state.
@@ -505,7 +687,11 @@ impl Vmm {
         // might modify the VirtIO transport and send an interrupt to the guest. If we save KVM
         // state before we save device state, that interrupt will never be delivered to the guest
         // upon resuming from the snapshot.
-        let device_states = self.device_manager.save();
+        let device_states = if checkpoint {
+            self.device_manager.save_checkpoint()
+        } else {
+            self.device_manager.save()
+        };
         let kvm_vm = self
             .vm
             .as_kvm()
@@ -513,10 +699,11 @@ impl Vmm {
         let vcpu_states = kvm_vm.save_vcpu_states()?;
         let kvm_state = kvm_vm.kvm().save_state();
         let vm_state = {
+            // A stopped guest holds the clock of its stop; a running one the clock of now.
             #[cfg(target_arch = "x86_64")]
             {
                 kvm_vm
-                    .save_state()
+                    .save_state(self.stopped_clock.as_ref().map(|stopped| &stopped.clock))
                     .map_err(MicrovmStateError::SaveVmState)?
             }
             #[cfg(target_arch = "aarch64")]
@@ -820,6 +1007,9 @@ impl MutEventSubscriber for Vmm {
                         FcExitCode::Ok
                     };
                     self.stop(exit_code);
+                } else if source == DISK_ERROR_EVT.as_raw_fd() && event_set == EventSet::IN {
+                    let _ = DISK_ERROR_EVT.read();
+                    self.handle_disk_error();
                 } else {
                     error!("Spurious EventManager event for handler: Vmm");
                 }
@@ -833,7 +1023,232 @@ impl MutEventSubscriber for Vmm {
                 if let Err(err) = ops.add(Events::new(kvm_vm.vcpus_exit_evt(), EventSet::IN)) {
                     error!("Failed to register vmm exit event: {}", err);
                 }
+                if let Err(err) = ops.add(Events::new(&*DISK_ERROR_EVT, EventSet::IN)) {
+                    error!("Failed to register the disk error event: {}", err);
+                }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use crate::builder::tests::{
+        CustomBlockConfig, default_kernel_cmdline, default_vmm, insert_block_devices,
+    };
+    use crate::devices::virtio::block::CacheType;
+    use crate::utils::u64_to_usize;
+    use crate::vmm_config::space::FillState;
+
+    /// A default Vmm that counts as running (it has no vCPU threads, so a pause and a resume
+    /// only change the state of the Vmm and of KVM's clock).
+    fn running_vmm() -> Vmm {
+        let mut vmm = default_vmm();
+        vmm.instance_info.state = VmState::Running;
+        vmm
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn kvm_clock(vmm: &Vmm) -> u64 {
+        vmm.vm.as_kvm().unwrap().get_clock().unwrap().clock
+    }
+
+    const MS: u64 = 1_000_000;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_clock_is_saved_at_a_stop_and_set_at_the_resume() {
+        let mut vmm = running_vmm();
+        let before = kvm_clock(&vmm);
+        vmm.pause_vm().unwrap();
+        let stopped = vmm.stopped_clock().unwrap().clock.clock;
+        assert!(stopped >= before);
+
+        // Nothing sets the clock during the stop: KVM's clock runs on.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(kvm_clock(&vmm) >= stopped + 300 * MS);
+        // A second pause request keeps the clock of the first stop.
+        vmm.pause_vm().unwrap();
+        assert_eq!(vmm.stopped_clock().unwrap().clock.clock, stopped);
+
+        // The resume sets the clock of the stop: the guest goes on from it.
+        vmm.resume_vm().unwrap();
+        let after = kvm_clock(&vmm);
+        assert!(
+            after >= stopped && after < stopped + 100 * MS,
+            "{after} {stopped}"
+        );
+        assert!(vmm.stopped_clock().is_none());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_state_saved_while_stopped_holds_the_clock_of_the_stop() {
+        let mut vmm = running_vmm();
+        let vm_info = VmInfo::from(&vmm);
+        vmm.pause_vm().unwrap();
+        let stopped = vmm.stopped_clock().unwrap().clock.clock;
+        std::thread::sleep(Duration::from_millis(200));
+        let state = vmm.save_state(&vm_info).unwrap();
+        assert_eq!(state.vm_state.clock().clock, stopped);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_state_saved_while_running_reads_the_clock_of_now() {
+        let mut vmm = running_vmm();
+        let vm_info = VmInfo::from(&vmm);
+        let before = kvm_clock(&vmm);
+        std::thread::sleep(Duration::from_millis(50));
+        let state = vmm.save_state(&vm_info).unwrap();
+        let clock = state.vm_state.clock().clock;
+        assert!(clock >= before + 50 * MS);
+        // Within the check of 50 ms of a checkpoint of a running guest.
+        assert!(kvm_clock(&vmm) - clock < 50 * MS);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_checkpoint_state_of_a_running_guest_reads_the_clock_of_now() {
+        let mut vmm = running_vmm();
+        let vm_info = VmInfo::from(&vmm);
+        let before = kvm_clock(&vmm);
+        std::thread::sleep(Duration::from_millis(20));
+        let state = vmm.save_checkpoint_state(&vm_info).unwrap();
+        assert!(state.vm_state.clock().clock >= before + 20 * MS);
+        assert!(!vmm.is_stopped());
+    }
+
+    #[test]
+    fn test_stop_reasons() {
+        let mut vmm = running_vmm();
+        vmm.stop_vm(PausedReason::DiskError("rootfs".to_string()))
+            .unwrap();
+        assert!(vmm.is_stopped());
+        assert_eq!(
+            vmm.instance_info.paused_reason,
+            Some(PausedReason::DiskError("rootfs".to_string()))
+        );
+        assert_eq!(vmm.instance_info.paused_drive_id.as_deref(), Some("rootfs"));
+        // A later pause request keeps the reason of the first stop.
+        vmm.pause_vm().unwrap();
+        assert_eq!(
+            vmm.instance_info.paused_reason,
+            Some(PausedReason::DiskError("rootfs".to_string()))
+        );
+        // The end of a lease replaces it.
+        vmm.stop_vm(PausedReason::Lease).unwrap();
+        assert_eq!(vmm.instance_info.paused_reason, Some(PausedReason::Lease));
+        assert!(vmm.instance_info.paused_drive_id.is_none());
+
+        assert!(!vmm.instance_info.ran_since_load);
+        vmm.resume_vm().unwrap();
+        assert!(!vmm.is_stopped());
+        assert!(vmm.instance_info.ran_since_load);
+        assert!(vmm.instance_info.paused_reason.is_none());
+    }
+
+    #[test]
+    fn test_refused_resume_keeps_the_guest_stopped() {
+        let mut vmm = running_vmm();
+        vmm.pause_vm().unwrap();
+        vmm.refuse_resume(Some("the lease is over".to_string()));
+        assert!(matches!(
+            vmm.resume_vm(),
+            Err(VmmError::ResumeRefused(why)) if why == "the lease is over"
+        ));
+        assert!(vmm.is_stopped());
+        assert_eq!(vmm.instance_info.paused_reason, Some(PausedReason::Api));
+        #[cfg(target_arch = "x86_64")]
+        assert!(vmm.stopped_clock().is_some());
+
+        vmm.refuse_resume(None);
+        vmm.resume_vm().unwrap();
+        assert!(!vmm.is_stopped());
+    }
+
+    #[test]
+    fn test_disk_error_stops_the_guest() {
+        let mut vmm = running_vmm();
+        let mut cmdline = default_kernel_cmdline();
+        let mut event_manager = EventManager::new().unwrap();
+        let _files = insert_block_devices(
+            &mut vmm,
+            &mut cmdline,
+            &mut event_manager,
+            vec![CustomBlockConfig::new(
+                "rootfs".to_string(),
+                true,
+                None,
+                false,
+                CacheType::Unsafe,
+            )],
+        );
+
+        // No drive failed: nothing happens.
+        vmm.handle_disk_error();
+        assert!(!vmm.is_stopped());
+
+        vmm.device_manager
+            .with_virtio_device("rootfs", |block: &mut Block| match block {
+                Block::Virtio(block) => block.error_pending = true,
+                Block::VhostUser(_) => unreachable!(),
+            })
+            .unwrap();
+        vmm.handle_disk_error();
+        assert!(vmm.is_stopped());
+        assert_eq!(
+            vmm.instance_info.paused_reason,
+            Some(PausedReason::DiskError("rootfs".to_string()))
+        );
+        #[cfg(target_arch = "x86_64")]
+        assert!(vmm.stopped_clock().is_some());
+    }
+
+    #[test]
+    fn test_memory_regions() {
+        let vmm = default_vmm();
+        let regions = vmm.memory_regions().regions;
+        assert!(!regions.is_empty());
+        let mut offset = 0;
+        for (region, mem) in regions
+            .iter()
+            .zip(vmm.vm.as_kvm().unwrap().guest_memory().iter())
+        {
+            assert_eq!(region.offset, offset);
+            assert_eq!(region.host_addr, mem.as_ptr() as u64);
+            assert_eq!(region.size, mem.len());
+            assert_eq!(region.guest_addr, mem.start_addr().0);
+            offset += region.size;
+        }
+        assert_eq!(offset, 128 << 20);
+    }
+
+    #[test]
+    fn test_fill_populates_guest_memory() {
+        let mut vmm = default_vmm();
+        assert!(matches!(vmm.start_fill(), Err(VmmError::Fill(_))));
+        vmm.filler = space::Filler::spawn(Arc::new(vec![])).unwrap();
+        assert_eq!(vmm.fill_status().state, FillState::Idle);
+        vmm.start_fill().unwrap();
+        let start = Instant::now();
+        while vmm.fill_status().state == FillState::Running {
+            assert!(start.elapsed() < Duration::from_secs(30));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(vmm.fill_status().state, FillState::Done);
+
+        for region in vmm.vm.as_kvm().unwrap().guest_memory().iter() {
+            let len = u64_to_usize(region.len());
+            let mut pages = vec![0u8; len / 4096];
+            // SAFETY: the region is guest memory of this Vmm, and `pages` has a byte for each
+            // page of it.
+            let ret = unsafe { libc::mincore(region.as_ptr().cast(), len, pages.as_mut_ptr()) };
+            assert_eq!(ret, 0);
+            assert!(pages.iter().all(|page| page & 1 != 0));
         }
     }
 }

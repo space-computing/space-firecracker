@@ -162,8 +162,9 @@ pub enum CreateSnapshotError {
     SnapshotBackingFile(&'static str, io::Error),
 }
 
-/// Snapshot version
-pub const SNAPSHOT_VERSION: Version = Version::new(12, 0, 0);
+/// Snapshot version. Major 13 is the fork's: the state of a block device holds the requests
+/// that a disk error kept.
+pub const SNAPSHOT_VERSION: Version = Version::new(13, 0, 0);
 
 /// Creates a Microvm snapshot.
 pub fn create_snapshot(
@@ -181,13 +182,18 @@ pub fn create_snapshot(
         params.sync_snapshot_files,
     )?;
 
+    // A snapshot of the state only: no memory is written and no dirty bitmap is read or reset.
+    let Some(mem_file_path) = &params.mem_file_path else {
+        return Ok(());
+    };
+
     let kvm_vm = vmm.vm.as_kvm().ok_or_else(|| {
         CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(
             "snapshot requires KVM".into(),
         ))
     })?;
     kvm_vm.snapshot_memory_to_file(
-        &params.mem_file_path,
+        mem_file_path,
         params.snapshot_type,
         params.sync_snapshot_files,
     )?;
@@ -773,7 +779,7 @@ mod tests {
             #[cfg(target_arch = "aarch64")]
             vm_state: vmm.vm.as_kvm().unwrap().save_state(&mpidrs).unwrap(),
             #[cfg(target_arch = "x86_64")]
-            vm_state: vmm.vm.as_kvm().unwrap().save_state().unwrap(),
+            vm_state: vmm.vm.as_kvm().unwrap().save_state(None).unwrap(),
         };
 
         let serialized_data = bitcode::serialize(&microvm_state).unwrap();

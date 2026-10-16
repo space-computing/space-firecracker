@@ -16,6 +16,8 @@ use utils::time::TimestampUs;
 use vm_allocator::AllocPolicy;
 use vm_memory::GuestAddress;
 
+#[cfg(target_arch = "x86_64")]
+use crate::StoppedClock;
 #[cfg(target_arch = "aarch64")]
 use crate::Vcpu;
 use crate::arch::{ConfigurationError, configure_system_for_boot, load_kernel};
@@ -46,11 +48,12 @@ use crate::persist::{MicrovmState, MicrovmStateError};
 use crate::resources::VmResources;
 use crate::seccomp::BpfThreadMap;
 use crate::snapshot::Persist;
+use crate::space::Filler;
 use crate::utils::{u32_mib_to_bytes, u64_to_usize};
 use crate::vmm_config::boot_source::{
     DEFAULT_KERNEL_CMDLINE, append_root_device_cmdline, build_cmdline,
 };
-use crate::vmm_config::instance_info::{InstanceInfo, VmState};
+use crate::vmm_config::instance_info::{InstanceInfo, PausedReason};
 use crate::vmm_config::machine_config::MachineConfigError;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vmm_config::pmem::PmemConfig;
@@ -125,6 +128,8 @@ pub enum StartMicrovmError {
     VcpuFdCloneError(#[from] crate::vstate::vcpu::CopyKvmFdError),
     /// Error with the KvmVm object: {0}
     KvmVm(#[from] VmError),
+    /// Cannot start the fill thread: {0}
+    FillThread(io::Error),
 }
 
 /// It's convenient to automatically convert `linux_loader::cmdline::Error`s
@@ -320,6 +325,14 @@ pub fn build_microvm_for_boot(
         boot_cmdline,
     )?;
 
+    let filler = Filler::spawn(
+        seccomp_filters
+            .get("fill")
+            .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("fill".to_string()))?
+            .clone(),
+    )
+    .map_err(StartMicrovmError::FillThread)?;
+
     let vmm = Vmm {
         instance_info: instance_info.clone(),
         machine_config: vm_resources.machine_config.clone(),
@@ -327,6 +340,10 @@ pub fn build_microvm_for_boot(
         shutdown_exit_code: None,
         vm,
         device_manager,
+        #[cfg(target_arch = "x86_64")]
+        stopped_clock: None,
+        resume_refused: None,
+        filler,
     };
     let vmm = Arc::new(Mutex::new(vmm));
 
@@ -348,7 +365,11 @@ pub fn build_microvm_for_boot(
                 .clone(),
         )
         .map_err(VmmError::VcpuStart)?;
-    vmm.lock().unwrap().instance_info.state = VmState::Paused;
+    // The guest has not run yet; the boot resumes it at once.
+    vmm.lock()
+        .unwrap()
+        .instance_info
+        .set_paused(PausedReason::Load);
 
     #[cfg(feature = "gdb")]
     if let Some(gdb_socket_path) = &vm_resources.machine_config.gdb_socket_path {
@@ -417,6 +438,10 @@ pub enum BuildMicrovmFromSnapshotError {
     RestoreDevices(#[from] DeviceManagerPersistError),
     /// clock_realtime is not supported on aarch64.
     UnsupportedClockRealtime,
+    /// Failed to start the fill thread as no fill seccomp filter found.
+    MissingFillSeccompFilter,
+    /// Cannot start the fill thread: {0}
+    FillThread(io::Error),
 }
 
 /// Builds and starts a microVM based on the provided MicrovmState.
@@ -510,6 +535,14 @@ pub fn build_microvm_from_snapshot(
     let mut device_manager =
         DeviceManager::restore(device_ctor_args, &microvm_state.device_states)?;
 
+    let filler = Filler::spawn(
+        seccomp_filters
+            .get("fill")
+            .ok_or(BuildMicrovmFromSnapshotError::MissingFillSeccompFilter)?
+            .clone(),
+    )
+    .map_err(BuildMicrovmFromSnapshotError::FillThread)?;
+
     let vmm = Vmm {
         instance_info: instance_info.clone(),
         machine_config: vm_resources.machine_config.clone(),
@@ -517,6 +550,15 @@ pub fn build_microvm_from_snapshot(
         shutdown_exit_code: None,
         vm,
         device_manager,
+        // The clock of the state is set by the resume that follows the load, not here: the
+        // time for which the guest waits loaded is not time of the guest.
+        #[cfg(target_arch = "x86_64")]
+        stopped_clock: Some(StoppedClock {
+            clock: *microvm_state.vm_state.clock(),
+            realtime: clock_realtime,
+        }),
+        resume_refused: None,
+        filler,
     };
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
@@ -529,7 +571,10 @@ pub fn build_microvm_from_snapshot(
     )?;
 
     let vmm = Arc::new(Mutex::new(vmm));
-    vmm.lock().unwrap().instance_info.state = VmState::Paused;
+    vmm.lock()
+        .unwrap()
+        .instance_info
+        .set_paused(PausedReason::Load);
     event_manager.add_subscriber(vmm.clone());
 
     debug!("event_end: build microvm from snapshot");
@@ -855,6 +900,10 @@ pub(crate) mod tests {
             shutdown_exit_code: None,
             vm: Vm::Kvm(Arc::new(vm)),
             device_manager: default_device_manager(),
+            #[cfg(target_arch = "x86_64")]
+            stopped_clock: None,
+            resume_refused: None,
+            filler: Default::default(),
         }
     }
 
@@ -873,6 +922,10 @@ pub(crate) mod tests {
             shutdown_exit_code: None,
             vm: Vm::Kvm(vm),
             device_manager,
+            #[cfg(target_arch = "x86_64")]
+            stopped_clock: None,
+            resume_refused: None,
+            filler: Default::default(),
         }
     }
 

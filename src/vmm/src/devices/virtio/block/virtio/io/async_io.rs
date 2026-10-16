@@ -40,6 +40,13 @@ pub struct AsyncFileEngine {
     file: File,
     ring: IoUring<WrappedRequest>,
     completion_evt: EventFd,
+    // Test-only: the number of completions still to come that are turned into an I/O error,
+    // as a disk that fails them.
+    #[cfg(test)]
+    pub(crate) fail_completions: u32,
+    // Test-only: the number of `fsync` calls of the file.
+    #[cfg(test)]
+    pub(crate) sync_all_calls: u32,
 }
 
 #[derive(Debug)]
@@ -100,6 +107,10 @@ impl AsyncFileEngine {
             file,
             ring,
             completion_evt,
+            #[cfg(test)]
+            fail_completions: 0,
+            #[cfg(test)]
+            sync_all_calls: 0,
         })
     }
 
@@ -199,8 +210,14 @@ impl AsyncFileEngine {
             })
     }
 
-    pub fn discard(&mut self, _range: (u64, u32)) -> Result<u32, AsyncIoError> {
-        Err(AsyncIoError::NotImplemented)
+    /// Discards `range` (byte offset and length): the requests in flight end first, then the
+    /// range is discarded (`BLKDISCARD` on a block device, a punched hole in a file). Their
+    /// completions stay in the ring and are taken as usual.
+    pub fn discard(&mut self, range: (u64, u32)) -> Result<u32, AsyncIoError> {
+        self.ring
+            .submit_and_wait_all()
+            .map_err(AsyncIoError::IoUring)?;
+        super::sync_io::file_discard_range(&self.file, range).map_err(AsyncIoError::IO)
     }
 
     pub fn kick_submission_queue(&mut self) -> Result<(), AsyncIoError> {
@@ -230,6 +247,10 @@ impl AsyncFileEngine {
         // Sync data out to physical media on host.
         // We don't need to call flush first since all the ops are performed through io_uring
         // and Rust shouldn't manage any data in its internal buffers.
+        #[cfg(test)]
+        {
+            self.sync_all_calls += 1;
+        }
         self.file.sync_all().map_err(AsyncIoError::SyncAll)?;
 
         Ok(())
@@ -243,7 +264,17 @@ impl AsyncFileEngine {
         &mut self,
         mem: &GuestMemoryMmap,
     ) -> Result<Option<Cqe<PendingRequest>>, AsyncIoError> {
-        let cqe = self.do_pop()?.map(|cqe| {
+        let cqe = self.do_pop()?;
+        #[cfg(test)]
+        let cqe = cqe.map(|cqe| {
+            if self.fail_completions > 0 {
+                self.fail_completions -= 1;
+                Cqe::new(-libc::EIO, cqe.user_data())
+            } else {
+                cqe
+            }
+        });
+        let cqe = cqe.map(|cqe| {
             let count = cqe.count();
             cqe.map_user_data(|wrapped_user_data| {
                 wrapped_user_data.mark_dirty_mem_and_unwrap(mem, count)

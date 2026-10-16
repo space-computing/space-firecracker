@@ -388,6 +388,47 @@ impl DeviceManager {
         self.for_each_virtio_device_mut(|_, device| device.kick());
     }
 
+    /// Ends the work in flight of every VirtIO device at a stop of the guest.
+    pub fn quiesce_virtio_devices(&self) {
+        self.for_each_virtio_device_mut(|_, device| device.quiesce());
+    }
+
+    /// The id of a drive whose disk error waits for the Vmm to stop the guest, if one does.
+    pub fn take_disk_error(&self) -> Option<String> {
+        let mut failed = None;
+        self.for_each_virtio_device_mut(|device_type, device| {
+            if device_type == VirtioDeviceType::Block
+                && let Some(block) = device.as_mut_any().downcast_mut::<Block>()
+                && block.take_disk_error()
+                && failed.is_none()
+            {
+                failed = Some(block.id().to_owned());
+            }
+        });
+        failed
+    }
+
+    /// Saves the state of the devices for a checkpoint: each device is readied by
+    /// `prepare_checkpoint` in the place of `prepare_save` (no `fsync` of a drive; vsock keeps
+    /// its connections).
+    pub fn save_checkpoint(&self) -> DevicesState {
+        let virtio_state = match &self.virtio_devices {
+            VirtioDevices::Mmio(mmio_devices) => VirtioDevicesState::Mmio(
+                mmio_devices.save_with(&|device| device.prepare_checkpoint()),
+            ),
+            VirtioDevices::Pci(pci_devices) => VirtioDevicesState::Pci(
+                pci_devices.save_with(&|device| device.prepare_checkpoint()),
+            ),
+        };
+
+        DevicesState {
+            virtio_state,
+            mmio_platform_state: self.mmio_platform_devices.save(),
+            acpi_state: self.acpi_devices.save(),
+            serial_state: self.serial_state(),
+        }
+    }
+
     /// Mark queue memory dirty for activated VirtIO devices
     pub fn mark_virtio_queue_memory_dirty(&self, mem: &GuestMemoryMmap) {
         self.for_each_virtio_device_mut(|_, device| {
