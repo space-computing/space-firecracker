@@ -1068,3 +1068,147 @@ fn test_hook_lines() {
     );
     let _ = std::fs::remove_file(path);
 }
+
+/// Whether KVM keeps a dirty log for each slot of guest memory: `KVM_GET_DIRTY_LOG` fails on a
+/// slot with no log.
+fn kvm_logs(vmm: &Vmm) -> Vec<bool> {
+    let kvm_vm = vmm.vm.as_kvm().unwrap();
+    kvm_vm
+        .guest_memory()
+        .iter()
+        .flat_map(|region| region.plugged_slots())
+        .map(|slot| {
+            kvm_vm
+                .fd()
+                .get_dirty_log(slot.slot, slot.slice.len())
+                .is_ok()
+        })
+        .collect()
+}
+
+#[test]
+fn test_release_ends_the_tracking_with_no_stream() {
+    let _reset = Reset;
+    for track_from_start in [false, true] {
+        let mut vmm = ckpt_vmm();
+        vmm.machine_config.track_dirty_pages = track_from_start;
+        // A guest that arrived: loaded and not resumed; no stream begins.
+        vmm.instance_info.set_paused(PausedReason::Load);
+        vmm.checkpoint_track(&CheckpointTrackParams {
+            enable: true,
+            hold: Some(true),
+            lease_ms: Some(5000),
+        })
+        .unwrap();
+        let info = vmm.checkpoint_info();
+        assert!(info.tracking && info.holding);
+        assert!(vmm.vm.as_kvm().unwrap().log_dirty());
+        assert!(kvm_logs(&vmm).iter().all(|on| *on));
+
+        vmm.checkpoint_release().unwrap();
+        let info = vmm.checkpoint_info();
+        assert!(!info.tracking, "the release left the tracking on");
+        assert!(!info.holding);
+        // KVM's dirty log goes off, unless the machine tracks dirty pages from its start.
+        assert_eq!(vmm.vm.as_kvm().unwrap().log_dirty(), track_from_start);
+        assert!(
+            kvm_logs(&vmm).iter().all(|on| *on == track_from_start),
+            "KVM's dirty log after the release: {:?}",
+            kvm_logs(&vmm)
+        );
+        // The guest that the load stopped stays stopped.
+        assert!(vmm.is_stopped());
+        assert_eq!(vmm.instance_info.paused_reason, Some(PausedReason::Load));
+    }
+}
+
+/// The syscalls that the wait of the fault `stop-held` may make, by name and number.
+#[cfg(target_arch = "x86_64")]
+const WAIT_SYSCALLS: [(&str, i64); 9] = [
+    ("poll", libc::SYS_poll),
+    ("ppoll", libc::SYS_ppoll),
+    ("clock_gettime", libc::SYS_clock_gettime),
+    ("nanosleep", libc::SYS_nanosleep),
+    ("clock_nanosleep", libc::SYS_clock_nanosleep),
+    ("restart_syscall", libc::SYS_restart_syscall),
+    ("rt_sigreturn", libc::SYS_rt_sigreturn),
+    ("exit", libc::SYS_exit),
+    ("exit_group", libc::SYS_exit_group),
+];
+
+/// A seccomp filter of the tests: it allows those of `WAIT_SYSCALLS` that the VMM thread's
+/// filter of the release (`resources/seccomp/x86_64-unknown-linux-musl.json`, thread `vmm`)
+/// allows with no condition on the arguments, and kills the process at any other syscall.
+#[cfg(target_arch = "x86_64")]
+fn vmm_wait_filter() -> Vec<u64> {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../resources/seccomp/x86_64-unknown-linux-musl.json"
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let allowed: Vec<&str> = json["vmm"]["filter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|rule| rule.get("args").is_none())
+        .map(|rule| rule["syscall"].as_str().unwrap())
+        .collect();
+    assert!(allowed.contains(&"exit_group"));
+    // struct sock_filter { u16 code; u8 jt; u8 jf; u32 k; }
+    let insn = |code: u16, jt: u8, jf: u8, k: u32| {
+        u64::from(code) | (u64::from(jt) << 16) | (u64::from(jf) << 24) | (u64::from(k) << 32)
+    };
+    const LD_W_ABS: u16 = 0x20;
+    const JEQ_K: u16 = 0x15;
+    const RET_K: u16 = 0x06;
+    const ALLOW: u32 = 0x7fff_0000;
+    const KILL_PROCESS: u32 = 0x8000_0000;
+    // The syscall's number is the first word of `struct seccomp_data`.
+    let mut filter = vec![insn(LD_W_ABS, 0, 0, 0)];
+    for (name, nr) in WAIT_SYSCALLS {
+        if allowed.contains(&name) {
+            filter.push(insn(JEQ_K, 0, 1, u32::try_from(nr).unwrap()));
+            filter.push(insn(RET_K, 0, 0, ALLOW));
+        }
+    }
+    filter.push(insn(RET_K, 0, 0, KILL_PROCESS));
+    filter
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_stop_held_waits_with_what_the_vmm_filter_allows() {
+    // The wait runs in a child process under the filter: a syscall that the VMM thread's filter
+    // does not allow ends the child with SIGSYS, as it ends the release binary.
+    let filter = vmm_wait_filter();
+    let time = Duration::from_millis(300);
+    let start = Instant::now();
+    // SAFETY: the child sets the filter, waits and ends; it takes no lock and allocates nothing.
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0);
+    if pid == 0 {
+        if crate::seccomp::apply_filter(&filter).is_err() {
+            // SAFETY: ends the child.
+            unsafe { libc::_exit(2) };
+        }
+        wait_on_vmm_thread(time);
+        // SAFETY: ends the child.
+        unsafe { libc::_exit(0) };
+    }
+    let mut status = 0;
+    // SAFETY: waits for the child of this test.
+    assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "the wait ended the process: exited {} with {}, signal {}",
+        libc::WIFEXITED(status),
+        libc::WEXITSTATUS(status),
+        if libc::WIFSIGNALED(status) {
+            libc::WTERMSIG(status)
+        } else {
+            0
+        }
+    );
+    assert!(start.elapsed() >= time, "{:?}", start.elapsed());
+}

@@ -122,6 +122,22 @@ fn discarded_stop() {
     *DISCARDED.lock().expect("Poisoned lock") = None;
 }
 
+/// Waits for `time` on the VMM thread: `poll` on no descriptor, with the time left as its limit.
+/// The seccomp filter of the VMM thread allows `poll`; it does not allow `clock_nanosleep`, which
+/// `std::thread::sleep` uses.
+fn wait_on_vmm_thread(time: Duration) {
+    let end = std::time::Instant::now() + time;
+    loop {
+        let left = end.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        let ms = i32::try_from(left.as_micros().div_ceil(1000)).unwrap_or(i32::MAX);
+        // SAFETY: no descriptor is given; a signal only ends the wait early.
+        unsafe { libc::poll(std::ptr::null_mut(), 0, ms) };
+    }
+}
+
 /// A fault of the tests (`fault` of `PUT /space/checkpoint`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Fault {
@@ -919,7 +935,8 @@ impl Vmm {
 
     /// `PUT /space/checkpoint/release` (`x-checkpoint-release`): the management program has the
     /// guest for good. The held frames go out, the hold and the lease end, the mode ends (the
-    /// hook is told `end N`), and a guest that the end of the lease stopped continues.
+    /// hook is told `end N`), the tracking ends (KVM's dirty log goes off), and a guest that the
+    /// end of the lease stopped continues.
     pub fn checkpoint_release(&mut self) -> Result<(), CheckpointError> {
         self.checkpoint.end_released = true;
         HOLD.set(false, 1);
@@ -935,9 +952,10 @@ impl Vmm {
             self.end_stream(Some(epoch));
             self.checkpoint.config.on = false;
             self.checkpoint.config.cont = false;
-            self.checkpoint.tracking = false;
-            self.end_tracking_if_idle();
         }
+        // The tracking ends too, with or without a stream.
+        self.checkpoint.tracking = false;
+        self.end_tracking_if_idle();
         if self.checkpoint.lease_stopped {
             self.checkpoint.lease_stopped = false;
             if self.is_stopped() {
@@ -1464,7 +1482,7 @@ impl Vmm {
                 "checkpoint: fault stop-held: the stop of checkpoint {epoch} is held from {} for {ms} ms",
                 host_us()
             );
-            std::thread::sleep(Duration::from_millis(ms));
+            wait_on_vmm_thread(Duration::from_millis(ms));
             eprintln!(
                 "checkpoint: fault stop-held: the stop of checkpoint {epoch} ended at {}",
                 host_us()
