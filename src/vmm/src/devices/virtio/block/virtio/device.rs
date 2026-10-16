@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use vm_memory::ByteValued;
 use vmm_sys_util::eventfd::EventFd;
 
-use super::io::async_io;
+use super::io::{DirectAlignment, async_io};
 use super::request::*;
 use super::{
     BLOCK_QUEUE_SIZES, MAX_DISCARD_SECTORS, SECTOR_SHIFT, SECTOR_SIZE, VirtioBlockError,
@@ -113,6 +113,15 @@ impl DiskProperties {
         Ok(disk_size)
     }
 
+    // The alignment that the requests of the file need: the file of an `Async` drive is
+    // opened with `O_DIRECT`, so its engine aligns each request to the device's blocks.
+    fn direct_alignment(file: &File, file_engine_type: FileEngineType) -> DirectAlignment {
+        match file_engine_type {
+            FileEngineType::Async => DirectAlignment::of_direct_file(file),
+            FileEngineType::Sync => DirectAlignment::NONE,
+        }
+    }
+
     /// Create a new file for the block device using a FileEngine
     pub fn new(
         disk_image_path: String,
@@ -123,10 +132,11 @@ impl DiskProperties {
             Self::open_file(&disk_image_path, is_disk_read_only, file_engine_type)?;
         let disk_size = Self::file_size(&disk_image_path, &mut disk_image)?;
         let image_id = Self::build_disk_image_id(&disk_image);
+        let align = Self::direct_alignment(&disk_image, file_engine_type);
 
         Ok(Self {
             file_path: disk_image_path,
-            file_engine: FileEngine::from_file(disk_image, file_engine_type)
+            file_engine: FileEngine::from_file(disk_image, file_engine_type, align)
                 .map_err(VirtioBlockError::FileEngine)?,
             nsectors: disk_size >> SECTOR_SHIFT,
             image_id,
@@ -148,8 +158,9 @@ impl DiskProperties {
         let disk_size = Self::file_size(&disk_image_path, &mut disk_image)?;
 
         self.image_id = Self::build_disk_image_id(&disk_image);
+        let align = Self::direct_alignment(&disk_image, file_engine_type);
         self.file_engine
-            .update_file_path(disk_image)
+            .update_file_path(disk_image, align)
             .map_err(VirtioBlockError::FileEngine)?;
         self.nsectors = disk_size >> SECTOR_SHIFT;
         self.file_path = disk_image_path;
@@ -1078,6 +1089,7 @@ mod tests {
     use crate::devices::virtio::test_utils::{VirtQueue, default_interrupt, default_mem};
     use crate::rate_limiter::TokenType;
     use crate::snapshot::Persist;
+    use crate::test_utils::single_region_mem;
     use crate::vstate::memory::{Address, Bytes, GuestAddress};
 
     #[test]
@@ -2667,5 +2679,448 @@ mod tests {
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
             assert_eq!(flags & libc::O_DIRECT != 0, direct);
         }
+    }
+
+    // The alignment of `O_DIRECT` (requests that the device's blocks do not cover go through an
+    // aligned buffer). The memory of these tests: the queue at 0, the headers at 0x1000, the
+    // statuses at 0x3000, the data from 0x10000.
+    const ALIGN_MEM: usize = 0x40000;
+    const ALIGN_QUEUE: u16 = 32;
+    // The first bytes of the backing, which the tests compare with a model.
+    const MODEL_LEN: usize = 0x10000;
+
+    /// The backings of the alignment tests: a regular file (the engine takes 4096 bytes as the
+    /// alignment of a regular file) and, when `SPACE_TEST_BLOCK_4K` names one, a block device
+    /// with 4096-byte logical blocks (`losetup --sector-size 4096`), whose `O_DIRECT` refuses
+    /// what is not aligned to 4096 bytes.
+    fn aligned_backings() -> Vec<(String, Option<TempFile>)> {
+        let f = TempFile::new().unwrap();
+        f.as_file().set_len(ALIGN_MEM as u64).unwrap();
+        let mut backings = vec![(f.as_path().to_str().unwrap().to_string(), Some(f))];
+        match std::env::var("SPACE_TEST_BLOCK_4K") {
+            Ok(dev) => backings.push((dev, None)),
+            Err(_) => eprintln!("SPACE_TEST_BLOCK_4K is not set: no run on a 4096-byte device"),
+        }
+        backings
+    }
+
+    /// An `Async` drive on `path` whose guest sees 512-byte blocks, active on `mem` with the
+    /// queue `vq`.
+    fn aligned_block(
+        path: &str,
+        discard: bool,
+        mem: &GuestMemoryMmap,
+        vq: &VirtQueue,
+    ) -> VirtioBlock {
+        let config = VirtioBlockConfig {
+            drive_id: "aligned".to_string(),
+            path_on_host: path.to_string(),
+            is_root_device: false,
+            partuuid: None,
+            is_read_only: false,
+            discard,
+            cache_type: CacheType::Unsafe,
+            rate_limiter: None,
+            file_engine_type: FileEngineType::Async,
+            blk_size: Some(512),
+            topology: None,
+        };
+        let mut block = VirtioBlock::new(config).unwrap();
+        block.acked_features = block.avail_features;
+        set_queue(&mut block, 0, vq.create_queue());
+        block.activate(mem.clone(), default_interrupt()).unwrap();
+        block
+    }
+
+    /// Bytes that differ from sector to sector and from seed to seed.
+    fn pattern(seed: u8, len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| seed.wrapping_add(u8::try_from((i * 7 + i / 512 * 13) % 256).unwrap()))
+            .collect()
+    }
+
+    /// Writes `data` at `offset` of the backing through a descriptor of its own, synced.
+    fn fill_backing(path: &str, offset: u64, data: &[u8]) {
+        use std::os::unix::fs::FileExt;
+        let f = OpenOptions::new().write(true).open(path).unwrap();
+        f.write_all_at(data, offset).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    fn read_backing(path: &str, len: usize) -> Vec<u8> {
+        use std::os::unix::fs::FileExt;
+        let mut buf = vec![0u8; len];
+        File::open(path)
+            .unwrap()
+            .read_exact_at(&mut buf, 0)
+            .unwrap();
+        buf
+    }
+
+    /// Starts a new set of requests in the queue.
+    fn new_round(block: &mut VirtioBlock, vq: &VirtQueue) {
+        vq.avail.idx.set(0);
+        vq.used.idx.set(0);
+        set_queue(block, 0, vq.create_queue());
+    }
+
+    /// Puts request `n` of the round in the queue: its data at `data`, its header at
+    /// 0x1000 + 0x10 * n, its status at 0x3000 + n.
+    fn put_request(vq: &VirtQueue, n: u16, request_type: u32, sector: u64, data: u64, len: u32) {
+        let mem = vq.memory();
+        let (h, d, st) = (3 * n, 3 * n + 1, 3 * n + 2);
+        let header = 0x1000 + 0x10 * u64::from(n);
+        mem.write_obj(
+            RequestHeader::new(request_type, sector),
+            GuestAddress(header),
+        )
+        .unwrap();
+        let data_flags = if request_type == VIRTIO_BLK_T_IN {
+            VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE
+        } else {
+            VIRTQ_DESC_F_NEXT
+        };
+        vq.dtable[h as usize].set(header, 16, VIRTQ_DESC_F_NEXT, d);
+        vq.dtable[d as usize].set(data, len, data_flags, st);
+        vq.dtable[st as usize].set(0x3000 + u64::from(n), 1, VIRTQ_DESC_F_WRITE, 0);
+        mem.write_obj::<u8>(0xff, GuestAddress(0x3000 + u64::from(n)))
+            .unwrap();
+        vq.avail.ring[n as usize].set(h);
+        vq.avail.idx.set(n + 1);
+    }
+
+    fn status_of(mem: &GuestMemoryMmap, n: u16) -> u32 {
+        u32::from(
+            mem.read_obj::<u8>(GuestAddress(0x3000 + u64::from(n)))
+                .unwrap(),
+        )
+    }
+
+    fn run_round(block: &mut VirtioBlock) {
+        simulate_queue_event(block, None);
+        complete_async(block);
+    }
+
+    fn sector_range(sector: u64, len: u32) -> std::ops::Range<usize> {
+        let start = usize::try_from(sector * 512).unwrap();
+        start..start + len as usize
+    }
+
+    #[test]
+    fn test_direct_alignment_of_the_backing() {
+        // A regular file opened with O_DIRECT: 4096 bytes; a Sync drive: none.
+        let mem = single_region_mem(ALIGN_MEM);
+        let vq = VirtQueue::new(GuestAddress(0), &mem, ALIGN_QUEUE);
+        for (path, _file) in aligned_backings() {
+            let mut block = aligned_block(&path, false, &mem, &vq);
+            let expected = DirectAlignment {
+                offset: 4096,
+                mem: 4096,
+            };
+            assert_eq!(async_engine(&mut block).alignment(), expected, "{path}");
+        }
+        let f = TempFile::new().unwrap();
+        let file = File::open(f.as_path()).unwrap();
+        assert_eq!(
+            DiskProperties::direct_alignment(&file, FileEngineType::Sync),
+            DirectAlignment::NONE
+        );
+    }
+
+    #[test]
+    fn test_unaligned_reads_and_writes_of_each_case() {
+        // (sector, length, offset of the guest's memory from 0x10000)
+        let cases: [(u64, u32, u64); 8] = [
+            // Aligned: no buffer.
+            (8, 4096, 0),
+            // The offset is not aligned.
+            (1, 4096, 0),
+            // The length is not aligned.
+            (8, 512, 0),
+            // The memory is not aligned.
+            (8, 4096, 0x200),
+            // None is aligned.
+            (3, 1536, 0x200),
+            // Parts of two device blocks.
+            (7, 1024, 0),
+            // Parts of two device blocks with a whole one between them.
+            (15, 5120, 0x10),
+            // The end of the model's range, a part of its last device block.
+            (125, 1536, 0),
+        ];
+        let mem = single_region_mem(ALIGN_MEM);
+        let vq = VirtQueue::new(GuestAddress(0), &mem, ALIGN_QUEUE);
+        for (path, _file) in aligned_backings() {
+            let mut model = pattern(0x40, MODEL_LEN);
+            fill_backing(&path, 0, &model);
+            let mut block = aligned_block(&path, false, &mem, &vq);
+
+            for (i, &(sector, len, mem_off)) in cases.iter().enumerate() {
+                let bounced = async_engine(&mut block).bounced_jobs;
+                let data = pattern(u8::try_from(i).unwrap() * 17 + 1, len as usize);
+                let addr = 0x10000 + mem_off;
+                mem.write_slice(&data, GuestAddress(addr)).unwrap();
+                new_round(&mut block, &vq);
+                put_request(&vq, 0, VIRTIO_BLK_T_OUT, sector, addr, len);
+                run_round(&mut block);
+                assert_eq!(vq.used.idx.get(), 1, "{path} case {i}");
+                assert_eq!(status_of(&mem, 0), VIRTIO_BLK_S_OK, "{path} case {i}");
+                model[sector_range(sector, len)].copy_from_slice(&data);
+                assert!(
+                    read_backing(&path, MODEL_LEN) == model,
+                    "{path} case {i}: the backing differs from the model"
+                );
+
+                // Read it back, to another place of the memory with the same alignment.
+                let back = 0x20000 + mem_off;
+                mem.write_slice(&vec![0u8; len as usize], GuestAddress(back))
+                    .unwrap();
+                new_round(&mut block, &vq);
+                put_request(&vq, 0, VIRTIO_BLK_T_IN, sector, back, len);
+                run_round(&mut block);
+                assert_eq!(vq.used.idx.get(), 1, "{path} case {i}");
+                assert_eq!(vq.used.ring[0].get().len, len + 1, "{path} case {i}");
+                assert_eq!(status_of(&mem, 0), VIRTIO_BLK_S_OK, "{path} case {i}");
+                let mut got = vec![0u8; len as usize];
+                mem.read_slice(&mut got, GuestAddress(back)).unwrap();
+                assert!(got == data, "{path} case {i}: the read differs");
+
+                let bounces = async_engine(&mut block).bounced_jobs - bounced;
+                assert_eq!(bounces, if i == 0 { 0 } else { 2 }, "{path} case {i}");
+            }
+            assert_eq!(async_engine(&mut block).taken_jobs(), 0);
+        }
+    }
+
+    #[test]
+    fn test_requests_that_overlap_a_read_modify_write_wait() {
+        let mem = single_region_mem(ALIGN_MEM);
+        let vq = VirtQueue::new(GuestAddress(0), &mem, ALIGN_QUEUE);
+        for (path, _file) in aligned_backings() {
+            let mut model = pattern(0x40, MODEL_LEN);
+            fill_backing(&path, 0, &model);
+            let mut block = aligned_block(&path, false, &mem, &vq);
+            // (first request, second request, whether the second waits); each request is
+            // (type, sector, length).
+            type Req = (u32, u64, u32);
+            let rounds: [(Req, Req, bool); 5] = [
+                // A write of a whole block after a write of a part of it.
+                (
+                    (VIRTIO_BLK_T_OUT, 1, 512),
+                    (VIRTIO_BLK_T_OUT, 0, 4096),
+                    true,
+                ),
+                // A write of a part of a block after a write of the whole block: it waits for
+                // the write in flight before it reads the block.
+                (
+                    (VIRTIO_BLK_T_OUT, 8, 4096),
+                    (VIRTIO_BLK_T_OUT, 9, 512),
+                    true,
+                ),
+                // Two writes of parts of the same block that do not overlap for the guest.
+                (
+                    (VIRTIO_BLK_T_OUT, 17, 512),
+                    (VIRTIO_BLK_T_OUT, 18, 512),
+                    true,
+                ),
+                // A read of the block of a write of a part of it.
+                (
+                    (VIRTIO_BLK_T_OUT, 25, 512),
+                    (VIRTIO_BLK_T_IN, 24, 4096),
+                    true,
+                ),
+                // Requests of other blocks do not wait.
+                (
+                    (VIRTIO_BLK_T_OUT, 33, 512),
+                    (VIRTIO_BLK_T_OUT, 40, 4096),
+                    false,
+                ),
+            ];
+            for (r, &(first, second, waits)) in rounds.iter().enumerate() {
+                new_round(&mut block, &vq);
+                let mut writes = Vec::new();
+                for (n, &(t, sector, len)) in [first, second].iter().enumerate() {
+                    let addr = 0x10000 + 0x4000 * n as u64;
+                    if t == VIRTIO_BLK_T_OUT {
+                        let data = pattern(u8::try_from(r * 2 + n).unwrap() * 11 + 3, len as usize);
+                        mem.write_slice(&data, GuestAddress(addr)).unwrap();
+                        writes.push((sector, len, data));
+                    } else {
+                        mem.write_slice(&vec![0u8; len as usize], GuestAddress(addr))
+                            .unwrap();
+                    }
+                    put_request(&vq, u16::try_from(n).unwrap(), t, sector, addr, len);
+                }
+                simulate_queue_event(&mut block, None);
+                assert_eq!(
+                    async_engine(&mut block).waiting_jobs(),
+                    usize::from(waits),
+                    "{path} round {r}"
+                );
+                complete_async(&mut block);
+                assert_eq!(vq.used.idx.get(), 2, "{path} round {r}");
+                assert_eq!(status_of(&mem, 0), VIRTIO_BLK_S_OK, "{path} round {r}");
+                assert_eq!(status_of(&mem, 1), VIRTIO_BLK_S_OK, "{path} round {r}");
+                // The order of the queue is kept: the second ran after the first.
+                for (sector, len, data) in writes {
+                    model[sector_range(sector, len)].copy_from_slice(&data);
+                }
+                assert!(
+                    read_backing(&path, MODEL_LEN) == model,
+                    "{path} round {r}: the backing differs from the model"
+                );
+                if second.0 == VIRTIO_BLK_T_IN {
+                    let mut got = vec![0u8; second.2 as usize];
+                    mem.read_slice(&mut got, GuestAddress(0x14000)).unwrap();
+                    assert!(
+                        got == model[sector_range(second.1, second.2)],
+                        "{path} round {r}: the read did not see the write before it"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_disk_error_in_a_read_modify_write_keeps_the_request() {
+        let mem = single_region_mem(ALIGN_MEM);
+        let vq = VirtQueue::new(GuestAddress(0), &mem, ALIGN_QUEUE);
+        for (path, _file) in aligned_backings() {
+            // The disk fails the read of the block (no operation passes), then the write of it
+            // (the read passes).
+            for (pass, sector) in [(0u32, 1u64), (1, 7)] {
+                let mut model = pattern(0x40, MODEL_LEN);
+                fill_backing(&path, 0, &model);
+                let mut block = aligned_block(&path, false, &mem, &vq);
+                let len = 1024;
+                let data = pattern(0x99, len as usize);
+                mem.write_slice(&data, GuestAddress(0x10000)).unwrap();
+                new_round(&mut block, &vq);
+                put_request(&vq, 0, VIRTIO_BLK_T_OUT, sector, 0x10000, len);
+                async_engine(&mut block).pass_completions = pass;
+                async_engine(&mut block).fail_completions = 1;
+                run_round(&mut block);
+
+                // Kept, not answered; the disk is as it was.
+                assert_eq!(vq.used.idx.get(), 0, "{path} pass {pass}");
+                assert_eq!(status_of(&mem, 0), 0xff);
+                assert_eq!(block.kept.len(), 1);
+                assert!(block.stopped_on_error);
+                assert!(block.take_disk_error());
+                assert_eq!(async_engine(&mut block).taken_jobs(), 0);
+                assert!(read_backing(&path, MODEL_LEN) == model);
+
+                // At the resume it runs again from its start, whole.
+                block.kick();
+                block.process_queue_event();
+                complete_async(&mut block);
+                assert_eq!(vq.used.idx.get(), 1, "{path} pass {pass}");
+                assert_eq!(status_of(&mem, 0), VIRTIO_BLK_S_OK);
+                assert!(block.kept.is_empty());
+                model[sector_range(sector, len)].copy_from_slice(&data);
+                assert!(
+                    read_backing(&path, MODEL_LEN) == model,
+                    "{path} pass {pass}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_drain_with_a_read_modify_write_in_flight() {
+        let mem = single_region_mem(ALIGN_MEM);
+        let vq = VirtQueue::new(GuestAddress(0), &mem, ALIGN_QUEUE);
+        for (path, _file) in aligned_backings() {
+            let mut model = pattern(0x40, MODEL_LEN);
+            fill_backing(&path, 0, &model);
+            let mut block = aligned_block(&path, false, &mem, &vq);
+            // A stop of the guest, then a checkpoint.
+            for (r, checkpoint) in [false, true].into_iter().enumerate() {
+                let base = u64::try_from(r).unwrap() * 16;
+                let first = pattern(0x21 + u8::try_from(r).unwrap(), 512);
+                let second = pattern(0x61 + u8::try_from(r).unwrap(), 4096);
+                mem.write_slice(&first, GuestAddress(0x10000)).unwrap();
+                mem.write_slice(&second, GuestAddress(0x14000)).unwrap();
+                new_round(&mut block, &vq);
+                put_request(&vq, 0, VIRTIO_BLK_T_OUT, base + 1, 0x10000, 512);
+                put_request(&vq, 1, VIRTIO_BLK_T_OUT, base, 0x14000, 4096);
+                simulate_queue_event(&mut block, None);
+                assert_eq!(async_engine(&mut block).taken_jobs(), 2);
+                assert_eq!(async_engine(&mut block).waiting_jobs(), 1);
+
+                // The drain ends both: the read-modify-write and the request behind it.
+                if checkpoint {
+                    VirtioDevice::prepare_checkpoint(&mut block);
+                } else {
+                    VirtioDevice::quiesce(&mut block);
+                }
+                assert_eq!(vq.used.idx.get(), 2, "{path} round {r}");
+                assert_eq!(status_of(&mem, 0), VIRTIO_BLK_S_OK);
+                assert_eq!(status_of(&mem, 1), VIRTIO_BLK_S_OK);
+                assert_eq!(async_engine(&mut block).taken_jobs(), 0);
+                assert!(block.kept.is_empty());
+                model[sector_range(base + 1, 512)].copy_from_slice(&first);
+                model[sector_range(base, 4096)].copy_from_slice(&second);
+                assert!(read_backing(&path, MODEL_LEN) == model, "{path} round {r}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_unaligned_discard_on_a_4k_block_device() {
+        let Ok(path) = std::env::var("SPACE_TEST_BLOCK_4K") else {
+            eprintln!("SPACE_TEST_BLOCK_4K is not set: the test does not run");
+            return;
+        };
+        let mem = single_region_mem(ALIGN_MEM);
+        let vq = VirtQueue::new(GuestAddress(0), &mem, ALIGN_QUEUE);
+        let mut model = pattern(0x40, MODEL_LEN);
+        fill_backing(&path, 0, &model);
+        let mut block = aligned_block(&path, true, &mem, &vq);
+        let put_discard = |n: u16, sector: u64, sectors: u32| {
+            let range_addr = 0x10000 + 0x100 * u64::from(n);
+            let mut range = [0u8; 16];
+            range[0..8].copy_from_slice(&sector.to_le_bytes());
+            range[8..12].copy_from_slice(&sectors.to_le_bytes());
+            mem.write_slice(&range, GuestAddress(range_addr)).unwrap();
+            put_request(&vq, n, VIRTIO_BLK_T_DISCARD, 0, range_addr, 16);
+        };
+
+        // Sectors 1 to 16 (bytes 512 to 8704): the whole block 1 inside is discarded, and the
+        // parts of blocks 0 and 2 are written with zeros; sectors 24 to 31 are a whole block;
+        // sectors 41 and 42 are inside block 5. Each range reads as zeros after it, and the
+        // rest of the blocks at its ends is kept.
+        new_round(&mut block, &vq);
+        put_discard(0, 1, 16);
+        put_discard(1, 24, 8);
+        put_discard(2, 41, 2);
+        run_round(&mut block);
+        assert_eq!(vq.used.idx.get(), 3);
+        for n in 0..3 {
+            assert_eq!(status_of(&mem, n), VIRTIO_BLK_S_OK);
+        }
+        model[sector_range(1, 16 * 512)].fill(0);
+        model[sector_range(24, 8 * 512)].fill(0);
+        model[sector_range(41, 2 * 512)].fill(0);
+        assert!(read_backing(&path, MODEL_LEN) == model);
+        assert_eq!(async_engine(&mut block).taken_jobs(), 0);
+
+        // The disk fails the read of the block at an end: the discard is kept, and runs again
+        // whole at the resume.
+        new_round(&mut block, &vq);
+        put_discard(0, 49, 2);
+        async_engine(&mut block).fail_completions = 1;
+        run_round(&mut block);
+        assert_eq!(vq.used.idx.get(), 0);
+        assert_eq!(block.kept.len(), 1);
+        assert!(block.take_disk_error());
+        assert!(read_backing(&path, MODEL_LEN) == model);
+        block.kick();
+        block.process_queue_event();
+        complete_async(&mut block);
+        assert_eq!(vq.used.idx.get(), 1);
+        assert_eq!(status_of(&mem, 0), VIRTIO_BLK_S_OK);
+        model[sector_range(49, 2 * 512)].fill(0);
+        assert!(read_backing(&path, MODEL_LEN) == model);
     }
 }
