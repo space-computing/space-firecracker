@@ -31,6 +31,10 @@ use crate::device_manager::{
 use crate::devices::virtio::balloon::Balloon;
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::device::VirtioDevice;
+use crate::devices::virtio::gpu::{
+    GPU_DEV_ID, Gpu, GpuAudioOut, Input, InputKind, KEYBOARD_DEV_ID, SOUND_DEV_ID, Sound,
+    TABLET_DEV_ID,
+};
 use crate::devices::virtio::mem::{VIRTIO_MEM_DEFAULT_SLOT_SIZE_MIB, VirtioMem};
 use crate::devices::virtio::net::Net;
 use crate::devices::virtio::pmem::device::Pmem;
@@ -115,6 +119,8 @@ pub enum StartMicrovmError {
     SetVmResources(MachineConfigError),
     /// Cannot create the entropy device: {0}
     CreateEntropyDevice(crate::devices::virtio::rng::EntropyError),
+    /// Cannot create the GPU device: {0}
+    CreateGpuDevice(io::Error),
     /// Failed to allocate guest resource: {0}
     AllocateResources(#[from] vm_allocator::Error),
     /// Error starting GDB debug session: {0}
@@ -275,6 +281,63 @@ pub fn build_microvm_for_boot(
             entropy,
             event_manager,
         )?;
+    }
+
+    // A GPU whose commands are rendered outside Firecracker (`PUT /gpu`). Its I/O threads start
+    // here and apply the `vmm` filter themselves; the socket of the guest agent's channel is
+    // made here too. Beside it, the input and sound devices whose input and output go through
+    // the same renderer.
+    if let Some(cfg) = &vm_resources.gpu {
+        let filter = seccomp_filters
+            .get("vmm")
+            .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("vmm".to_string()))?
+            .clone();
+        let mut gpu = Gpu::new(cfg.clone(), filter).map_err(StartMicrovmError::CreateGpuDevice)?;
+        let inputs = if cfg.input() {
+            let kbd = Arc::new(Mutex::new(
+                Input::new(InputKind::Keyboard).map_err(StartMicrovmError::CreateGpuDevice)?,
+            ));
+            let tab = Arc::new(Mutex::new(
+                Input::new(InputKind::Tablet).map_err(StartMicrovmError::CreateGpuDevice)?,
+            ));
+            gpu.set_inputs(kbd.clone(), tab.clone());
+            Some((kbd, tab))
+        } else {
+            None
+        };
+        let gpu = Arc::new(Mutex::new(gpu));
+        device_manager.attach_boot_virtio_device(
+            &vm,
+            GPU_DEV_ID.to_string(),
+            gpu.clone(),
+            &mut boot_cmdline,
+            event_manager,
+            false,
+        )?;
+        if let Some((kbd, tab)) = inputs {
+            for (id, dev) in [(KEYBOARD_DEV_ID, kbd), (TABLET_DEV_ID, tab)] {
+                device_manager.attach_boot_virtio_device(
+                    &vm,
+                    id.to_string(),
+                    dev,
+                    &mut boot_cmdline,
+                    event_manager,
+                    false,
+                )?;
+            }
+        }
+        if cfg.sound() {
+            let sound = Sound::new(Box::new(GpuAudioOut(gpu)))
+                .map_err(StartMicrovmError::CreateGpuDevice)?;
+            device_manager.attach_boot_virtio_device(
+                &vm,
+                SOUND_DEV_ID.to_string(),
+                Arc::new(Mutex::new(sound)),
+                &mut boot_cmdline,
+                event_manager,
+                false,
+            )?;
+        }
     }
 
     // Attach virtio-mem device if configured
@@ -505,6 +568,10 @@ pub fn build_microvm_from_snapshot(
         vm_resources,
         instance_id: &instance_info.id,
         vcpus_exit_evt: kvm_vm.vcpus_exit_evt(),
+        vmm_filter: seccomp_filters
+            .get("vmm")
+            .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("vmm".to_string()))?
+            .clone(),
     };
     #[allow(unused_mut)]
     let mut device_manager =

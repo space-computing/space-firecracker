@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use super::acpi::ACPIDeviceManager;
 use super::mmio::*;
 use crate::EventManager;
-use crate::device_manager::DevicePersistError;
 use crate::device_manager::acpi::ACPIDeviceError;
+use crate::device_manager::{DevicePersistError, restore_screen};
 use crate::devices::acpi::vmclock::{VmClock, VmClockState};
 use crate::devices::acpi::vmgenid::{VMGenIDState, VmGenId};
 #[cfg(target_arch = "aarch64")]
@@ -22,6 +22,7 @@ use crate::devices::virtio::balloon::persist::{BalloonConstructorArgs, BalloonSt
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::block::persist::{BlockConstructorArgs, BlockState};
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
+use crate::devices::virtio::gpu::{Gpu, GpuState, Input, InputState, Sound, SoundState};
 use crate::devices::virtio::mem::VirtioMem;
 use crate::devices::virtio::mem::persist::{VirtioMemConstructorArgs, VirtioMemState};
 use crate::devices::virtio::net::Net;
@@ -38,6 +39,7 @@ use crate::devices::virtio::vsock::persist::{
 use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
 use crate::mmds::data_store::MmdsVersion;
 use crate::resources::VmResources;
+use crate::seccomp::BpfProgram;
 use crate::snapshot::Persist;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vstate::memory::GuestMemoryMmap;
@@ -129,6 +131,12 @@ pub struct DeviceStates {
     pub pmem_devices: Vec<VirtioDeviceState<PmemState>>,
     /// Memory device state.
     pub memory_device: Option<VirtioDeviceState<VirtioMemState>>,
+    /// GPU device state (its large part is in the side file beside the snapshot).
+    pub gpu_device: Option<VirtioDeviceState<GpuState>>,
+    /// The input devices beside the GPU.
+    pub input_devices: Vec<VirtioDeviceState<InputState>>,
+    /// The sound device beside the GPU.
+    pub sound_device: Option<VirtioDeviceState<SoundState>>,
 }
 
 pub struct MMIODevManagerConstructorArgs<'a> {
@@ -137,6 +145,8 @@ pub struct MMIODevManagerConstructorArgs<'a> {
     pub event_manager: &'a mut EventManager,
     pub vm_resources: &'a mut VmResources,
     pub instance_id: &'a str,
+    /// The `vmm` seccomp filter, for the GPU device's threads.
+    pub vmm_filter: Arc<BpfProgram>,
 }
 
 pub struct MMIOPlatformDevicesConstructorArgs<'a> {
@@ -391,6 +401,33 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
                         device_info,
                     });
                 }
+                VirtioDeviceType::Gpu => {
+                    let gpu = locked_device.as_any().downcast_ref::<Gpu>().unwrap();
+                    states.gpu_device = Some(VirtioDeviceState {
+                        device_id,
+                        device_state: gpu.save(),
+                        transport_state,
+                        device_info,
+                    });
+                }
+                VirtioDeviceType::Input => {
+                    let input = locked_device.as_any().downcast_ref::<Input>().unwrap();
+                    states.input_devices.push(VirtioDeviceState {
+                        device_id,
+                        device_state: input.save(),
+                        transport_state,
+                        device_info,
+                    });
+                }
+                VirtioDeviceType::Sound => {
+                    let sound = locked_device.as_any().downcast_ref::<Sound>().unwrap();
+                    states.sound_device = Some(VirtioDeviceState {
+                        device_id,
+                        device_state: sound.save(),
+                        transport_state,
+                        device_info,
+                    });
+                }
             };
 
             Ok(())
@@ -613,6 +650,53 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
             )?;
         }
 
+        if let Some(gpu_state) = &state.gpu_device {
+            let inputs: Vec<&InputState> = state
+                .input_devices
+                .iter()
+                .map(|s| &s.device_state)
+                .collect();
+            let (gpu, inputs, sound) = restore_screen(
+                mem,
+                &constructor_args.vmm_filter,
+                constructor_args.vm_resources,
+                &gpu_state.device_state,
+                &inputs,
+                state.sound_device.as_ref().map(|s| &s.device_state),
+            )?;
+            restore_helper(
+                gpu,
+                gpu_state.device_state.virtio_state.activated,
+                false,
+                &gpu_state.device_id,
+                &gpu_state.transport_state,
+                &gpu_state.device_info,
+                constructor_args.event_manager,
+            )?;
+            for (dev, s) in inputs.into_iter().zip(&state.input_devices) {
+                restore_helper(
+                    dev,
+                    s.device_state.virtio_state.activated,
+                    false,
+                    &s.device_id,
+                    &s.transport_state,
+                    &s.device_info,
+                    constructor_args.event_manager,
+                )?;
+            }
+            if let (Some(dev), Some(s)) = (sound, &state.sound_device) {
+                restore_helper(
+                    dev,
+                    s.device_state.virtio_state.activated,
+                    false,
+                    &s.device_id,
+                    &s.transport_state,
+                    &s.device_info,
+                    constructor_args.event_manager,
+                )?;
+            }
+        }
+
         if let Some(memory_state) = &state.memory_device {
             let ctor_args = VirtioMemConstructorArgs::new(Arc::clone(vm));
             let device = VirtioMem::restore(ctor_args, &memory_state.device_state)?;
@@ -806,6 +890,7 @@ mod tests {
             event_manager: &mut event_manager,
             vm_resources,
             instance_id: "microvm-id",
+            vmm_filter: Arc::new(Vec::new()),
         };
         let _restored_dev_manager = MMIOVirtioDevices::restore(restore_args, mmio_state).unwrap();
 

@@ -23,6 +23,7 @@ use crate::vmm_config::boot_source::{
 };
 use crate::vmm_config::drive::*;
 use crate::vmm_config::entropy::*;
+use crate::vmm_config::gpu::{GpuConfig, GpuConfigError};
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{MachineConfig, MachineConfigError, MachineConfigUpdate};
 use crate::vmm_config::memory_hotplug::{MemoryHotplugConfig, MemoryHotplugConfigError};
@@ -68,6 +69,8 @@ pub enum ResourcesError {
     PmemConfig(#[from] PmemConfigError),
     /// Memory hotplug config error: {0}
     MemoryHotplugConfig(#[from] MemoryHotplugConfigError),
+    /// GPU device error: {0}
+    GpuConfig(#[from] GpuConfigError),
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
@@ -95,6 +98,8 @@ pub struct VmmConfig {
     pub network_interfaces: Vec<NetworkInterfaceConfig>,
     pub vsock: Option<VsockDeviceConfig>,
     pub entropy: Option<EntropyDeviceConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<GpuConfig>,
     #[serde(default, rename = "pmem")]
     pub pmem_devices: Vec<PmemConfig>,
     #[serde(skip)]
@@ -120,6 +125,8 @@ pub struct VmResources {
     pub net_builder: NetBuilder,
     /// The entropy device builder.
     pub entropy: EntropyDeviceBuilder,
+    /// The GPU device, made when the VM boots (its threads must start before the filters).
+    pub gpu: Option<GpuConfig>,
     /// The pmem device configs.
     pub pmem: PmemBuilder,
     /// The memory hotplug configuration.
@@ -224,6 +231,10 @@ impl VmResources {
 
         if let Some(entropy_device_config) = vmm_config.entropy {
             resources.build_entropy_device(entropy_device_config)?;
+        }
+
+        if let Some(gpu_config) = vmm_config.gpu {
+            resources.set_gpu_device(gpu_config)?;
         }
 
         for pmem_config in vmm_config.pmem_devices.into_iter() {
@@ -388,6 +399,13 @@ impl VmResources {
         self.entropy.insert(body)
     }
 
+    /// Sets the GPU device to be attached when the VM starts.
+    pub fn set_gpu_device(&mut self, config: GpuConfig) -> Result<(), GpuConfigError> {
+        config.validate()?;
+        self.gpu = Some(config);
+        Ok(())
+    }
+
     /// Builds a pmem device to be attached when the VM starts.
     pub fn build_pmem_device(&mut self, body: PmemConfig) -> Result<(), PmemConfigError> {
         let has_block_root = self.block.has_root_device();
@@ -549,6 +567,7 @@ impl From<&VmResources> for VmmConfig {
             network_interfaces: resources.net_builder.configs(),
             vsock: resources.vsock.config(),
             entropy: resources.entropy.config(),
+            gpu: resources.gpu.clone(),
             pmem_devices: resources.pmem.configs.clone(),
             // serial_config is marked serde(skip) so that it doesnt end up in snapshots.
             serial_config: None,
@@ -664,6 +683,7 @@ mod tests {
             boot_timer: false,
             mmds_size_limit: HTTP_MAX_PAYLOAD_SIZE,
             entropy: Default::default(),
+            gpu: None,
             pmem: Default::default(),
             pci_enabled: false,
             serial_out_path: None,

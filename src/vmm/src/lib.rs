@@ -138,6 +138,7 @@ use crate::devices::virtio::balloon::{
 use crate::devices::virtio::block::BlockError;
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceId, VirtioDeviceType};
+use crate::devices::virtio::gpu::Gpu;
 use crate::devices::virtio::mem::device::VirtioMem;
 use crate::devices::virtio::mem::{VIRTIO_MEM_DEV_ID, VirtioMemError, VirtioMemStatus};
 use crate::devices::virtio::net::Net;
@@ -351,6 +352,7 @@ impl Vmm {
         let mut balloon = None;
         let mut vsock = None;
         let mut entropy = None;
+        let mut gpu = None;
         let mut memory_hotplug = None;
         let mut mmds_ipv4_address = None;
         let mut mmds_ref = None;
@@ -399,6 +401,13 @@ impl Vmm {
                         memory_hotplug = Some(MemoryHotplugConfig::from(m));
                     }
                 }
+                VirtioDeviceType::Gpu => {
+                    if let Some(g) = device.as_any().downcast_ref::<Gpu>() {
+                        gpu = Some(g.cfg.clone());
+                    }
+                }
+                // Part of the GPU's configuration (`input`, `sound`).
+                VirtioDeviceType::Input | VirtioDeviceType::Sound => {}
             });
 
         let mmds_config = mmds_ref.map(|mmds| {
@@ -426,6 +435,7 @@ impl Vmm {
             network_interfaces: net,
             vsock,
             entropy,
+            gpu,
             pmem_devices: pmem,
             // serial_config is marked serde(skip) so that it doesnt end up in snapshots
             serial_config: None,
