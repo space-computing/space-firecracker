@@ -269,6 +269,10 @@ impl BusDevice for MmioTransport {
                         }
                     }
                     0x70 => self.device_status,
+                    // SHMLen and SHMBase: no device here has shared memory regions. The spec
+                    // says a region that does not exist reads as all ones; a driver that looks
+                    // for one (virtio-gpu for host visible memory) takes 0 as a region of size 0.
+                    0xb0 | 0xb4 | 0xb8 | 0xbc => 0xffff_ffff,
                     0xfc => self.config_generation,
                     _ => {
                         warn!("unknown virtio mmio register read: {:#x}", offset);
@@ -333,6 +337,7 @@ impl BusDevice for MmioTransport {
                     0x94 => self.update_queue_field(|q| hi(&mut q.avail_ring_address, v)),
                     0xa0 => self.update_queue_field(|q| lo(&mut q.used_ring_address, v)),
                     0xa4 => self.update_queue_field(|q| hi(&mut q.used_ring_address, v)),
+                    0xac => {} // SHMSel: there are no shared memory regions to select
                     _ => {
                         warn!("unknown virtio mmio register write: {:#x}", offset);
                     }
