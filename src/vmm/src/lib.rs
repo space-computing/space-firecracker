@@ -711,6 +711,15 @@ impl Vmm {
     ) -> Result<MicrovmState, MicrovmStateError> {
         self.check_unsnapshottable_devices()?;
 
+        // A snapshot needs a paused guest; a checkpoint is also taken in its own stop of a
+        // running guest, whose vCPUs are paused and whose devices are readied by
+        // `prepare_checkpoint`.
+        if !checkpoint && self.instance_info.state != VmState::Paused {
+            return Err(MicrovmStateError::NotAllowed(
+                "snapshot requires a paused microVM".into(),
+            ));
+        }
+
         // We need to save device state before saving KVM state.
         // Some devices, (at the time of writing this comment block device with async engine)
         // might modify the VirtIO transport and send an interrupt to the guest. If we save KVM
@@ -926,6 +935,10 @@ impl Vmm {
         event_manager: &mut EventManager,
     ) -> Result<(), VmmActionError> {
         log_dev_preview_warning("PCI device hotplug", None);
+        if let HotplugDeviceConfig::Block(block_config) = &config {
+            self.machine_config
+                .validate_num_queues(&block_config.drive_id, block_config.num_queues)?;
+        }
         let kvm_vm = self
             .vm
             .as_kvm()
@@ -1145,9 +1158,15 @@ mod tests {
     fn test_state_saved_while_running_reads_the_clock_of_now() {
         let mut vmm = running_vmm();
         let vm_info = VmInfo::from(&vmm);
+        // A snapshot needs a paused guest (the worker threads of the drives are paused by it); the
+        // state of a running guest is the one of a checkpoint, in its own stop.
+        assert!(matches!(
+            vmm.save_state(&vm_info),
+            Err(MicrovmStateError::NotAllowed(_))
+        ));
         let before = kvm_clock(&vmm);
         std::thread::sleep(Duration::from_millis(50));
-        let state = vmm.save_state(&vm_info).unwrap();
+        let state = vmm.save_checkpoint_state(&vm_info).unwrap();
         let clock = state.vm_state.clock().clock;
         assert!(clock >= before + 50 * MS);
         // Within the check of 50 ms of a checkpoint of a running guest.
@@ -1238,7 +1257,9 @@ mod tests {
 
         vmm.device_manager
             .with_virtio_device("rootfs", |block: &mut Block| match block {
-                Block::Virtio(block) => block.error_pending = true,
+                Block::Virtio(block) => block
+                    .disk_error
+                    .store(true, std::sync::atomic::Ordering::SeqCst),
                 Block::VhostUser(_) => unreachable!(),
             })
             .unwrap();

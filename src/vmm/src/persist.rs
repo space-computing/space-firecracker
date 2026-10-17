@@ -162,9 +162,10 @@ pub enum CreateSnapshotError {
     SnapshotBackingFile(&'static str, io::Error),
 }
 
-/// Snapshot version. Major 13 is the fork's: the state of a block device holds the requests
-/// that a disk error kept.
-pub const SNAPSHOT_VERSION: Version = Version::new(13, 0, 0);
+/// Snapshot version. Majors 13 and 14 are the fork's: the state of a block device holds the
+/// requests that a disk error kept (13), for each of its queues, with the number of its queues
+/// and the poll window of their worker threads (14).
+pub const SNAPSHOT_VERSION: Version = Version::new(14, 0, 0);
 
 /// Creates a Microvm snapshot.
 pub fn create_snapshot(

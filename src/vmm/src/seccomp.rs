@@ -44,6 +44,7 @@ pub fn get_empty_filters() -> BpfThreadMap {
     map.insert("vcpu".to_string(), Arc::new(vec![]));
     map.insert("fill".to_string(), Arc::new(vec![]));
     map.insert("checkpoint".to_string(), Arc::new(vec![]));
+    map.insert("blk_worker".to_string(), Arc::new(vec![]));
     map
 }
 

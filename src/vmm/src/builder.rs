@@ -32,6 +32,7 @@ use crate::device_manager::{
     DeviceRestoreArgs,
 };
 use crate::devices::virtio::balloon::Balloon;
+use crate::devices::virtio::block::BlockError;
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::device::VirtioDevice;
 use crate::devices::virtio::mem::{VIRTIO_MEM_DEFAULT_SLOT_SIZE_MIB, VirtioMem};
@@ -113,6 +114,8 @@ pub enum StartMicrovmError {
     NetDeviceNotConfigured,
     /// Cannot open the block device backing file: {0}
     OpenBlockDevice(io::Error),
+    /// Failed to spawn the block worker thread: {0}
+    SpawnBlockWorker(BlockError),
     /// Cannot restore microvm state: {0}
     RestoreMicrovmState(MicrovmStateError),
     /// Cannot set vm resources: {0}
@@ -217,6 +220,7 @@ pub fn build_microvm_for_boot(
         vm_resources.serial_out_path.as_ref(),
         vm_resources.serial_rate_limiter(),
         vm_resources.pci_enabled,
+        seccomp_filters.get("blk_worker").cloned(),
     )?;
 
     let guest_memory = kvm_vm.guest_memory();
@@ -547,6 +551,7 @@ pub fn build_microvm_from_snapshot(
         vm_resources,
         instance_id: &instance_info.id,
         vcpus_exit_evt: kvm_vm.vcpus_exit_evt(),
+        blk_worker_filter: seccomp_filters.get("blk_worker").cloned(),
     };
     #[allow(unused_mut)]
     let mut device_manager =
@@ -595,6 +600,9 @@ pub fn build_microvm_from_snapshot(
             .clone(),
     )?;
 
+    // A loaded guest is stopped until its resume: the worker threads of its drives take no
+    // request until then (the queues of a drive on the VMM thread wait with that thread).
+    vmm.device_manager.quiesce_virtio_devices();
     let vmm = Arc::new(Mutex::new(vmm));
     vmm.lock()
         .unwrap()
@@ -745,6 +753,13 @@ fn attach_block_devices<'a, I: Iterator<Item = &'a Arc<Mutex<Block>>> + Debug>(
             }
             (locked.id().to_string(), locked.is_vhost_user())
         };
+
+        block
+            .lock()
+            .expect("Poisoned lock")
+            .spawn_worker(device_manager.blk_worker_filter.clone())
+            .map_err(StartMicrovmError::SpawnBlockWorker)?;
+
         // The device mutex mustn't be locked here otherwise it will deadlock.
         device_manager.attach_boot_virtio_device(
             vm,
@@ -846,6 +861,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::device_manager::tests::{default_device_manager, default_device_manager_with_pci};
     use crate::devices::virtio::block::CacheType;
+    use crate::devices::virtio::block::virtio::device::FileEngineType;
     use crate::devices::virtio::device::VirtioDeviceType;
     use crate::devices::virtio::rng::device::ENTROPY_DEV_ID;
     use crate::devices::virtio::vsock::VSOCK_DEV_ID;
@@ -871,6 +887,8 @@ pub(crate) mod tests {
         partuuid: Option<String>,
         is_read_only: bool,
         cache_type: CacheType,
+        // The worker threads of the drive: `num_queues` and `poll_us`, with the Async engine.
+        workers: Option<(std::num::NonZeroU16, u32)>,
     }
 
     impl CustomBlockConfig {
@@ -887,7 +905,15 @@ pub(crate) mod tests {
                 partuuid,
                 is_read_only,
                 cache_type,
+                workers: None,
             }
+        }
+
+        /// The drive on `num_queues` worker threads that poll for `poll_us`, with the Async
+        /// engine.
+        pub(crate) fn with_workers(mut self, num_queues: u16, poll_us: u32) -> Self {
+            self.workers = Some((std::num::NonZeroU16::new(num_queues).unwrap(), poll_us));
+            self
         }
     }
 
@@ -975,6 +1001,8 @@ pub(crate) mod tests {
 
                 is_read_only: Some(custom_block_cfg.is_read_only),
                 discard: None,
+                num_queues: custom_block_cfg.workers.map(|(n, _)| n),
+                poll_us: custom_block_cfg.workers.map(|(_, us)| us),
                 path_on_host: Some(
                     block_files
                         .last()
@@ -985,12 +1013,22 @@ pub(crate) mod tests {
                         .to_string(),
                 ),
                 rate_limiter: None,
-                file_engine_type: None,
+                file_engine_type: custom_block_cfg.workers.map(|_| FileEngineType::Async),
                 blk_size: None,
                 topology: None,
 
                 socket: None,
             };
+            if custom_block_cfg.workers.is_some() {
+                // A drive of the Async engine opens its file with O_DIRECT: the file has a
+                // size of whole blocks.
+                block_files
+                    .last()
+                    .unwrap()
+                    .as_file()
+                    .set_len(0x10000)
+                    .unwrap();
+            }
 
             block_dev_configs
                 .insert(block_device_config, false)

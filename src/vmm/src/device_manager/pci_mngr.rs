@@ -36,6 +36,7 @@ use crate::logger::{debug, warn};
 use crate::pci::PciSBDF;
 use crate::pci::bus::PciRootError;
 use crate::resources::VmResources;
+use crate::seccomp::BpfProgram;
 use crate::snapshot::Persist;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vstate::bus::BusError;
@@ -133,7 +134,7 @@ impl PciDevices {
 
         // Allocate one MSI vector per queue, plus one for configuration
         let msix_num =
-            u16::try_from(device.lock().expect("Poisoned lock").queues().len() + 1).unwrap();
+            u16::try_from(device.lock().expect("Poisoned lock").num_queues() + 1).unwrap();
 
         let msix_vectors = KvmVm::create_msix_group(vm.clone(), msix_num)?;
 
@@ -332,6 +333,7 @@ pub struct PciDevicesConstructorArgs<'a> {
     pub vm_resources: &'a mut VmResources,
     pub instance_id: &'a str,
     pub event_manager: &'a mut EventManager,
+    pub blk_worker_filter: Option<Arc<BpfProgram>>,
 }
 
 impl<'a> Debug for PciDevicesConstructorArgs<'a> {
@@ -530,6 +532,11 @@ impl<'a> Persist<'a> for PciDevices {
                 BlockConstructorArgs { mem: mem.clone() },
                 &block_state.device_state,
             )?));
+
+            device
+                .lock()
+                .expect("Poisoned lock")
+                .spawn_worker(constructor_args.blk_worker_filter.clone())?;
 
             constructor_args
                 .vm_resources
@@ -842,6 +849,7 @@ mod tests {
             vm_resources,
             instance_id: "microvm-id",
             event_manager: &mut event_manager,
+            blk_worker_filter: None,
         };
         let _restored_dev_manager = PciDevices::restore(restore_args, pci_state).unwrap();
 
@@ -862,6 +870,8 @@ mod tests {
       "cache_type": "Unsafe",
       "is_read_only": true,
       "discard": false,
+      "num_queues": null,
+      "poll_us": null,
       "path_on_host": "{}",
       "rate_limiter": null,
       "io_engine": "Sync",

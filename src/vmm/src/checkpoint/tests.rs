@@ -422,6 +422,121 @@ fn test_full_copy_frame_zero_and_frames() {
 }
 
 #[test]
+fn test_used_ring_page_of_a_drive_on_workers_is_in_the_next_checkpoint() {
+    // A drive on two worker threads that poll: at each checkpoint of the running guest the
+    // workers end their requests and stop, the rings of both queues are marked after the reset,
+    // and the workers take their queues again after the stop.
+    let _reset = Reset;
+    let mut vmm = ckpt_vmm();
+    vmm.device_manager.blk_worker_filter = Some(Arc::new(vec![]));
+    let mut cmdline = default_kernel_cmdline();
+    let mut event_manager = EventManager::new().unwrap();
+    let _files = insert_block_devices(
+        &mut vmm,
+        &mut cmdline,
+        &mut event_manager,
+        vec![
+            CustomBlockConfig::new("root".to_string(), true, None, false, CacheType::Unsafe)
+                .with_workers(2, 128),
+        ],
+    );
+    // The guest set up the two queues of the drive: queue q at 0x10000 + 0x4000 * q, its
+    // used ring at + 0x2000, with EVENT_IDX.
+    let guest_mem = mem(&vmm).clone();
+    vmm.device_manager
+        .with_virtio_device("root", |block: &mut Block| {
+            let Block::Virtio(b) = block else {
+                unreachable!()
+            };
+            b.set_acked_features(b.avail_features());
+            for q in 0..2u64 {
+                let base = 0x10000 + 0x4000 * q;
+                let c = b.queue_config_mut(usize::try_from(q).unwrap()).unwrap();
+                c.size = 16;
+                c.desc_table_address = GuestAddress(base);
+                c.avail_ring_address = GuestAddress(base + 0x1000);
+                c.used_ring_address = GuestAddress(base + 0x2000);
+                c.ready = true;
+            }
+            block.activate(guest_mem, default_interrupt()).unwrap();
+        })
+        .unwrap();
+    let place = Place::new(Begin::New);
+    vmm.checkpoint_set(&set(30, &place.uri())).unwrap();
+    pump(&mut vmm, 10, |v| acked(v, 1));
+    // The devices write their used rings, with no mark.
+    write_unmarked(&vmm, 0x12000 + 4, &[0xab; 8]);
+    write_unmarked(&vmm, 0x16000 + 4, &[0xcd; 8]);
+    let n = vmm.checkpoint_info().sent;
+    pump(&mut vmm, 10, |v| acked(v, n + 1));
+    let f = place.frame(n + 1).unwrap();
+    assert_eq!(f.has_page(0x12), Some(true));
+    assert_eq!(f.has_page(0x16), Some(true));
+
+    // After the checkpoints the workers serve the guest: a request for the drive's id on each
+    // queue (its header at 0x30000 + 0x100 * q, its data at 0x31000 + 0x100 * q, its status at
+    // 0x32000 + q), kicked as the guest's driver kicks.
+    let gm = mem(&vmm).clone();
+    for q in 0..2u64 {
+        let base = 0x10000 + 0x4000 * q;
+        let (header, data, status) = (0x30000 + 0x100 * q, 0x31000 + 0x100 * q, 0x32000 + q);
+        gm.write_obj(
+            crate::devices::virtio::block::virtio::RequestHeader::new(
+                crate::devices::virtio::block::virtio::VIRTIO_BLK_T_GET_ID,
+                0,
+            ),
+            GuestAddress(header),
+        )
+        .unwrap();
+        gm.write_obj::<u8>(0xff, GuestAddress(status)).unwrap();
+        // Three descriptors of 16 bytes: header, data (20 bytes, written by the device),
+        // status.
+        for (i, (addr, len, flags, next)) in [
+            (header, 16u32, 1u16, 1u16),
+            (data, 20, 1 | 2, 2),
+            (status, 1, 2, 0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let d = GuestAddress(base + 16 * i as u64);
+            gm.write_obj(addr, d).unwrap();
+            gm.write_obj(len, GuestAddress(d.0 + 8)).unwrap();
+            gm.write_obj(flags, GuestAddress(d.0 + 12)).unwrap();
+            gm.write_obj(next, GuestAddress(d.0 + 14)).unwrap();
+        }
+        let avail = base + 0x1000;
+        let old: u16 = gm.read_obj(GuestAddress(avail + 2)).unwrap();
+        gm.write_obj(0u16, GuestAddress(avail + 4 + 2 * u64::from(old % 16)))
+            .unwrap();
+        gm.write_obj(old.wrapping_add(1), GuestAddress(avail + 2))
+            .unwrap();
+        vmm.device_manager
+            .with_virtio_device("root", |block: &mut Block| {
+                block
+                    .queue_event(usize::try_from(q).unwrap())
+                    .unwrap()
+                    .write(1)
+                    .unwrap();
+            })
+            .unwrap();
+    }
+    let start = Instant::now();
+    while (0..2u64).any(|q| gm.read_obj::<u8>(GuestAddress(0x32000 + q)).unwrap() != 0) {
+        vmm.checkpoint_service();
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the workers did not answer"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    for q in 0..2u64 {
+        let used: u16 = gm.read_obj(GuestAddress(0x12000 + 0x4000 * q + 2)).unwrap();
+        assert_eq!(used, 1);
+    }
+}
+
+#[test]
 fn test_used_ring_page_written_with_no_mark_is_in_the_next_checkpoint() {
     let _reset = Reset;
     let mut vmm = ckpt_vmm();
@@ -446,7 +561,7 @@ fn test_used_ring_page_written_with_no_mark_is_in_the_next_checkpoint() {
             let Block::Virtio(b) = block else {
                 unreachable!()
             };
-            let q = &mut b.queues[0];
+            let q = b.queue_config_mut(0).unwrap();
             q.size = 16;
             q.desc_table_address = GuestAddress(0x10000);
             q.avail_ring_address = GuestAddress(0x11000);

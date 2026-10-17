@@ -1414,6 +1414,27 @@ definitions:
           requests in flight end first.
           This field is optional for virtio-block config and should be omitted for vhost-user-block configuration.
         default: false
+      num_queues:
+        type: integer
+        format: int32
+        minimum: 1
+        description:
+          Number of virtio queues exposed by the block device, each processed on a
+          dedicated worker thread. Cannot exceed the configured vCPU count.
+          If omitted, the device exposes a single queue processed on the VMM thread.
+          Setting it to 1 still processes the queue on a dedicated worker thread.
+          This field is supported only for virtio-block configuration.
+      poll_us:
+        type: integer
+        format: int32
+        minimum: 0
+        maximum: 1000000
+        description:
+          How long, in microseconds, each worker thread of the drive keeps looking at its
+          queue and at its completions after its last work, with the guest's notification
+          left off, before it arms the notification and waits. Needs num_queues. If omitted
+          or 0, the worker threads do not poll.
+          This field is supported only for virtio-block configuration.
       path_on_host:
         type: string
         description:

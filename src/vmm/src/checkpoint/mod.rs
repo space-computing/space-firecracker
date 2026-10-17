@@ -569,6 +569,7 @@ impl Vmm {
             mem.mark_dirty(addr, len);
         }
         if was_running {
+            self.device_manager.resume_virtio_devices_after_checkpoint();
             kvm_vm.resume_vcpus().map_err(|e| e.to_string())?;
             self.device_manager.kick_net_receive();
         }
@@ -1543,10 +1544,13 @@ impl Vmm {
             if leased && lease.passed(lease.now()) {
                 // The stop took longer than the lease had left: the guest does not run again.
                 self.lease_check();
-            } else if let Err(err) = kvm_vm.resume_vcpus() {
-                error!("The end of the stop of a checkpoint: {}", err);
             } else {
-                self.device_manager.kick_net_receive();
+                self.device_manager.resume_virtio_devices_after_checkpoint();
+                if let Err(err) = kvm_vm.resume_vcpus() {
+                    error!("The end of the stop of a checkpoint: {}", err);
+                } else {
+                    self.device_manager.kick_net_receive();
+                }
             }
         }
         let stop_us = host_us() - t_begin;

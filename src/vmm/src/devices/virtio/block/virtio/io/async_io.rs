@@ -9,6 +9,8 @@ use std::os::fd::RawFd;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::AsRawFd;
 use std::ptr::NonNull;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use slab::Slab;
 use vm_memory::{GuestMemoryBackend, GuestMemoryError};
@@ -95,6 +97,161 @@ impl DirectAlignment {
     }
 }
 
+/// The device blocks that the engines of one drive have in work. A drive with more than one
+/// queue has an engine for each queue, on a thread of its own: a read-modify-write of one engine
+/// and a request of another engine on the same device blocks do not run at the same time, as
+/// within one engine (two writes of the guest to different sectors of one device block would
+/// otherwise each write back the other's old sectors).
+#[derive(Debug, Default)]
+pub struct DriveBlocks {
+    inner: Mutex<DriveBlocksInner>,
+    released: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct DriveBlocksInner {
+    claims: Slab<Claim>,
+    // The number of claims of read-modify-writes.
+    rmw: usize,
+    // The number of releases so far, so that a wait for one misses none.
+    releases: u64,
+    engines: Vec<EngineSlot>,
+}
+
+#[derive(Debug)]
+struct EngineSlot {
+    // A job of the engine waits for a claim of another engine.
+    waits: bool,
+    // Wakes the engine's thread (the completion event of its ring), so that it tries again.
+    wake: EventFd,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Claim {
+    engine: usize,
+    start: u64,
+    end: u64,
+    rmw: bool,
+}
+
+/// The longest wait of a thread for a release of another engine before it looks again.
+const RELEASE_WAIT: Duration = Duration::from_millis(10);
+
+impl DriveBlocks {
+    fn lock(&self) -> std::sync::MutexGuard<'_, DriveBlocksInner> {
+        self.inner.lock().expect("Poisoned drive blocks lock")
+    }
+
+    /// Adds an engine, woken by `wake`; returns its number.
+    fn register(&self, wake: EventFd) -> usize {
+        let mut inner = self.lock();
+        inner.engines.push(EngineSlot { waits: false, wake });
+        inner.engines.len() - 1
+    }
+
+    /// Claims the device blocks `start..end` for a job of `engine`, unless they conflict with a
+    /// claim of another engine (the two overlap and one of them is a read-modify-write); then
+    /// the engine is woken at the next release.
+    fn try_claim(&self, engine: usize, start: u64, end: u64, rmw: bool) -> Option<usize> {
+        let mut inner = self.lock();
+        if rmw || inner.rmw > 0 {
+            let conflict = inner.claims.iter().any(|(_, c)| {
+                c.engine != engine && (rmw || c.rmw) && c.start < end && start < c.end
+            });
+            if conflict {
+                inner.engines[engine].waits = true;
+                return None;
+            }
+        }
+        if rmw {
+            inner.rmw += 1;
+        }
+        Some(inner.claims.insert(Claim {
+            engine,
+            start,
+            end,
+            rmw,
+        }))
+    }
+
+    /// Claims the device blocks `start..end` as a read-modify-write, waiting for the claims of
+    /// other engines that conflict. The caller holds no claim, so the wait ends.
+    fn claim_waiting(&self, engine: usize, start: u64, end: u64) -> usize {
+        loop {
+            let seen = self.releases();
+            if let Some(slot) = self.try_claim(engine, start, end, true) {
+                return slot;
+            }
+            self.wait_release(seen);
+        }
+    }
+
+    fn release(&self, slot: usize) {
+        let mut inner = self.lock();
+        let claim = inner.claims.remove(slot);
+        if claim.rmw {
+            inner.rmw -= 1;
+        }
+        Self::released(&mut inner);
+        drop(inner);
+        self.released.notify_all();
+    }
+
+    /// Releases every claim of `engine` (its jobs were thrown away).
+    fn release_engine(&self, engine: usize) {
+        let mut inner = self.lock();
+        let slots: Vec<usize> = inner
+            .claims
+            .iter()
+            .filter(|(_, c)| c.engine == engine)
+            .map(|(slot, _)| slot)
+            .collect();
+        if slots.is_empty() {
+            return;
+        }
+        for slot in slots {
+            let claim = inner.claims.remove(slot);
+            if claim.rmw {
+                inner.rmw -= 1;
+            }
+        }
+        Self::released(&mut inner);
+        drop(inner);
+        self.released.notify_all();
+    }
+
+    fn released(inner: &mut DriveBlocksInner) {
+        inner.releases += 1;
+        for slot in inner.engines.iter_mut().filter(|e| e.waits) {
+            slot.waits = false;
+            if let Err(err) = slot.wake.write(1) {
+                error!("Failed to wake a block queue: {:?}", err);
+            }
+        }
+    }
+
+    fn releases(&self) -> u64 {
+        self.lock().releases
+    }
+
+    /// Waits until a release after the count `seen`, or for `RELEASE_WAIT`.
+    fn wait_release(&self, seen: u64) {
+        let inner = self.lock();
+        if inner.releases == seen {
+            let _ = self
+                .released
+                .wait_timeout(inner, RELEASE_WAIT)
+                .expect("Poisoned drive blocks lock");
+        }
+    }
+
+    // Test-only: the number of claims.
+    #[cfg(test)]
+    pub(crate) fn claims(&self) -> usize {
+        self.lock().claims.len()
+    }
+}
+
 /// Memory for the aligned operations of a request: whole device blocks, at the memory
 /// alignment of `O_DIRECT`, zeroed when made.
 #[derive(Debug)]
@@ -162,6 +319,9 @@ pub struct AsyncFileEngine {
     ready: VecDeque<Done>,
     // The result of the last write of the engine's own (the zeros at the ends of a discard).
     own_result: Option<i32>,
+    // The device blocks in work of the drive's engines, and the number of this engine among
+    // them, for a drive with more than one queue.
+    blocks: Option<(Arc<DriveBlocks>, usize)>,
     // Test-only: the number of completions of the ring that pass before the injector below
     // turns completions into I/O errors.
     #[cfg(test)]
@@ -249,6 +409,8 @@ struct Job {
     buf: Option<AlignedBuf>,
     edge: Option<AlignedBuf>,
     step: Step,
+    // The claim of the device blocks among the drive's engines.
+    claim: Option<usize>,
 }
 
 impl Job {
@@ -336,14 +498,27 @@ impl AsyncFileEngine {
     }
 
     /// An engine over `file`, whose requests are aligned to `align` (`DirectAlignment::NONE`
-    /// for a file opened with no `O_DIRECT`).
-    pub fn from_file(file: File, align: DirectAlignment) -> Result<AsyncFileEngine, AsyncIoError> {
+    /// for a file opened with no `O_DIRECT`). The engines of the queues of one drive share
+    /// `blocks`.
+    pub fn from_file(
+        file: File,
+        align: DirectAlignment,
+        blocks: Option<Arc<DriveBlocks>>,
+    ) -> Result<AsyncFileEngine, AsyncIoError> {
         log_dev_preview_warning("Async file IO", Option::None);
 
         let completion_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(AsyncIoError::EventFd)?;
         let ring =
             Self::new_ring(&file, completion_evt.as_raw_fd()).map_err(AsyncIoError::IoUring)?;
         let is_block_device = Self::is_block_device(&file);
+        let blocks = match blocks {
+            Some(blocks) => {
+                let wake = completion_evt.try_clone().map_err(AsyncIoError::EventFd)?;
+                let engine = blocks.register(wake);
+                Some((blocks, engine))
+            }
+            None => None,
+        };
 
         Ok(AsyncFileEngine {
             file,
@@ -357,6 +532,7 @@ impl AsyncFileEngine {
             rmw_jobs: 0,
             ready: VecDeque::new(),
             own_result: None,
+            blocks,
             #[cfg(test)]
             pass_completions: 0,
             #[cfg(test)]
@@ -459,6 +635,7 @@ impl AsyncFileEngine {
             buf: None,
             edge: None,
             step: Step::Waiting,
+            claim: None,
         };
         if !direct {
             // The operations of the ring move at most `u32::MAX` bytes; such a request (and
@@ -495,7 +672,7 @@ impl AsyncFileEngine {
         if rmw {
             self.rmw_jobs += 1;
         }
-        if self.blocked(key, self.waiting.len()) {
+        if self.blocked(key, self.waiting.len()) || !self.claim(key) {
             self.waiting.push_back(key);
             return Ok(());
         }
@@ -527,6 +704,25 @@ impl AsyncFileEngine {
                 .iter()
                 .take(earlier)
                 .any(|&k| k != key && job.conflicts(&self.jobs[k]))
+    }
+
+    /// Claims the device blocks of job `key` among the drive's engines; false when a job of
+    /// another engine holds them (the engine is woken when it lets them go).
+    fn claim(&mut self, key: usize) -> bool {
+        let Some((blocks, engine)) = &self.blocks else {
+            return true;
+        };
+        let job = &mut self.jobs[key];
+        if job.claim.is_some() {
+            return true;
+        }
+        match blocks.try_claim(*engine, job.start, job.end, job.rmw) {
+            Some(slot) => {
+                job.claim = Some(slot);
+                true
+            }
+            None => false,
+        }
     }
 
     fn first_step(&self, key: usize) -> Step {
@@ -617,6 +813,9 @@ impl AsyncFileEngine {
         let job = self.jobs.remove(key);
         if job.rmw {
             self.rmw_jobs -= 1;
+        }
+        if let (Some(slot), Some((blocks, _))) = (job.claim, &self.blocks) {
+            blocks.release(slot);
         }
         job
     }
@@ -736,7 +935,7 @@ impl AsyncFileEngine {
         let mut i = 0;
         while i < self.waiting.len() {
             let key = self.waiting[i];
-            if self.blocked(key, i) {
+            if self.blocked(key, i) || !self.claim(key) {
                 i += 1;
                 continue;
             }
@@ -798,6 +997,22 @@ impl AsyncFileEngine {
     /// punched hole in a file reads as zeros.
     pub fn discard(&mut self, range: (u64, u32)) -> Result<u32, AsyncIoError> {
         self.drain(false)?;
+        // The device blocks of the range are claimed among the drive's engines, as a
+        // read-modify-write: no request of another queue on them runs at the same time.
+        let block = u64::from(self.align.offset);
+        let claim = self.blocks.as_ref().map(|(blocks, engine)| {
+            let start = range.0 - range.0 % block;
+            let end = (range.0 + u64::from(range.1)).next_multiple_of(block);
+            (blocks.clone(), blocks.claim_waiting(*engine, start, end))
+        });
+        let res = self.discard_claimed(range);
+        if let Some((blocks, slot)) = claim {
+            blocks.release(slot);
+        }
+        res
+    }
+
+    fn discard_claimed(&mut self, range: (u64, u32)) -> Result<u32, AsyncIoError> {
         let (offset, len) = range;
         let block = u64::from(self.align.offset);
         if self.is_block_device && block > 1 {
@@ -836,6 +1051,8 @@ impl AsyncFileEngine {
             buf: Some(buf),
             edge: None,
             step: Step::Waiting,
+            // The discard holds the claim of its blocks.
+            claim: None,
         });
         self.rmw_jobs += 1;
         self.own_result = None;
@@ -877,6 +1094,9 @@ impl AsyncFileEngine {
             self.stalled.clear();
             self.rmw_jobs = 0;
             self.ready.clear();
+            if let Some((blocks, engine)) = &self.blocks {
+                blocks.release_engine(*engine);
+            }
             return Ok(());
         }
 
@@ -890,7 +1110,19 @@ impl AsyncFileEngine {
             }
             self.run_deferred();
             if self.ring.num_ops() == 0 {
-                break;
+                if self.waiting.is_empty() {
+                    break;
+                }
+                // What is left waits for the blocks that a job of another queue holds; that
+                // job ends in the kernel, and its thread lets them go.
+                let Some((blocks, _)) = self.blocks.clone() else {
+                    break;
+                };
+                let seen = blocks.releases();
+                self.run_deferred();
+                if self.ring.num_ops() == 0 {
+                    blocks.wait_release(seen);
+                }
             }
         }
         debug_assert!(self.jobs.is_empty() && self.waiting.is_empty());
@@ -987,6 +1219,9 @@ impl Drop for AsyncFileEngine {
             && let Err(err) = self.ring.submit_and_wait_all()
         {
             error!("Failed to end block operations on drop: {:?}", err);
+        }
+        if let Some((blocks, engine)) = &self.blocks {
+            blocks.release_engine(*engine);
         }
     }
 }
