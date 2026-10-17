@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender as ChannelSender, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use vmm_sys_util::eventfd::EventFd;
 
@@ -35,6 +35,19 @@ use crate::seccomp::BpfProgram;
 #[derive(Debug)]
 pub struct Hook {
     stream: UnixStream,
+    /// The part of the answer that was read (its first bytes).
+    got: Vec<u8>,
+}
+
+/// What the hook said to the line that waits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookAnswer {
+    /// `ok`.
+    Ok,
+    /// The hook is gone or said another thing.
+    Gone,
+    /// No whole answer yet.
+    Waiting,
 }
 
 /// The hook, shared by the VMM thread (`epoch N` in the stop) and the sender (`commit N`,
@@ -46,6 +59,7 @@ impl Hook {
     pub fn open(path: &str) -> std::io::Result<Hook> {
         Ok(Hook {
             stream: UnixStream::connect(path)?,
+            got: Vec::with_capacity(4),
         })
     }
 
@@ -57,26 +71,59 @@ impl Hook {
     /// Writes `word N` and waits for the line `ok`. False: the hook is gone or said another
     /// thing.
     pub fn tell(&mut self, word: &str, n: u64) -> bool {
+        self.say(word, n) && self.answer(None) == HookAnswer::Ok
+    }
+
+    /// Writes `word N`; its answer is read by [`Hook::answer`]. False: the hook is gone.
+    pub fn say(&mut self, word: &str, n: u64) -> bool {
+        self.got.clear();
         let line = format!("{word} {n}\n");
-        if !send_all(self.stream.as_raw_fd(), line.as_bytes()) {
-            return false;
-        }
-        let mut got = Vec::with_capacity(4);
+        send_all(self.stream.as_raw_fd(), line.as_bytes())
+    }
+
+    /// Reads the answer to the line that was written, until `deadline`, or with no limit.
+    pub fn answer(&mut self, deadline: Option<Instant>) -> HookAnswer {
+        let fd = self.stream.as_raw_fd();
         loop {
+            if let Some(deadline) = deadline {
+                let left = deadline.saturating_duration_since(Instant::now());
+                let ms = i32::try_from(left.as_micros().div_ceil(1000)).unwrap_or(i32::MAX);
+                let mut p = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: one valid pollfd.
+                let r = unsafe { libc::poll(&mut p, 1, ms) };
+                if r < 0 {
+                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return HookAnswer::Gone;
+                }
+                if r == 0 {
+                    if Instant::now() >= deadline {
+                        return HookAnswer::Waiting;
+                    }
+                    continue;
+                }
+            }
             let mut c = 0u8;
             // SAFETY: a read of one byte into `c` from the descriptor of the hook.
-            let r = unsafe { libc::read(self.stream.as_raw_fd(), (&raw mut c).cast(), 1) };
+            let r = unsafe { libc::read(fd, (&raw mut c).cast(), 1) };
             if r < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
             if r <= 0 {
-                return false;
+                return HookAnswer::Gone;
             }
             if c == b'\n' {
-                return got == b"ok";
+                let ok = self.got == b"ok";
+                self.got.clear();
+                return if ok { HookAnswer::Ok } else { HookAnswer::Gone };
             }
-            if got.len() < 4 {
-                got.push(c);
+            if self.got.len() < 4 {
+                self.got.push(c);
             }
         }
     }
@@ -88,6 +135,31 @@ pub fn hook_tell(hook: &SharedHook, word: &str, n: u64) -> bool {
         Some(h) => h.tell(word, n),
         None => true,
     }
+}
+
+/// Writes `word N` to the hook, if there is one. False: the hook is gone.
+pub fn hook_say(hook: &SharedHook, word: &str, n: u64) -> bool {
+    match hook.lock().expect("Poisoned lock").as_mut() {
+        Some(h) => h.say(word, n),
+        None => true,
+    }
+}
+
+/// Reads the hook's answer to the line that was written, until `deadline`, or with no limit;
+/// with no hook, `ok`.
+pub fn hook_answer(hook: &SharedHook, deadline: Option<Instant>) -> HookAnswer {
+    match hook.lock().expect("Poisoned lock").as_mut() {
+        Some(h) => h.answer(deadline),
+        None => HookAnswer::Ok,
+    }
+}
+
+/// The descriptor of the hook, if there is one.
+pub fn hook_fd(hook: &SharedHook) -> Option<RawFd> {
+    hook.lock()
+        .expect("Poisoned lock")
+        .as_ref()
+        .map(Hook::raw_fd)
 }
 
 /// Writes all of `buf` to a socket, with no SIGPIPE when the other side is gone.

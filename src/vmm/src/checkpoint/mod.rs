@@ -61,7 +61,10 @@ use vm_memory::{GuestAddress, GuestMemoryBackend, GuestMemoryRegion};
 use self::hold::HOLD;
 use self::lease::{Lease, host_us, monotonic_ms};
 use self::need::{Decision, NeedConfig, NeedState};
-use self::sender::{CopyRange, Event, Hook, Job, Sender, SharedHook, StartKind, hook_tell};
+use self::sender::{
+    CopyRange, Event, Hook, HookAnswer, Job, Sender, SharedHook, StartKind, hook_answer, hook_fd,
+    hook_say,
+};
 use self::signal::Signal;
 use self::stream::{ID_LEN, PAGE, RegionDesc};
 use crate::Vmm;
@@ -81,6 +84,9 @@ const CLOCK_BEHIND_NS: u64 = 50 * 1_000_000;
 const BEAT_MS: u64 = 100;
 /// The tries of a save whose check fails.
 const SAVE_TRIES: u32 = 3;
+/// The error of a finish with no answer in its limit.
+const NO_ANSWER: &str =
+    "The receiving place did not answer the last checkpoint: the mode is as it was";
 
 /// An error of a `/space/checkpoint` call.
 #[derive(Debug, thiserror::Error, displaydoc::Display, PartialEq, Eq)]
@@ -210,6 +216,24 @@ struct OnItsWay {
     t_sent: Option<i64>,
 }
 
+/// The stop of a checkpoint whose hook has been told `epoch N` and has not answered yet: the
+/// guest stays stopped and its state is not copied until the answer. Only a finish leaves such
+/// a stop open, at its limit; every other wait for the hook has no limit.
+#[derive(Debug, Clone)]
+struct OpenStop {
+    epoch: u64,
+    reason: &'static str,
+    busy: i32,
+    t_begin: i64,
+    account_before: i64,
+    was_running: bool,
+    run_state: &'static str,
+    leased: bool,
+    first_of_new: bool,
+    /// The line could not be written: the hook is gone.
+    hook_gone: bool,
+}
+
 /// A stream that runs.
 #[derive(Debug)]
 struct Run {
@@ -288,6 +312,8 @@ pub struct Checkpointer {
     /// A release ended the mode.
     end_released: bool,
     spare: Option<Vec<u8>>,
+    /// The stop of a checkpoint that waits for the hook's answer after a finish ended.
+    open_stop: Option<OpenStop>,
 }
 
 impl Default for Checkpointer {
@@ -335,10 +361,12 @@ impl Checkpointer {
             reason_before_lease: None,
             end_released: false,
             spare: None,
+            open_stop: None,
         }
     }
 
-    /// The descriptors that wake the loop: the timers and the events of the sender.
+    /// The descriptors that wake the loop: the timers and the events of the sender, and the
+    /// hook while a stop waits for its answer.
     pub fn fds(&self) -> Vec<RawFd> {
         let mut fds = vec![
             self.loop_timer.as_raw_fd(),
@@ -347,6 +375,11 @@ impl Checkpointer {
         ];
         if let Some(s) = &self.sender {
             fds.push(s.evt().as_raw_fd());
+        }
+        if self.open_stop.is_some()
+            && let Some(fd) = hook_fd(&self.hook)
+        {
+            fds.push(fd);
         }
         fds
     }
@@ -976,7 +1009,11 @@ impl Vmm {
     /// stopped, a checkpoint on its way is answered first (its frames are released when the
     /// lease runs), the last checkpoint is taken in place and answered, and the mode ends; the
     /// hold stays on. One limit for all of it: two times `lost-ms` and 1 s. With no answer in it
-    /// the call fails and the mode is as it was.
+    /// the call fails and the mode is as it was. That holds for the answer of the hook too: a
+    /// stop whose hook has not answered `epoch N` in the limit stays open after the call, the
+    /// guest stopped, and the checkpoint goes on when the hook answers (a hook that is gone
+    /// makes the mode lost); every other call waits for the end of that stop, as it waits while
+    /// a stop runs.
     pub fn checkpoint_finish(&mut self) -> Result<CheckpointFinish, CheckpointError> {
         let active = self.checkpoint.st.active
             && self
@@ -1030,6 +1067,11 @@ impl Vmm {
     }
 
     fn finish_steps(&mut self, deadline: std::time::Instant) -> Result<u64, String> {
+        // (0) The stop that a finish before left open: the answer of its hook. The rest of that
+        // checkpoint then goes as the loop's.
+        if !self.continue_stop(Some(deadline)) {
+            return Err(NO_ANSWER.into());
+        }
         // (1) A checkpoint on its way: its answer, read here directly.
         self.wait_answer(deadline)?;
         // (2) The last checkpoint, in place: the guest is stopped.
@@ -1043,7 +1085,11 @@ impl Vmm {
         } else {
             -1
         };
-        self.take_checkpoint(reason, busy);
+        self.take_checkpoint_until(reason, busy, Some(deadline));
+        if self.checkpoint.open_stop.is_some() {
+            // The hook has not answered: the stop stays open.
+            return Err(NO_ANSWER.into());
+        }
         let run = self.checkpoint.run.as_ref().ok_or("the mode ended")?;
         if run.broken || run.on_its_way.is_none() {
             return Err(format!(
@@ -1057,10 +1103,7 @@ impl Vmm {
         if self.checkpoint.st.have_ack && self.checkpoint.st.acked == epoch {
             Ok(epoch)
         } else {
-            Err(
-                "The receiving place did not answer the last checkpoint: the mode is as it was"
-                    .into(),
-            )
+            Err(NO_ANSWER.into())
         }
     }
 
@@ -1081,10 +1124,7 @@ impl Vmm {
             }
             let now = std::time::Instant::now();
             if now >= deadline {
-                return Err(
-                    "The receiving place did not answer the last checkpoint: the mode is as it was"
-                        .into(),
-                );
+                return Err(NO_ANSWER.into());
             }
             let event = self
                 .checkpoint
@@ -1099,6 +1139,31 @@ impl Vmm {
                 }
             }
         }
+    }
+
+    /// Ends a stop that waits for the hook (a finish left it open), waiting for the hook with
+    /// no limit, as every stop does: a call other than a finish runs only after it.
+    pub fn checkpoint_end_open_stop(&mut self) {
+        if self.checkpoint.open_stop.is_some() {
+            self.continue_stop(None);
+        }
+    }
+
+    /// Reads the hook's answer to the open stop, until `deadline` or with no limit, and ends
+    /// the stop when it came (or when the hook is gone). False: the stop is still open.
+    fn continue_stop(&mut self, deadline: Option<std::time::Instant>) -> bool {
+        let Some(stop) = self.checkpoint.open_stop.as_ref() else {
+            return true;
+        };
+        let gone = stop.hook_gone
+            || match hook_answer(&self.checkpoint.hook, deadline) {
+                HookAnswer::Ok => false,
+                HookAnswer::Gone => true,
+                HookAnswer::Waiting => return false,
+            };
+        let stop = self.checkpoint.open_stop.take().unwrap();
+        self.end_stop(stop, gone);
+        true
     }
 
     /// Ends the stream: no further signal; the sender closes the connection and tells the hook
@@ -1171,6 +1236,14 @@ impl Vmm {
     /// The events of the loop: called by the event loop when one of its descriptors is ready,
     /// and at each turn of the loop that serves a stopped guest.
     pub fn checkpoint_service(&mut self) {
+        if self.checkpoint.open_stop.is_some() {
+            // A stop waits for the hook: the loop stands until it ends (no stamp, so the signal
+            // pauses as in every long stop), and nothing else is handled before.
+            self.checkpoint.clear_fds();
+            if !self.continue_stop(Some(std::time::Instant::now())) {
+                return;
+            }
+        }
         self.checkpoint.lease.stamp();
         self.checkpoint.clear_fds();
         while let Some((generation, event)) =
@@ -1412,6 +1485,18 @@ impl Vmm {
 
     /// The stop of checkpoint N (see the head of this module).
     fn take_checkpoint(&mut self, reason: &'static str, busy: i32) {
+        self.take_checkpoint_until(reason, busy, None);
+    }
+
+    /// The stop of checkpoint N, whose wait for the hook's answer to `epoch N` ends at
+    /// `deadline` (a finish) or has no limit. A stop whose hook has not answered at `deadline`
+    /// stays open: the guest stays stopped, and the stop goes on when the answer comes.
+    fn take_checkpoint_until(
+        &mut self,
+        reason: &'static str,
+        busy: i32,
+        deadline: Option<std::time::Instant>,
+    ) {
         let Some(kvm_vm) = self.kvm_vm_arc() else {
             return;
         };
@@ -1491,10 +1576,41 @@ impl Vmm {
         }
         // No disk request is in work, and the hook is told the number of this checkpoint.
         self.device_manager.quiesce_virtio_devices();
-        let mut broken: Option<String> = None;
-        if !hook_tell(&self.checkpoint.hook, "epoch", epoch) {
-            broken = Some("the hook gives no answer".into());
-        }
+        let hook_gone = !hook_say(&self.checkpoint.hook, "epoch", epoch);
+        self.checkpoint.open_stop = Some(OpenStop {
+            epoch,
+            reason,
+            busy,
+            t_begin,
+            account_before,
+            was_running,
+            run_state,
+            leased,
+            first_of_new,
+            hook_gone,
+        });
+        self.continue_stop(deadline);
+    }
+
+    /// The rest of the stop of checkpoint N, after the hook's answer to `epoch N` (`hook_gone`:
+    /// it gave none): the state, the pages, the mark of the hold, the resume, and the frame.
+    fn end_stop(&mut self, stop: OpenStop, hook_gone: bool) {
+        let OpenStop {
+            epoch,
+            reason,
+            busy,
+            t_begin,
+            account_before,
+            was_running,
+            run_state,
+            leased,
+            first_of_new,
+            ..
+        } = stop;
+        let Some(kvm_vm) = self.kvm_vm_arc() else {
+            return;
+        };
+        let mut broken: Option<String> = hook_gone.then(|| "the hook gives no answer".into());
         let mut state_bytes = Vec::new();
         if broken.is_none() {
             match self.save_verified(was_running) {

@@ -747,6 +747,14 @@ impl RuntimeApiController {
         event_manager: &mut EventManager,
     ) -> Result<VmmData, VmmActionError> {
         use self::VmmAction::*;
+        if !matches!(request, FinishCheckpoint) {
+            // The stop of a checkpoint that a finish left open (its hook has not answered) ends
+            // first: every other call waits for it, as it waits while a stop runs.
+            self.vmm
+                .lock()
+                .expect("Poisoned lock")
+                .checkpoint_end_open_stop();
+        }
         match request {
             // Supported operations allowed post-boot.
             CreateSnapshot(snapshot_create_cfg) => self.create_snapshot(&snapshot_create_cfg),

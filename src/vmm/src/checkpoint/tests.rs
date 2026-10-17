@@ -1184,6 +1184,244 @@ fn test_hook_lines() {
     let _ = std::fs::remove_file(path);
 }
 
+/// A hook of a disk program in the test that holds an answer: it answers each line with `ok`
+/// at once, but the first line `epoch N` after `arm` is set waits until `let_go` is set (or for
+/// 10 s), and is then answered, or, with `close`, the connection closes in its place.
+struct HeldHook {
+    path: std::path::PathBuf,
+    lines: Arc<Mutex<Vec<String>>>,
+    arm: Arc<AtomicBool>,
+    held: Arc<AtomicBool>,
+    let_go: Arc<AtomicBool>,
+}
+
+impl HeldHook {
+    fn new(name: &str, close: bool) -> HeldHook {
+        let path = temp_path(name);
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let h = HeldHook {
+            path,
+            lines: Arc::new(Mutex::new(Vec::new())),
+            arm: Arc::new(AtomicBool::new(false)),
+            held: Arc::new(AtomicBool::new(false)),
+            let_go: Arc::new(AtomicBool::new(false)),
+        };
+        let (kept, arm, held, let_go) = (
+            h.lines.clone(),
+            h.arm.clone(),
+            h.held.clone(),
+            h.let_go.clone(),
+        );
+        thread::spawn(move || {
+            let Ok((s, _)) = listener.accept() else {
+                return;
+            };
+            let mut w = s.try_clone().unwrap();
+            for line in std::io::BufRead::lines(std::io::BufReader::new(s)) {
+                let Ok(line) = line else {
+                    break;
+                };
+                let hold = line.starts_with("epoch ") && arm.swap(false, Ordering::SeqCst);
+                kept.lock().unwrap().push(line);
+                if hold {
+                    held.store(true, Ordering::SeqCst);
+                    // (At most 10 s, so that a VMM that waits for it with no limit fails its
+                    // test instead of holding it.)
+                    let since = Instant::now();
+                    while !let_go.load(Ordering::SeqCst)
+                        && since.elapsed() < Duration::from_secs(10)
+                    {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    if close {
+                        break;
+                    }
+                }
+                if w.write_all(b"ok\n").is_err() {
+                    break;
+                }
+            }
+            kept.lock().unwrap().push("closed".into());
+        });
+        h
+    }
+
+    fn path(&self) -> String {
+        self.path.to_string_lossy().into()
+    }
+
+    fn lines(&self) -> Vec<String> {
+        self.lines.lock().unwrap().clone()
+    }
+}
+
+impl Drop for HeldHook {
+    fn drop(&mut self) {
+        self.let_go.store(true, Ordering::SeqCst);
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// A stream of checkpoints with a hook, `lost-ms` 250 (the limit of a finish is 1.5 s),
+/// checkpoint 0 answered and the guest stopped by its caller; the next checkpoint is taken
+/// only by a finish.
+fn stopped_with_hook(hook: &HeldHook) -> (Vmm, Place) {
+    let mut vmm = ckpt_vmm();
+    let place = Place::new(Begin::New);
+    let mut p = set(60000, &place.uri());
+    p.lost_ms = Some(250);
+    p.hook = Some(hook.path());
+    vmm.checkpoint_set(&p).unwrap();
+    pump(&mut vmm, 10, |v| acked(v, 0));
+    vmm.pause_vm().unwrap();
+    (vmm, place)
+}
+
+/// The limit of a finish with `lost-ms` 250, and the time that a test gives it beyond.
+const FINISH_LIMIT: Duration = Duration::from_millis(1500);
+const FINISH_SLACK: Duration = Duration::from_millis(200);
+
+/// Turns the loop of the VMM thread for `time`.
+fn turn(vmm: &mut Vmm, time: Duration) {
+    let start = Instant::now();
+    while start.elapsed() < time {
+        vmm.checkpoint_service();
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn test_finish_with_a_silent_hook_ends_in_its_limit() {
+    let _reset = Reset;
+    let hook = HeldHook::new("hook-silent", false);
+    let (mut vmm, place) = stopped_with_hook(&hook);
+    write_page(&vmm, 12, 0x12);
+    hook.arm.store(true, Ordering::SeqCst);
+    // A finish that waited for the hook with no limit would end when the hook answers: 3 s.
+    let let_go = hook.let_go.clone();
+    let t = thread::spawn(move || {
+        thread::sleep(Duration::from_secs(3));
+        let_go.store(true, Ordering::SeqCst);
+    });
+    let start = Instant::now();
+    let result = vmm.checkpoint_finish();
+    let took = start.elapsed();
+    assert!(hook.held.load(Ordering::SeqCst));
+    let err = result.unwrap_err();
+    assert!(
+        took < FINISH_LIMIT + FINISH_SLACK,
+        "the finish took {took:?}"
+    );
+    assert!(err.to_string().contains("did not answer"), "{err}");
+    // The mode is as it was: checkpoint 0 is the newest answered, nothing is lost, and the
+    // guest stays stopped.
+    let info = vmm.checkpoint_info();
+    assert!(info.active && info.enabled && !info.lost, "{info:?}");
+    assert_eq!((info.sent, info.acked), (0, Some(0)));
+    assert!(vmm.is_stopped());
+    // While the hook is silent the stop stays open: checkpoint 1 does not leave.
+    turn(&mut vmm, Duration::from_millis(200));
+    assert!(place.frame(1).is_none());
+    // The hook's answer lets checkpoint 1 go on as the loop's: its frame, its answer.
+    hook.let_go.store(true, Ordering::SeqCst);
+    pump(&mut vmm, 10, |v| acked(v, 1));
+    assert_eq!(place.frame(1).unwrap().has_page(12), Some(true));
+    let info = vmm.checkpoint_info();
+    assert!(info.active && !info.lost, "{info:?}");
+    assert_eq!((info.sent, info.acked), (1, Some(1)));
+    assert_eq!(
+        &hook.lines()[..4],
+        &["epoch 0", "commit 0", "epoch 1", "commit 1"]
+    );
+    // A second finish, with a hook that answers at once, ends the mode.
+    write_page(&vmm, 13, 0x13);
+    let fin = vmm.checkpoint_finish().unwrap();
+    assert!(fin.acked);
+    assert_eq!(fin.epoch, 2);
+    assert_eq!(place.frame(2).unwrap().has_page(13), Some(true));
+    assert!(*place.image.lock().unwrap() == memory_bytes(&vmm));
+    assert!(!vmm.checkpoint_info().active);
+    t.join().unwrap();
+}
+
+#[test]
+fn test_a_hook_that_closes_in_a_finish_makes_the_mode_lost() {
+    // The hook closes its connection inside the limit of the finish.
+    let _reset = Reset;
+    let hook = HeldHook::new("hook-close", true);
+    hook.let_go.store(true, Ordering::SeqCst);
+    let (mut vmm, place) = stopped_with_hook(&hook);
+    hook.arm.store(true, Ordering::SeqCst);
+    let start = Instant::now();
+    let err = vmm.checkpoint_finish().unwrap_err();
+    assert!(start.elapsed() < FINISH_LIMIT + FINISH_SLACK);
+    assert!(
+        err.to_string().contains("the hook gives no answer"),
+        "{err}"
+    );
+    let info = vmm.checkpoint_info();
+    assert!(info.lost, "{info:?}");
+    assert_eq!(info.reason.as_deref(), Some("the hook gives no answer"));
+    assert!(place.frame(1).is_none());
+    drop(vmm);
+    drop(place);
+
+    // The hook closes its connection after the limit of the finish.
+    let hook = HeldHook::new("hook-close-late", true);
+    let (mut vmm, place) = stopped_with_hook(&hook);
+    hook.arm.store(true, Ordering::SeqCst);
+    let start = Instant::now();
+    let err = vmm.checkpoint_finish().unwrap_err();
+    assert!(start.elapsed() < FINISH_LIMIT + FINISH_SLACK);
+    assert!(err.to_string().contains("did not answer"), "{err}");
+    assert!(!vmm.checkpoint_info().lost);
+    hook.let_go.store(true, Ordering::SeqCst);
+    pump(&mut vmm, 10, |v| v.checkpoint_info().lost);
+    let info = vmm.checkpoint_info();
+    assert_eq!(info.reason.as_deref(), Some("the hook gives no answer"));
+    assert!(place.frame(1).is_none());
+    let err = vmm.checkpoint_finish().unwrap_err();
+    assert!(err.to_string().contains("lost"), "{err}");
+}
+
+#[test]
+fn test_calls_wait_for_the_stop_that_a_finish_left_open() {
+    use crate::rpc_interface::{RuntimeApiController, VmmAction, VmmData};
+
+    let _reset = Reset;
+    let hook = HeldHook::new("hook-calls", false);
+    let (vmm, place) = stopped_with_hook(&hook);
+    let vmm = Arc::new(Mutex::new(vmm));
+    let mut runtime = RuntimeApiController::new(vmm.clone());
+    let mut event_manager = EventManager::new().unwrap();
+    hook.arm.store(true, Ordering::SeqCst);
+    runtime
+        .handle_request(VmmAction::FinishCheckpoint, &mut event_manager)
+        .unwrap_err();
+    // The next call (a query) runs when the hook has answered and the stop has ended.
+    let let_go = hook.let_go.clone();
+    let t = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(300));
+        let_go.store(true, Ordering::SeqCst);
+    });
+    let start = Instant::now();
+    let info = match runtime.handle_request(VmmAction::GetCheckpoint, &mut event_manager) {
+        Ok(VmmData::Checkpoint(info)) => info,
+        other => panic!("{other:?}"),
+    };
+    assert!(start.elapsed() >= Duration::from_millis(250));
+    assert_eq!(info.sent, 1);
+    t.join().unwrap();
+    // A resume after it, and the answer to checkpoint 1 counts.
+    runtime
+        .handle_request(VmmAction::Resume, &mut event_manager)
+        .unwrap();
+    let mut vmm = vmm.lock().unwrap();
+    assert!(!vmm.is_stopped());
+    pump(&mut vmm, 10, |v| acked(v, 1));
+    assert!(place.frame(1).is_some());
+}
+
 /// Whether KVM keeps a dirty log for each slot of guest memory: `KVM_GET_DIRTY_LOG` fails on a
 /// slot with no log.
 fn kvm_logs(vmm: &Vmm) -> Vec<bool> {
