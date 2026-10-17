@@ -307,6 +307,10 @@ pub struct AsyncFileEngine {
     completion_evt: EventFd,
     align: DirectAlignment,
     is_block_device: bool,
+    // The end of the drive: the length of its file when the engine took the file (at the
+    // attach, at a load, or when `PATCH /drives` gave a new file). A read through a buffer may
+    // end there; bytes that the file lost after it are a disk error.
+    drive_len: u64,
     // The reads and writes of the guest that the engine has taken and not yet answered.
     jobs: Slab<Job>,
     // Jobs that wait for a job that overlaps them, in their order.
@@ -503,6 +507,12 @@ impl AsyncFileEngine {
             .unwrap_or(false)
     }
 
+    /// The length of the file now (a block device has no end inside a request, so its length
+    /// is not used).
+    fn file_len(file: &File) -> u64 {
+        file.metadata().map_or(u64::MAX, |m| m.len())
+    }
+
     /// An engine over `file`, whose requests are aligned to `align` (`DirectAlignment::NONE`
     /// for a file opened with no `O_DIRECT`). The engines of the queues of one drive share
     /// `blocks`.
@@ -517,6 +527,7 @@ impl AsyncFileEngine {
         let ring =
             Self::new_ring(&file, completion_evt.as_raw_fd()).map_err(AsyncIoError::IoUring)?;
         let is_block_device = Self::is_block_device(&file);
+        let drive_len = Self::file_len(&file);
         let blocks = match blocks {
             Some(blocks) => {
                 let wake = completion_evt.try_clone().map_err(AsyncIoError::EventFd)?;
@@ -532,6 +543,7 @@ impl AsyncFileEngine {
             completion_evt,
             align,
             is_block_device,
+            drive_len,
             jobs: Slab::new(),
             waiting: VecDeque::new(),
             stalled: VecDeque::new(),
@@ -562,6 +574,7 @@ impl AsyncFileEngine {
 
         self.drain(false)?;
         self.is_block_device = Self::is_block_device(&file);
+        self.drive_len = Self::file_len(&file);
         self.file = file;
         self.ring = ring;
         self.align = align;
@@ -888,7 +901,8 @@ impl AsyncFileEngine {
             }
             step @ (Step::Head | Step::Tail) => {
                 // The bytes of the block outside the guest's range go into the buffer; a
-                // read that ends at the end of a regular file leaves zeros.
+                // read that ends at the end of the drive (a regular file whose length is not
+                // a multiple of the block) leaves zeros.
                 let block = u64::from(self.align.offset);
                 let at = if step == Step::Head {
                     job.start
@@ -925,10 +939,11 @@ impl AsyncFileEngine {
     }
 
     /// Whether the operation of `step` of job `key`, which moved `transferred` bytes, moved
-    /// fewer than it asked. A read through a buffer may end at the end of a regular file (the
-    /// bytes after it are outside the drive, or read as zeros); a block device has no end
-    /// inside the aligned range of a request. A direct operation is judged by the device,
-    /// against the request.
+    /// fewer than it asked. A read through a buffer may end at the end of the drive, a regular
+    /// file's length when the engine took it (the bytes after it are outside the drive); one
+    /// that ends earlier, as on a file cut short after it was attached, is short. A block
+    /// device has no end inside the aligned range of a request. A direct operation is judged
+    /// by the device, against the request.
     fn is_short_step(&self, key: usize, step: Step, transferred: u32) -> bool {
         let job = &self.jobs[key];
         let block = u64::from(self.align.offset);
@@ -945,8 +960,7 @@ impl AsyncFileEngine {
         if step == Step::Write || self.is_block_device {
             return true;
         }
-        let file_len = self.file.metadata().map_or(u64::MAX, |m| m.len());
-        transferred < len.min(file_len.saturating_sub(at))
+        transferred < len.min(self.drive_len.saturating_sub(at))
     }
 
     /// Puts the next operation of job `key` in the ring; when the ring is full the job goes on

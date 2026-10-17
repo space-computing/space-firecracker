@@ -3635,6 +3635,137 @@ mod tests {
     }
 
     #[test]
+    fn test_short_head_and_tail_reads_of_a_cut_file_are_kept() {
+        // The drive's file is cut short after its attach, so a write that reads the device
+        // block at its start or at its end (a read-modify-write) reads fewer bytes than it
+        // asked. The request is kept and the guest stops; the file comes back whole before the
+        // resume, and the write runs again from its start. (sector, length, the file's length
+        // after the cut)
+        let cases: [(u64, u32, u64); 6] = [
+            // The read of the block at the start of the write (the write starts inside a
+            // block): 0 bytes; and fewer, though they cover the guest's part of the block.
+            (1, 512, 0),
+            (9, 512, 0x1000),
+            (9, 512, 0x1800),
+            // The read of the block at the end of the write (the write starts at a block): 0
+            // bytes, and fewer.
+            (8, 512, 0x1000),
+            (8, 512, 0x1800),
+            // A write over parts of two blocks: the read of the first passes, the read of the
+            // second moves fewer bytes.
+            (7, 1024, 0x1400),
+        ];
+        let mem = single_region_mem(ALIGN_MEM);
+        let vq = VirtQueue::new(GuestAddress(0), &mem, ALIGN_QUEUE);
+        let f = TempFile::new().unwrap();
+        let path = f.as_path().to_str().unwrap().to_string();
+        for (i, &(sector, len, cut)) in cases.iter().enumerate() {
+            f.as_file().set_len(ALIGN_MEM as u64).unwrap();
+            let mut model = pattern(0x40, MODEL_LEN);
+            fill_backing(&path, 0, &model);
+            let mut block = aligned_block(&path, false, &mem, &vq);
+            f.as_file().set_len(cut).unwrap();
+            let data = pattern(0x99, len as usize);
+            mem.write_slice(&data, GuestAddress(0x10000)).unwrap();
+            new_round(&mut block, &vq);
+            put_request(&vq, 0, VIRTIO_BLK_T_OUT, sector, 0x10000, len);
+            run_round(&mut block);
+
+            // Kept, not answered, and the Vmm is told; nothing was written.
+            assert_eq!(vq.used.idx.get(), 0, "case {i}");
+            assert_eq!(status_of(&mem, 0), 0xff, "case {i}");
+            assert_eq!(block.resources()[0].kept.len(), 1, "case {i}");
+            assert!(block.resources()[0].stopped_on_error, "case {i}");
+            assert!(block.take_disk_error(), "case {i}");
+            assert_eq!(async_engine(&mut block).taken_jobs(), 0, "case {i}");
+            assert_eq!(f.as_file().metadata().unwrap().len(), cut, "case {i}");
+
+            f.as_file().set_len(ALIGN_MEM as u64).unwrap();
+            fill_backing(&path, 0, &model);
+            block.kick();
+            block.process_queue_event();
+            complete_async(&mut block);
+            assert_eq!(vq.used.idx.get(), 1, "case {i}");
+            assert_eq!(status_of(&mem, 0), VIRTIO_BLK_S_OK, "case {i}");
+            assert!(block.resources()[0].kept.is_empty(), "case {i}");
+            assert!(!block.resources()[0].stopped_on_error, "case {i}");
+            model[sector_range(sector, len)].copy_from_slice(&data);
+            assert!(
+                read_backing(&path, MODEL_LEN) == model,
+                "case {i}: the backing differs from the model"
+            );
+        }
+    }
+
+    #[test]
+    fn test_reads_through_a_buffer_at_the_end_of_the_drive_leave_zeros() {
+        // A drive whose file is not a multiple of the device block (two blocks and 1024
+        // bytes): a read through the buffer of its last block ends at the end of the drive,
+        // the bytes after it are zeros, and the request succeeds. The same after `PATCH
+        // /drives` gave the drive this file in the place of a longer one: the drive ends at
+        // the end of the new file.
+        const DRIVE_LEN: usize = 0x2400;
+        // (type, sector, length, whether the file was given by an update of the drive)
+        let cases: [(u32, u64, u32, bool); 6] = [
+            (VIRTIO_BLK_T_IN, 16, 1024, false),
+            (VIRTIO_BLK_T_IN, 17, 512, false),
+            // Read-modify-writes: the read of the block at the start of the write, and at
+            // its end.
+            (VIRTIO_BLK_T_OUT, 17, 512, false),
+            (VIRTIO_BLK_T_OUT, 16, 512, false),
+            (VIRTIO_BLK_T_IN, 16, 1024, true),
+            (VIRTIO_BLK_T_OUT, 17, 512, true),
+        ];
+        let mem = single_region_mem(ALIGN_MEM);
+        let vq = VirtQueue::new(GuestAddress(0), &mem, ALIGN_QUEUE);
+        for (i, &(t, sector, len, updated)) in cases.iter().enumerate() {
+            let f = TempFile::new().unwrap();
+            let path = f.as_path().to_str().unwrap().to_string();
+            let mut model = pattern(0x52, DRIVE_LEN);
+            fill_backing(&path, 0, &model);
+            let mut block = if updated {
+                let first = TempFile::new().unwrap();
+                first.as_file().set_len(ALIGN_MEM as u64).unwrap();
+                let mut block = aligned_block(first.as_path().to_str().unwrap(), false, &mem, &vq);
+                block.update_disk_image(path.clone()).unwrap();
+                block
+            } else {
+                aligned_block(&path, false, &mem, &vq)
+            };
+            assert_eq!(u64::from_le(block.config_space.capacity), 18, "case {i}");
+
+            let data = pattern(0x99, len as usize);
+            if t == VIRTIO_BLK_T_OUT {
+                mem.write_slice(&data, GuestAddress(0x10000)).unwrap();
+            } else {
+                mem.write_slice(&vec![0u8; len as usize], GuestAddress(0x10000))
+                    .unwrap();
+            }
+            new_round(&mut block, &vq);
+            put_request(&vq, 0, t, sector, 0x10000, len);
+            run_round(&mut block);
+            assert_eq!(vq.used.idx.get(), 1, "case {i}");
+            assert_eq!(status_of(&mem, 0), VIRTIO_BLK_S_OK, "case {i}");
+            assert!(block.resources()[0].kept.is_empty(), "case {i}");
+            if t == VIRTIO_BLK_T_IN {
+                assert_eq!(vq.used.ring[0].get().len, len + 1, "case {i}");
+                let mut got = vec![0u8; len as usize];
+                mem.read_slice(&mut got, GuestAddress(0x10000)).unwrap();
+                assert!(
+                    got == model[sector_range(sector, len)],
+                    "case {i}: the read differs"
+                );
+            } else {
+                // The last block is written whole: the drive's bytes with the guest's part,
+                // then zeros after the end of the drive.
+                model[sector_range(sector, len)].copy_from_slice(&data);
+                model.resize(0x3000, 0);
+                assert!(read_backing(&path, 0x3000) == model, "case {i}");
+            }
+        }
+    }
+
+    #[test]
     fn test_short_read_kept_across_save_and_load() {
         // A read of 0 bytes of the drive with no worker threads: kept in the state, and run
         // again at the resume after a load.
