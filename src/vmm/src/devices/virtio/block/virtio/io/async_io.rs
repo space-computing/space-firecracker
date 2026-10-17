@@ -330,6 +330,12 @@ pub struct AsyncFileEngine {
     // as a disk that fails them.
     #[cfg(test)]
     pub(crate) fail_completions: u32,
+    // Test-only: the number of completions still to come (after those that pass) that report
+    // at most `short_to` bytes moved, as a disk that ends them short.
+    #[cfg(test)]
+    pub(crate) short_completions: u32,
+    #[cfg(test)]
+    pub(crate) short_to: u32,
     // Test-only: the number of `fsync` calls of the file.
     #[cfg(test)]
     pub(crate) sync_all_calls: u32,
@@ -537,6 +543,10 @@ impl AsyncFileEngine {
             pass_completions: 0,
             #[cfg(test)]
             fail_completions: 0,
+            #[cfg(test)]
+            short_completions: 0,
+            #[cfg(test)]
+            short_to: 0,
             #[cfg(test)]
             sync_all_calls: 0,
             #[cfg(test)]
@@ -856,6 +866,19 @@ impl AsyncFileEngine {
             return;
         }
         let transferred = u32::try_from(res).unwrap();
+        let step = self.jobs[key].step;
+        if self.is_short_step(key, step, transferred) {
+            // A step of a request through an aligned buffer that moved fewer bytes than it
+            // asked fails the whole request, as a disk error: it ends with 0 bytes of the
+            // guest's range moved, and runs again from its start.
+            let job = &self.jobs[key];
+            error!(
+                "A block operation ({:?}) of a request of {} bytes at {} moved {} bytes",
+                step, job.len, job.offset, transferred
+            );
+            self.finish_job(key, 0);
+            return;
+        }
         let job = &mut self.jobs[key];
         match job.step {
             Step::Direct => self.finish_job(key, res),
@@ -865,7 +888,7 @@ impl AsyncFileEngine {
             }
             step @ (Step::Head | Step::Tail) => {
                 // The bytes of the block outside the guest's range go into the buffer; a
-                // short read (the end of a file) leaves zeros.
+                // read that ends at the end of a regular file leaves zeros.
                 let block = u64::from(self.align.offset);
                 let at = if step == Step::Head {
                     job.start
@@ -899,6 +922,31 @@ impl AsyncFileEngine {
             }
             Step::Waiting => unreachable!(),
         }
+    }
+
+    /// Whether the operation of `step` of job `key`, which moved `transferred` bytes, moved
+    /// fewer than it asked. A read through a buffer may end at the end of a regular file (the
+    /// bytes after it are outside the drive, or read as zeros); a block device has no end
+    /// inside the aligned range of a request. A direct operation is judged by the device,
+    /// against the request.
+    fn is_short_step(&self, key: usize, step: Step, transferred: u32) -> bool {
+        let job = &self.jobs[key];
+        let block = u64::from(self.align.offset);
+        let (at, len) = match step {
+            Step::Read | Step::Write => (job.start, job.end - job.start),
+            Step::Head => (job.start, block),
+            Step::Tail => (job.end - block, block),
+            Step::Direct | Step::Waiting => return false,
+        };
+        let transferred = u64::from(transferred);
+        if transferred >= len {
+            return false;
+        }
+        if step == Step::Write || self.is_block_device {
+            return true;
+        }
+        let file_len = self.file.metadata().map_or(u64::MAX, |m| m.len());
+        transferred < len.min(file_len.saturating_sub(at))
     }
 
     /// Puts the next operation of job `key` in the ring; when the ring is full the job goes on
@@ -1162,6 +1210,11 @@ impl AsyncFileEngine {
             } else if self.fail_completions > 0 {
                 self.fail_completions -= 1;
                 Cqe::new(-libc::EIO, cqe.user_data())
+            } else if self.short_completions > 0 {
+                self.short_completions -= 1;
+                let res = raw_result(&cqe);
+                let short = i32::try_from(self.short_to).unwrap_or(i32::MAX);
+                Cqe::new(if res < 0 { res } else { res.min(short) }, cqe.user_data())
             } else {
                 cqe
             }

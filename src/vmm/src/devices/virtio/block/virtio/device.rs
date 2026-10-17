@@ -1768,6 +1768,17 @@ mod tests {
         }
     }
 
+    /// The request of the queue was not answered: it is kept and the guest stops. The kept
+    /// request is then dropped, for the next case of a test.
+    fn assert_kept_short_read(block: &mut VirtioBlock, vq: &VirtQueue) {
+        assert_eq!(vq.used.idx.get(), 0);
+        assert_eq!(block.resources()[0].kept.len(), 1);
+        assert!(block.resources()[0].stopped_on_error);
+        assert!(block.take_disk_error());
+        block.resources_mut()[0].kept.clear();
+        block.resources_mut()[0].stopped_on_error = false;
+    }
+
     #[test]
     fn test_read_write() {
         for engine in [FileEngineType::Sync, FileEngineType::Async] {
@@ -1996,17 +2007,25 @@ mod tests {
                     .unwrap();
 
                 // This will attempt to read past end of file.
-                simulate_queue_and_async_completion_events(&mut block, true);
+                if engine == FileEngineType::Async {
+                    // A read of 0 bytes of the `Async` engine is a disk error: kept, and the
+                    // guest stops.
+                    simulate_queue_event(&mut block, None);
+                    complete_async(&mut block);
+                    assert_kept_short_read(&mut block, &vq);
+                } else {
+                    simulate_queue_and_async_completion_events(&mut block, true);
 
-                assert_eq!(vq.used.idx.get(), 1);
-                assert_eq!(vq.used.ring[0].get().id, 0);
+                    assert_eq!(vq.used.idx.get(), 1);
+                    assert_eq!(vq.used.ring[0].get().id, 0);
 
-                // No data since can't read past end of file, only status byte length.
-                assert_eq!(vq.used.ring[0].get().len, 1);
-                assert_eq!(
-                    mem.read_obj::<u32>(status_addr).unwrap(),
-                    VIRTIO_BLK_S_IOERR
-                );
+                    // No data since can't read past end of file, only status byte length.
+                    assert_eq!(vq.used.ring[0].get().len, 1);
+                    assert_eq!(
+                        mem.read_obj::<u32>(status_addr).unwrap(),
+                        VIRTIO_BLK_S_IOERR
+                    );
+                }
 
                 // Check that no data was read since we can't read past the end of the file.
                 let mut buf = [0u8; 512];
@@ -2046,20 +2065,28 @@ mod tests {
                     .write_all(&rand_data[512..])
                     .unwrap();
 
-                simulate_queue_and_async_completion_events(&mut block, true);
+                if engine == FileEngineType::Async {
+                    // A short read of the `Async` engine is a disk error: kept, and the guest
+                    // stops.
+                    simulate_queue_event(&mut block, None);
+                    complete_async(&mut block);
+                    assert_kept_short_read(&mut block, &vq);
+                } else {
+                    simulate_queue_and_async_completion_events(&mut block, true);
 
-                assert_eq!(vq.used.idx.get(), 1);
-                assert_eq!(vq.used.ring[0].get().id, 0);
+                    assert_eq!(vq.used.idx.get(), 1);
+                    assert_eq!(vq.used.ring[0].get().id, 0);
 
-                assert_eq!(
-                    mem.read_obj::<u32>(status_addr).unwrap(),
-                    VIRTIO_BLK_S_IOERR
-                );
+                    assert_eq!(
+                        mem.read_obj::<u32>(status_addr).unwrap(),
+                        VIRTIO_BLK_S_IOERR
+                    );
 
-                // Check that we correctly read the second file sector.
-                let mut buf = [0u8; 512];
-                mem.read_slice(&mut buf, data_addr).unwrap();
-                assert_eq!(buf, rand_data[512..]);
+                    // Check that we correctly read the second file sector.
+                    let mut buf = [0u8; 512];
+                    mem.read_slice(&mut buf, data_addr).unwrap();
+                    assert_eq!(buf, rand_data[512..]);
+                }
             }
 
             // Read at valid address, with an overflowing length.
@@ -3483,6 +3510,176 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_short_reads_and_writes_are_kept_and_run_again() {
+        // (type, sector, length, completions that pass, bytes that the short one reports);
+        // each request is kept, the guest stops, and at the resume it runs again whole.
+        let cases: [(u32, u64, u32, u32, u32); 10] = [
+            // Direct: a read of 0 bytes, a short read, a write of 0 bytes, a short write.
+            (VIRTIO_BLK_T_IN, 8, 4096, 0, 0),
+            (VIRTIO_BLK_T_IN, 8, 4096, 0, 1536),
+            (VIRTIO_BLK_T_OUT, 8, 4096, 0, 0),
+            (VIRTIO_BLK_T_OUT, 8, 4096, 0, 2048),
+            // A read through an aligned buffer: 0 bytes; and short, though it covers the
+            // guest's part of the block.
+            (VIRTIO_BLK_T_IN, 1, 1024, 0, 0),
+            (VIRTIO_BLK_T_IN, 1, 1024, 0, 2048),
+            // A read-modify-write: the read of its block moves 0 bytes; the read passes and
+            // the write is short, though it covers the guest's part.
+            (VIRTIO_BLK_T_OUT, 1, 1024, 0, 0),
+            (VIRTIO_BLK_T_OUT, 1, 1024, 1, 2048),
+            // A read-modify-write of parts of two blocks: the read of the second moves 0
+            // bytes; the write of both is short.
+            (VIRTIO_BLK_T_OUT, 7, 1024, 1, 0),
+            (VIRTIO_BLK_T_OUT, 7, 1024, 2, 4096),
+        ];
+        let mem = single_region_mem(ALIGN_MEM);
+        let vq = VirtQueue::new(GuestAddress(0), &mem, ALIGN_QUEUE);
+        for (path, _file) in aligned_backings() {
+            for (i, &(t, sector, len, pass, short_to)) in cases.iter().enumerate() {
+                let mut model = pattern(0x40, MODEL_LEN);
+                fill_backing(&path, 0, &model);
+                let mut block = aligned_block(&path, false, &mem, &vq);
+                let data = pattern(0x99, len as usize);
+                if t == VIRTIO_BLK_T_OUT {
+                    mem.write_slice(&data, GuestAddress(0x10000)).unwrap();
+                }
+                new_round(&mut block, &vq);
+                put_request(&vq, 0, t, sector, 0x10000, len);
+                async_engine(&mut block).pass_completions = pass;
+                async_engine(&mut block).short_completions = 1;
+                async_engine(&mut block).short_to = short_to;
+                run_round(&mut block);
+
+                // Kept, not answered, and the Vmm is told.
+                assert_eq!(vq.used.idx.get(), 0, "{path} case {i}");
+                assert_eq!(status_of(&mem, 0), 0xff, "{path} case {i}");
+                assert_eq!(block.resources()[0].kept.len(), 1, "{path} case {i}");
+                assert!(block.resources()[0].stopped_on_error, "{path} case {i}");
+                assert!(block.take_disk_error(), "{path} case {i}");
+                assert_eq!(async_engine(&mut block).taken_jobs(), 0);
+
+                // What the short operation moved is undone before the resume (the fake
+                // reports fewer bytes than the kernel moved): the request must run again.
+                if t == VIRTIO_BLK_T_IN {
+                    mem.write_slice(&vec![0u8; len as usize], GuestAddress(0x10000))
+                        .unwrap();
+                } else {
+                    fill_backing(&path, 0, &model);
+                }
+
+                block.kick();
+                block.process_queue_event();
+                complete_async(&mut block);
+                assert_eq!(vq.used.idx.get(), 1, "{path} case {i}");
+                assert_eq!(status_of(&mem, 0), VIRTIO_BLK_S_OK, "{path} case {i}");
+                assert!(block.resources()[0].kept.is_empty());
+                assert!(!block.resources()[0].stopped_on_error);
+                if t == VIRTIO_BLK_T_IN {
+                    assert_eq!(vq.used.ring[0].get().len, len + 1, "{path} case {i}");
+                    let mut got = vec![0u8; len as usize];
+                    mem.read_slice(&mut got, GuestAddress(0x10000)).unwrap();
+                    assert!(
+                        got == model[sector_range(sector, len)],
+                        "{path} case {i}: the read differs"
+                    );
+                } else {
+                    model[sector_range(sector, len)].copy_from_slice(&data);
+                    assert!(
+                        read_backing(&path, MODEL_LEN) == model,
+                        "{path} case {i}: the backing differs from the model"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_read_past_the_end_of_a_shrunk_file_is_kept() {
+        // The kernel's own read of 0 bytes: the drive's file is cut short under it (as a disk
+        // whose program is gone), then comes back before the resume. A direct read and a read
+        // through an aligned buffer.
+        let mem = single_region_mem(ALIGN_MEM);
+        let vq = VirtQueue::new(GuestAddress(0), &mem, ALIGN_QUEUE);
+        let f = TempFile::new().unwrap();
+        f.as_file().set_len(ALIGN_MEM as u64).unwrap();
+        let path = f.as_path().to_str().unwrap().to_string();
+        let model = pattern(0x31, MODEL_LEN);
+        for (i, &(sector, len)) in [(32u64, 4096u32), (33, 1024)].iter().enumerate() {
+            fill_backing(&path, 0, &model);
+            let mut block = aligned_block(&path, false, &mem, &vq);
+            f.as_file().set_len(0x2000).unwrap();
+            mem.write_slice(&vec![0u8; len as usize], GuestAddress(0x10000))
+                .unwrap();
+            new_round(&mut block, &vq);
+            put_request(&vq, 0, VIRTIO_BLK_T_IN, sector, 0x10000, len);
+            run_round(&mut block);
+            assert_eq!(vq.used.idx.get(), 0, "case {i}");
+            assert_eq!(status_of(&mem, 0), 0xff, "case {i}");
+            assert_eq!(block.resources()[0].kept.len(), 1, "case {i}");
+            assert!(block.take_disk_error(), "case {i}");
+
+            f.as_file().set_len(ALIGN_MEM as u64).unwrap();
+            fill_backing(&path, 0, &model);
+            block.kick();
+            block.process_queue_event();
+            complete_async(&mut block);
+            assert_eq!(vq.used.idx.get(), 1, "case {i}");
+            assert_eq!(status_of(&mem, 0), VIRTIO_BLK_S_OK, "case {i}");
+            let mut got = vec![0u8; len as usize];
+            mem.read_slice(&mut got, GuestAddress(0x10000)).unwrap();
+            assert!(got == model[sector_range(sector, len)], "case {i}");
+        }
+    }
+
+    #[test]
+    fn test_short_read_kept_across_save_and_load() {
+        // A read of 0 bytes of the drive with no worker threads: kept in the state, and run
+        // again at the resume after a load.
+        let mem = single_region_mem(ALIGN_MEM);
+        // A queue of the size that a restore checks, after the buffers of the request.
+        let vq = VirtQueue::new(GuestAddress(0x20000), &mem, FIRECRACKER_MAX_QUEUE_SIZE);
+        let f = TempFile::new().unwrap();
+        f.as_file().set_len(ALIGN_MEM as u64).unwrap();
+        let path = f.as_path().to_str().unwrap().to_string();
+        let model = pattern(0x27, MODEL_LEN);
+        fill_backing(&path, 0, &model);
+        let mut block = aligned_block(&path, false, &mem, &vq);
+        new_round(&mut block, &vq);
+        put_request(&vq, 0, VIRTIO_BLK_T_IN, 8, 0x10000, 4096);
+        async_engine(&mut block).short_completions = 1;
+        run_round(&mut block);
+        assert_eq!(vq.used.idx.get(), 0);
+        assert!(block.take_disk_error());
+        mem.write_slice(&[0u8; 4096], GuestAddress(0x10000))
+            .unwrap();
+
+        VirtioDevice::quiesce(&mut block);
+        let state = block.save();
+        let bytes = bitcode::serialize(&state).unwrap();
+        drop(block);
+        let state = bitcode::deserialize(&bytes).unwrap();
+        let mut restored = VirtioBlock::restore(
+            crate::devices::virtio::block::persist::BlockConstructorArgs { mem: mem.clone() },
+            &state,
+        )
+        .unwrap();
+        assert_eq!(restored.resources()[0].kept.len(), 1);
+        assert!(restored.resources()[0].stopped_on_error);
+        restored.activate(mem.clone(), default_interrupt()).unwrap();
+        restored.process_queue_event();
+        assert_eq!(vq.used.idx.get(), 0);
+
+        restored.kick();
+        restored.process_queue_event();
+        complete_async(&mut restored);
+        assert_eq!(vq.used.idx.get(), 1);
+        assert_eq!(status_of(&mem, 0), VIRTIO_BLK_S_OK);
+        let mut got = vec![0u8; 4096];
+        mem.read_slice(&mut got, GuestAddress(0x10000)).unwrap();
+        assert!(got == model[sector_range(8, 4096)]);
     }
 
     #[test]

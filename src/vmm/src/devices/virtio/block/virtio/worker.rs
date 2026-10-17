@@ -368,8 +368,22 @@ impl BlockWorker {
                             ))),
                         ),
                     };
-                    // A request that the disk failed is kept and stops the guest. (A read or
-                    // a write that moved fewer bytes than asked is answered as before.)
+                    // A request that the disk failed is kept and stops the guest, and so is a
+                    // read or a write that moved fewer bytes than asked (0 bytes among them,
+                    // as when the disk's program is gone): it runs again from its start at
+                    // the resume.
+                    if let Ok(count) = res
+                        && pending.is_short(count)
+                    {
+                        let request = pending.to_request();
+                        error!(
+                            "Block device queue {}: the disk moved {} of the {} bytes of a {:?} \
+                             request",
+                            self.resources.queue_idx, count, request.data_len, request.r#type
+                        );
+                        failed_requests.push(pending);
+                        continue;
+                    }
                     if res.is_err() {
                         failed_requests.push(pending);
                         continue;
@@ -1615,6 +1629,68 @@ mod tests {
         }
         assert_eq!(vqs[1].used.ring[0].get().id, 0);
         assert!(!block.take_disk_error());
+    }
+
+    #[test]
+    fn test_short_completions_of_two_queues_with_polling_across_a_save_and_a_load() {
+        // Queue 0: a direct read that moves 0 bytes. Queue 1: a write of a part of a device
+        // block whose read of the block moves 0 bytes. Each is kept and stops the guest, is
+        // kept across a save and a load, and runs again whole at the resume.
+        let mem = mq_mem();
+        for (path, _file) in mq_backings() {
+            let mut model = pattern(0x52, MQ_FILE);
+            fill_file(&path, 0, &model);
+            let mut block = mq_block(&path, 2, 1_000_000, false);
+            let vqs = mq_queues(&mem, 2);
+            for q in 0..2 {
+                mq_engine(&mut block, q).short_completions = 1;
+                mq_engine(&mut block, q).short_to = 0;
+            }
+            mq_activate(&mut block, &mem, &vqs);
+
+            let data = pattern(0x99, 512);
+            mem.write_slice(&data, GuestAddress(data_addr(1, 0)))
+                .unwrap();
+            post(&block, &vqs[0], 0, 0, VIRTIO_BLK_T_IN, 8, 4096);
+            post(&block, &vqs[1], 1, 0, VIRTIO_BLK_T_OUT, 17, 512);
+            wait_disk_error(&mut block);
+            stays_used(&vqs[0], 0);
+            stays_used(&vqs[1], 0);
+            assert_eq!(mq_status(&mem, 0, 0), 0xff, "{path}");
+            assert_eq!(mq_status(&mem, 1, 0), 0xff, "{path}");
+
+            // The stop of the guest. The write did not reach the disk.
+            block.drain();
+            assert!(read_file(&path, MQ_FILE) == model, "{path}");
+            let state = block.save();
+            assert_eq!(state.kept_requests.len(), 2);
+            assert_eq!(state.kept_requests[0].len(), 1, "{path}");
+            assert_eq!(state.kept_requests[1].len(), 1, "{path}");
+            mem.write_slice(&[0u8; 4096], GuestAddress(data_addr(0, 0)))
+                .unwrap();
+
+            let mut block = save_and_load(block, &mem);
+            stays_used(&vqs[0], 0);
+            stays_used(&vqs[1], 0);
+            assert!(!block.take_disk_error());
+
+            block.kick();
+            wait_used(&vqs[0], 1);
+            wait_used(&vqs[1], 1);
+            assert_eq!(mq_status(&mem, 0, 0), VIRTIO_BLK_S_OK, "{path}");
+            assert_eq!(mq_status(&mem, 1, 0), VIRTIO_BLK_S_OK, "{path}");
+            let mut got = vec![0u8; 4096];
+            mem.read_slice(&mut got, GuestAddress(data_addr(0, 0)))
+                .unwrap();
+            assert!(got == model[4096..8192], "{path}: the read differs");
+            block.drain();
+            model[17 * 512..18 * 512].copy_from_slice(&data);
+            assert!(
+                read_file(&path, MQ_FILE) == model,
+                "{path}: the backing differs"
+            );
+            assert!(!block.take_disk_error());
+        }
     }
 
     #[test]

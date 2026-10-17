@@ -113,6 +113,12 @@ impl PendingRequest {
         self.desc_idx
     }
 
+    /// Whether a completion of `count` bytes is a read or a write that moved fewer bytes than
+    /// the request asked (0 bytes among them).
+    pub fn is_short(&self, count: u32) -> bool {
+        matches!(self.r#type, RequestType::In | RequestType::Out) && count < self.data_len
+    }
+
     /// The request, to run it again from its start.
     pub fn to_request(&self) -> Request {
         Request {
