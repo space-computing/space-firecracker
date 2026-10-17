@@ -124,9 +124,11 @@ const ROLLBACK_REDRAW_US: i64 = 2_000_000;
 /// A piece of a renderer's export, as an `SP_IMPORT` (the header, the bytes).
 type Piece = (Vec<u8>, Vec<u8>);
 
-/// How many of the resources shown last are saved at a snapshot (the compositor's swap chain).
+/// How many of the resources shown last are exported first at a snapshot (the compositor's swap
+/// chain).
 const SCANOUT_KEEP: usize = 4;
-/// How long a snapshot waits for the export of those resources, after the drain.
+/// How long a snapshot waits for each export of what the GPU drew (the shown resources, then
+/// the rest), after the drain.
 const SAVE_EXPORT_US: i64 = 2_000_000;
 
 /// The connections: the user's renderer, and the renderer on this server's CPU.
@@ -457,12 +459,13 @@ pub struct Gpu {
     resumed_at: Option<i64>,
     /// The resources shown last (`SET_SCANOUT`), the newest last: the compositor's swap chain.
     scanned: Vec<u32>,
-    /// A snapshot's export of those resources while it is taken: (done, pieces as `SP_IMPORT`s).
+    /// A snapshot's export while it is taken: (done, pieces as `SP_IMPORT`s).
     snap_export: Option<(bool, Vec<Piece>)>,
-    /// What the GPU drew into them at the last snapshot (for the side file), or, in a restored
-    /// device, at the snapshot it was restored from: imported into a renderer that is reset to
-    /// the snapshot and does not keep them (a rollback), so that the compositor's buffers hold
-    /// what the guest believes they hold. Dropped once the guest runs on.
+    /// What the GPU drew into the resources it wrote (the shown ones first) at the last snapshot
+    /// (for the side file), or, in a restored device, at the snapshot it was restored from:
+    /// imported into a renderer that is reset to the snapshot and does not keep them (a
+    /// rollback), so that they hold what the guest believes they hold. Dropped once the guest
+    /// runs on.
     pub(crate) scanout_saved: Vec<Piece>,
 
     /// A snapshot is being taken: no command of the guest is taken.
@@ -1994,8 +1997,8 @@ impl Gpu {
         }
     }
 
-    /// A restored device rebuilds a renderer before the guest ran on: the compositor's
-    /// buffers that the renderer did not keep get what the GPU had drawn into them at the
+    /// A restored device rebuilds a renderer before the guest ran on: the resources the GPU
+    /// wrote that the renderer did not keep get what the GPU had drawn into them at the
     /// snapshot, then the scanout is shown again.
     fn import_saved_scanouts(&mut self, to: usize, kept: &BTreeSet<u32>) {
         let saved = std::mem::take(&mut self.scanout_saved);
@@ -2021,25 +2024,68 @@ impl Gpu {
             sw.chunk_bytes += bytes;
         }
         self.log_info(&format!(
-            "spacebox remote gpu: the content of the shown resources {ids:?} saved at the snapshot imported ({n} pieces, {bytes} bytes)"
+            "spacebox remote gpu: the content of the resources {ids:?} saved at the snapshot imported ({n} pieces, {bytes} bytes)"
         ));
     }
 
-    /// At a snapshot, after the drain: what the GPU drew into the resources shown last (the
-    /// compositor's swap chain), exported by the renderer, for the side file.
+    /// At a snapshot, after the drain: what the GPU drew, exported by the renderer, for the side
+    /// file. First the resources shown last (the compositor's swap chain), then every other
+    /// resource the GPU wrote: a rollback resets the renderer to the snapshot and drops what was
+    /// written after it, and the guest's programs go on using what they drew before the snapshot
+    /// (a compositor's swap chain, the cached pictures of a shell's panel) without drawing it
+    /// again; each part has its own bound, and a part that is not answered in time is left out.
     fn save_scanouts(&mut self) {
         self.scanout_saved = Vec::new();
         let written = self.journal.gpu_written();
-        let ids: Vec<u32> = self
+        let shown: Vec<u32> = self
             .scanned
             .iter()
             .copied()
             .filter(|r| written.contains(r))
             .collect();
+        let rest: Vec<u32> = written
+            .iter()
+            .copied()
+            .filter(|r| !shown.contains(r))
+            .collect();
         let a = self.active;
-        if ids.is_empty() || !self.conns[a].up() || self.switch.is_some() {
+        // nothing shown, nothing saved: there is no picture to keep
+        if shown.is_empty() || !self.conns[a].up() || self.switch.is_some() {
             return;
         }
+        for (ids, what) in [
+            (shown, "the shown resources"),
+            (rest, "the other resources the GPU wrote"),
+        ] {
+            if ids.is_empty() {
+                continue;
+            }
+            let t0 = now_us();
+            let got = self.snapshot_export(&ids);
+            let n = got.as_ref().map_or(0, Vec::len);
+            let bytes: usize = got.iter().flatten().map(|(_, b)| b.len()).sum();
+            self.log_info(&format!(
+                "spacebox remote gpu: snapshot: {what} {} {} ({n} pieces, {bytes} bytes, {} ms)",
+                if ids.len() <= 8 {
+                    format!("{ids:?}")
+                } else {
+                    format!("({} resources)", ids.len())
+                },
+                if got.is_some() {
+                    "saved"
+                } else {
+                    "not saved (no answer in time)"
+                },
+                (now_us() - t0) / 1000
+            ));
+            self.scanout_saved.extend(got.unwrap_or_default());
+        }
+    }
+
+    /// One export of `ids` from the active renderer during a snapshot, within
+    /// [`SAVE_EXPORT_US`]: its pieces, or `None` when it did not end in time.
+    fn snapshot_export(&mut self, ids: &[u32]) -> Option<Vec<Piece>> {
+        let a = self.active;
         let t0 = now_us();
         self.snap_export = Some((false, Vec::new()));
         let req: Vec<u8> = ids.iter().flat_map(|r| r.to_le_bytes()).collect();
@@ -2058,16 +2104,7 @@ impl Gpu {
                 .wait(Duration::from_micros(left.clamp(1, 10_000).unsigned_abs()));
         }
         let (done, pieces) = self.snap_export.take().unwrap_or_default();
-        let bytes: usize = pieces.iter().map(|(_, b)| b.len()).sum();
-        if done {
-            self.scanout_saved = pieces;
-        }
-        self.log_info(&format!(
-            "spacebox remote gpu: snapshot: the shown resources {ids:?} {} ({} pieces, {bytes} bytes, {} ms)",
-            if done { "saved" } else { "not saved (no answer in time)" },
-            self.scanout_saved.len(),
-            (now_us() - t0) / 1000
-        ));
+        done.then_some(pieces)
     }
 
     /// In a planned switch, once the old renderer has answered everything: first the scanout,

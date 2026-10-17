@@ -1659,6 +1659,13 @@ fn a_rollback_gets_the_shown_resources_as_they_were_at_the_snapshot() {
     let mem = single_region_mem(0x200000);
     let mut r = rig_with(&mem, cfg(path.to_str().unwrap()));
     let (mut sink, _) = paired_with_a_drawn_texture(&mut r, &listener);
+    // texture 6 is drawn by the GPU too, and not shown (as the cached pictures of a shell's panel)
+    r.resource(6, 2, 67, 2, 64, 64, BACKING_AT + 0x10000);
+    let mut at = hdr(CMD_CTX_ATTACH_RESOURCE, None, 1);
+    put32(&mut at, 6);
+    put32(&mut at, 0);
+    r.give(at);
+    r.give(submit(None, 1, &draw_into(6)));
     // texture 5 (drawn by the GPU) is shown
     let mut sc = hdr(0x0103, None, 0);
     for v in [0, 0, 64, 64, 0, 5] {
@@ -1666,47 +1673,57 @@ fn a_rollback_gets_the_shown_resources_as_they_were_at_the_snapshot() {
     }
     r.give(sc);
     assert_eq!(r.gpu.scanned, [5]);
-    let (m, a) = sink.next();
-    assert_eq!((m.typ, u32_at(&a, 0)), (SP_CTRL, 0x0103));
-    // At the snapshot, after the drain, the device asks for what the GPU drew into it.
+    let mut last = 0;
+    loop {
+        let (m, a) = sink.next();
+        last = m.id.max(last);
+        if (m.typ, u32_at(&a, 0)) == (SP_CTRL, 0x0103) {
+            break;
+        }
+    }
+    // At the snapshot, after the drain, the device asks for what the GPU drew: the shown
+    // texture first, then the other one.
     let answer = std::thread::spawn(move || {
         sink.send(
             Hdr {
                 typ: SP_ACK,
-                ack: m.id,
+                ack: last,
                 ..Default::default()
             },
             &[],
         );
-        let (e, a) = sink.next();
-        assert_eq!((e.typ, u32_at(&a, 0)), (SP_EXPORT, 5));
-        // a sink's messages carry its acknowledgement
-        sink.send(
-            Hdr {
-                typ: SP_ACK,
-                ack: e.id,
-                ..Default::default()
-            },
-            &[],
-        );
-        let mut x = vec![0u8; 48];
-        x[..4].copy_from_slice(&5u32.to_le_bytes());
-        sink.say(1, SP_EXPORT_DATA, &x, &[7u8; 64], 0);
-        sink.say(2, SP_EXPORT_DONE, &[], &[], 1);
+        for (k, res, fill) in [(1, 5u32, 5u8), (3, 6u32, 6u8)] {
+            let (e, a) = sink.next();
+            assert_eq!((e.typ, a.len(), u32_at(&a, 0)), (SP_EXPORT, 4, res));
+            // a sink's messages carry its acknowledgement
+            sink.send(
+                Hdr {
+                    typ: SP_ACK,
+                    ack: e.id,
+                    ..Default::default()
+                },
+                &[],
+            );
+            let mut x = vec![0u8; 48];
+            x[..4].copy_from_slice(&res.to_le_bytes());
+            sink.say(k, SP_EXPORT_DATA, &x, &[fill; 64], 0);
+            sink.say(k + 1, SP_EXPORT_DONE, &[], &[], 1);
+        }
         sink
     });
     r.gpu.prepare_save();
     let sink = answer.join().unwrap();
-    assert_eq!(r.gpu.scanout_saved.len(), 1);
+    assert_eq!(r.gpu.scanout_saved.len(), 2);
+    assert_eq!(u32_at(&r.gpu.scanout_saved[0].0, 0), 5);
     let st = through_a_snapshot(&r.gpu);
-    assert_eq!(st.side.as_ref().unwrap().scanout_saved.len(), 1);
+    assert_eq!(st.side.as_ref().unwrap().scanout_saved.len(), 2);
     drop(r);
     drop(sink);
 
     // Rolled back: the renderer ran on and keeps nothing of the snapshot. After the rebuild it
-    // gets texture 5 as it was at the snapshot, and the scanout is shown again.
+    // gets textures 5 and 6 as they were at the snapshot, and the scanout is shown again.
     let mut g = restored(&mem, &st);
-    assert_eq!(g.scanout_saved.len(), 1);
+    assert_eq!(g.scanout_saved.len(), 2);
     g.process_retry();
     let mut sink = sink_on(&listener);
     let n = st.conns[USER].tx_id;
@@ -1714,7 +1731,7 @@ fn a_rollback_gets_the_shown_resources_as_they_were_at_the_snapshot() {
     pump(&mut g, |g| g.conns[USER].hello_done);
     let (m, _) = sink.next();
     assert_eq!((m.typ, m.arg0), (SP_STATE_RESET, n));
-    sink.say(3, SP_STATE_KEPT, &[], &[], n);
+    sink.say(5, SP_STATE_KEPT, &[], &[], n);
     pump(&mut g, |g| g.switch.is_none());
     let mut seen = Vec::new();
     loop {
@@ -1723,8 +1740,9 @@ fn a_rollback_gets_the_shown_resources_as_they_were_at_the_snapshot() {
         if h.typ == SP_CTRL && u32_at(&a, 0) == 0x0103 && seen.iter().any(|s| s.0 == SP_IMPORT) {
             break;
         }
-        assert!(seen.len() < 30, "{seen:?}");
+        assert!(seen.len() < 40, "{seen:?}");
     }
     assert!(seen.contains(&(SP_IMPORT, 5, 64)), "{seen:?}");
+    assert!(seen.contains(&(SP_IMPORT, 6, 64)), "{seen:?}");
     assert!(g.scanout_saved.is_empty());
 }
