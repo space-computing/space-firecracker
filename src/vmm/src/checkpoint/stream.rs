@@ -313,9 +313,12 @@ pub(crate) mod tests {
         assert!(!page_is_zero(&page));
     }
 
-    /// A reader of the GPU's part of a frame in the tests, as the receiving place reads it:
-    /// (the structure, or None for "the same"; each blob: id, Some(bytes) or None for known).
-    pub(crate) fn read_gpu(b: &[u8]) -> (Option<Vec<u8>>, Vec<(u64, Option<Vec<u8>>)>) {
+    /// The GPU's part as the tests read it: the structure, or None for "the same"; each blob:
+    /// id, Some(bytes) or None for known.
+    pub(crate) type GpuRead = (Option<Vec<u8>>, Vec<(u64, Option<Vec<u8>>)>);
+
+    /// A reader of the GPU's part of a frame in the tests, as the receiving place reads it.
+    pub(crate) fn read_gpu(b: &[u8]) -> GpuRead {
         let be64 = |at: usize| u64::from_be_bytes(b[at..at + 8].try_into().unwrap());
         let s = usize::try_from(be64(0)).unwrap();
         let skeleton = (s != 0).then(|| b[8..8 + s].to_vec());
