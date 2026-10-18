@@ -14,7 +14,13 @@
 //!
 //! Before the save the device takes no more commands and waits, at most 2 s, until its
 //! renderer has answered every command and acknowledged every message
-//! ([`Gpu::prepare_save`](super::Gpu)); then it closes its connections. The snapshot is a mark
+//! ([`Gpu::prepare_save`](super::Gpu)); then it asks the renderer for what the GPU drew into
+//! the resources it wrote (for a rollback, which drops what was written after the snapshot):
+//! each export goes on while the renderer sends, and ends when it is complete, when the
+//! renderer is gone, or after 2 s in which the renderer sent nothing. What an export that does
+//! not complete lacks is recorded in the side file (`scanout_missing`), and the snapshot is
+//! taken all the same; a rollback that lacks it asks for the redraw at once. Then the device
+//! closes its connections. The snapshot is a mark
 //! point of every connection (`Conn::marked`): a resource that is written after it is listed
 //! in an `SP_WMARK` again, so that a renderer that ran on after the snapshot can be reset to
 //! the snapshot's last message id.
@@ -46,7 +52,7 @@ use crate::vmm_config::gpu::GpuConfig;
 use crate::vstate::memory::{GuestAddress, GuestMemoryMmap};
 
 /// The first bytes of a side file.
-const SIDE_MAGIC: &[u8; 8] = b"SPGPU001";
+const SIDE_MAGIC: &[u8; 8] = b"SPGPU002";
 
 /// The file beside the snapshot `snapshot_path` that holds the GPU device's large state.
 pub fn side_path(snapshot_path: &Path) -> PathBuf {
@@ -147,9 +153,13 @@ pub struct GpuSideState {
     pub parked: Vec<ParkedState>,
     /// For each connection: the reliable messages its renderer has not acknowledged.
     pub unacked: Vec<Vec<(u64, Vec<u8>)>>,
-    /// What the GPU drew into the resources shown last, as `SP_IMPORT`s (header, bytes),
-    /// exported at the snapshot (imported at a rollback).
+    /// What the GPU drew into the resources it wrote (those shown last first), as `SP_IMPORT`s
+    /// (header, bytes), exported at the snapshot (imported at a rollback).
     pub scanout_saved: Vec<(Vec<u8>, Vec<u8>)>,
+    /// The resources the GPU wrote whose content the snapshot lacks (an export did not
+    /// complete, or the renderer could not answer): a rollback that does not keep one of them
+    /// asks for the redraw at once.
+    pub scanout_missing: Vec<u32>,
 }
 
 impl GpuSideState {
@@ -291,6 +301,7 @@ impl Persist<'_> for Gpu {
                 .map(|c| c.link.lock().q.unacked_messages())
                 .collect(),
             scanout_saved: self.scanout_saved.clone(),
+            scanout_missing: self.saved_missing.clone(),
         };
         // The wanted renderers are those before the snapshot closed the connections.
         let wanted: Vec<bool> = match &self.saved_wanted {
@@ -395,6 +406,7 @@ impl Persist<'_> for Gpu {
 
         gpu.journal = side.journal.clone();
         gpu.scanout_saved = side.scanout_saved.clone();
+        gpu.saved_missing = side.scanout_missing.clone();
         gpu.resources = side
             .resources
             .iter()
@@ -453,12 +465,21 @@ impl Persist<'_> for Gpu {
             })
             .collect::<VecDeque<_>>();
         let msg = format!(
-            "spacebox remote gpu: restored from a snapshot: session {:#x}, {} resources, {} commands not answered, the renderer's stream at {} of {} messages",
+            "spacebox remote gpu: restored from a snapshot: session {:#x}, {} resources, {} commands not answered, the renderer's stream at {} of {} messages{}",
             gpu.session,
             gpu.resources.len(),
             gpu.pending.len(),
             state.conns[state.active].rx_id,
-            state.conns[state.active].tx_id
+            state.conns[state.active].tx_id,
+            if gpu.saved_missing.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; the snapshot's GPU content is incomplete: {} resources not saved {:?}",
+                    gpu.saved_missing.len(),
+                    gpu.saved_missing
+                )
+            }
         );
         gpu.log_info_line(&msg);
         Ok(gpu)

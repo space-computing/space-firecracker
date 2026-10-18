@@ -145,11 +145,12 @@ fn read_dump(path: &str) -> std::io::Result<Vec<M>> {
 /// One piece of an export: its `SpXfer` and its bytes.
 type Piece = ([u8; XFER_LEN], Vec<u8>);
 
-/// What a renderer sends back that the replay waits for.
+/// What a renderer sends back that the replay waits for (an export's replies with their
+/// request id).
 enum Ev {
     Kept(Vec<u32>),
-    Data(Piece),
-    Done(Vec<u32>),
+    Data(u64, Piece),
+    Done(u64, Vec<u32>),
 }
 
 /// A connection to a renderer, as a source that does not compress.
@@ -197,9 +198,9 @@ fn reader(mut s: UnixStream, rx_id: &AtomicU64, out: &mpsc::Sender<Ev>) {
         let e = match u32_at(&h, 4) {
             SP_STATE_KEPT => Ev::Kept(words(&a)),
             SP_EXPORT_DATA if a.len() >= XFER_LEN => {
-                Ev::Data((a[..XFER_LEN].try_into().unwrap(), b))
+                Ev::Data(u64_at(&h, 56), (a[..XFER_LEN].try_into().unwrap(), b))
             }
-            SP_EXPORT_DONE => Ev::Done(words(&a)),
+            SP_EXPORT_DONE => Ev::Done(u64_at(&h, 56), words(&a)),
             _ => continue,
         };
         if out.send(e).is_err() {
@@ -268,14 +269,22 @@ impl Sink {
         }
     }
 
-    /// The contents of `ids`, in pieces, and the ids it did not export.
+    /// The contents of `ids`, in pieces, and the ids it did not export. The request id is the
+    /// id of the `SP_EXPORT` message; every reply must carry it.
     fn export(&mut self, ids: &[u32]) -> (Vec<(u32, Piece)>, Vec<u32>) {
-        self.send(SP_EXPORT, &bytes(ids), &[], [0; 3]);
+        self.send(SP_EXPORT, &bytes(ids), &[], [self.id + 1, 0, 0]);
+        let req = self.id;
         let mut v = Vec::new();
         loop {
             match self.wait() {
-                Ev::Data(p) => v.push((u32_at(&p.0, 0), p)),
-                Ev::Done(missing) => return (v, missing),
+                Ev::Data(r, p) => {
+                    assert_eq!(r, req, "a reply of another export");
+                    v.push((u32_at(&p.0, 0), p));
+                }
+                Ev::Done(r, missing) => {
+                    assert_eq!(r, req, "a reply of another export");
+                    return (v, missing);
+                }
                 Ev::Kept(_) => {}
             }
         }

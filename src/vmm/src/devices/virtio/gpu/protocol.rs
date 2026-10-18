@@ -48,12 +48,15 @@ pub(crate) const SP_STATE_KEPT: u32 = 18;
 /// To the sink. a: `SpXfer`, b: bytes for that part of a resource (kind 0: the guest's layout,
 /// written with context 0; other kinds: what a sink's export made).
 pub(crate) const SP_IMPORT: u32 = 19;
-/// To the sink. a: `u32[]` resources whose contents the sink sends back, in that order, as
-/// `SP_EXPORT_DATA` messages and then one `SP_EXPORT_DONE`.
+/// To the sink. arg0: the request id (not 0; each export has its own). a: `u32[]` resources
+/// whose contents the sink sends back, in that order, as `SP_EXPORT_DATA` messages and then
+/// one `SP_EXPORT_DONE`, each with the request id in arg2.
 pub(crate) const SP_EXPORT: u32 = 22;
-/// To the source. a: `SpXfer`, b: bytes (passed on to another sink as an `SP_IMPORT`).
+/// To the source. arg2: the request id. a: `SpXfer`, b: bytes (passed on to another sink as an
+/// `SP_IMPORT`).
 pub(crate) const SP_EXPORT_DATA: u32 = 23;
-/// To the source. arg0 messages, arg1 bytes of the export; a: `u32[]` resources not exported.
+/// To the source. arg0 messages, arg1 bytes of the export, arg2 the request id; a: `u32[]`
+/// resources not exported.
 pub(crate) const SP_EXPORT_DONE: u32 = 24;
 /// To the source: the sink ends on purpose; it goes on until `SP_BYE`.
 pub(crate) const SP_DETACH: u32 = 25;

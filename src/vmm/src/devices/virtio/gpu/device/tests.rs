@@ -1150,19 +1150,47 @@ impl Sink {
     }
 
     fn say(&mut self, id: u64, typ: u32, a: &[u8], b: &[u8], arg0: u64) {
+        self.say_args(id, typ, a, b, [arg0, 0, 0]);
+    }
+
+    fn say_args(&mut self, id: u64, typ: u32, a: &[u8], b: &[u8], args: [u64; 3]) {
         let mut m = a.to_vec();
         m.extend_from_slice(b);
+        self.send(export_hdr(id, typ, a, b, args), &m);
+    }
+
+    /// The reply of export `req` with one piece of resource `res` (64 bytes of `fill`):
+    /// `SP_EXPORT_DATA` with message id `id`, then `SP_EXPORT_DONE` with `id + 1`.
+    fn export_answer(&mut self, id: u64, req: u64, res: u32, fill: u8) {
+        let mut x = vec![0u8; 48];
+        x[..4].copy_from_slice(&res.to_le_bytes());
+        self.say_args(id, SP_EXPORT_DATA, &x, &[fill; 64], [0, 0, req]);
+        self.say_args(id + 1, SP_EXPORT_DONE, &[], &[], [1, 64, req]);
+    }
+
+    /// Acknowledge everything up to `id`.
+    fn ack_to(&mut self, id: u64) {
         self.send(
             Hdr {
-                typ,
-                id,
-                a_len: u32::try_from(a.len()).unwrap(),
-                b_len: u32::try_from(b.len()).unwrap(),
-                arg0,
+                typ: SP_ACK,
+                ack: id,
                 ..Default::default()
             },
-            &m,
+            &[],
         );
+    }
+}
+
+fn export_hdr(id: u64, typ: u32, a: &[u8], b: &[u8], args: [u64; 3]) -> Hdr {
+    Hdr {
+        typ,
+        id,
+        a_len: u32::try_from(a.len()).unwrap(),
+        b_len: u32::try_from(b.len()).unwrap(),
+        arg0: args[0],
+        arg1: args[1],
+        arg2: args[2],
+        ..Default::default()
     }
 }
 
@@ -1242,11 +1270,16 @@ fn switches_between_the_users_renderer_and_the_cpu_renderer() {
     pump2(&mut r.gpu, |g| {
         g.switch.as_ref().unwrap().phase == Phase::Scanout
     });
-    assert_eq!(user.take(1), [(SP_EXPORT, 5)]);
+    let (e, a) = user.next();
+    assert_eq!((e.typ, u32_at(&a, 0)), (SP_EXPORT, 5));
+    assert_ne!(e.arg0, 0);
     let x = gpu_journal::xfer(5, 1, 0, 0, 0, 2, [0, 0, 0, 64, 64, 1]);
-    user.say(2, SP_EXPORT_DATA, &x, &[9; 100], 0);
-    user.say(3, SP_EXPORT_DONE, &[], &[], 1);
+    // a reply of another export is dropped: it does not reach the new renderer
+    user.say_args(2, SP_EXPORT_DATA, &x, &[7; 100], [0, 0, e.arg0 + 1]);
+    user.say_args(3, SP_EXPORT_DATA, &x, &[9; 100], [0, 0, e.arg0]);
+    user.say_args(4, SP_EXPORT_DONE, &[], &[], [1, 100, e.arg0]);
     pump2(&mut r.gpu, |g| g.switch.is_none());
+    assert_eq!(r.gpu.counters.export_stale, 1);
     assert_eq!(r.gpu.active, CPU);
     assert_eq!(
         cpu.take(8),
@@ -1280,9 +1313,12 @@ fn switches_between_the_users_renderer_and_the_cpu_renderer() {
     pump2(&mut r.gpu, |g| {
         g.switch.as_ref().unwrap().phase == Phase::Scanout
     });
-    assert_eq!(cpu.take(1), [(SP_EXPORT, 5)]);
-    cpu.say(2, SP_EXPORT_DATA, &x, &[8; 100], 0);
-    cpu.say(3, SP_EXPORT_DONE, &[], &[], 1);
+    let (e2, a) = cpu.next();
+    assert_eq!((e2.typ, u32_at(&a, 0)), (SP_EXPORT, 5));
+    // each export has its own request id
+    assert_ne!(e2.arg0, e.arg0);
+    cpu.say_args(2, SP_EXPORT_DATA, &x, &[8; 100], [0, 0, e2.arg0]);
+    cpu.say_args(3, SP_EXPORT_DONE, &[], &[], [1, 100, e2.arg0]);
     pump2(&mut r.gpu, |g| g.switch.is_none());
     assert_eq!(r.gpu.active, USER);
     assert!(!r.gpu.conns[CPU].link.is_connected());
@@ -1696,18 +1732,8 @@ fn a_rollback_gets_the_shown_resources_as_they_were_at_the_snapshot() {
             let (e, a) = sink.next();
             assert_eq!((e.typ, a.len(), u32_at(&a, 0)), (SP_EXPORT, 4, res));
             // a sink's messages carry its acknowledgement
-            sink.send(
-                Hdr {
-                    typ: SP_ACK,
-                    ack: e.id,
-                    ..Default::default()
-                },
-                &[],
-            );
-            let mut x = vec![0u8; 48];
-            x[..4].copy_from_slice(&res.to_le_bytes());
-            sink.say(k, SP_EXPORT_DATA, &x, &[fill; 64], 0);
-            sink.say(k + 1, SP_EXPORT_DONE, &[], &[], 1);
+            sink.ack_to(e.id);
+            sink.export_answer(k, e.arg0, res, fill);
         }
         sink
     });
@@ -1715,8 +1741,10 @@ fn a_rollback_gets_the_shown_resources_as_they_were_at_the_snapshot() {
     let sink = answer.join().unwrap();
     assert_eq!(r.gpu.scanout_saved.len(), 2);
     assert_eq!(u32_at(&r.gpu.scanout_saved[0].0, 0), 5);
+    assert!(r.gpu.saved_missing.is_empty());
     let st = through_a_snapshot(&r.gpu);
     assert_eq!(st.side.as_ref().unwrap().scanout_saved.len(), 2);
+    assert!(st.side.as_ref().unwrap().scanout_missing.is_empty());
     drop(r);
     drop(sink);
 
@@ -1745,4 +1773,244 @@ fn a_rollback_gets_the_shown_resources_as_they_were_at_the_snapshot() {
     assert!(seen.contains(&(SP_IMPORT, 5, 64)), "{seen:?}");
     assert!(seen.contains(&(SP_IMPORT, 6, 64)), "{seen:?}");
     assert!(g.scanout_saved.is_empty());
+}
+
+// ---- a snapshot's export that is slow, stalled or answered late (V4 of validation r2) ------
+
+/// A device paired with a test sink, with texture 5 drawn by the GPU and shown, and with
+/// `other` texture 6 drawn too and not shown. Returns the sink and the last id the device
+/// gave out (not acknowledged yet).
+fn shown_texture(r: &mut Rig<'_>, listener: &UnixListener, other: bool) -> (Sink, u64) {
+    let (mut sink, _) = paired_with_a_drawn_texture(r, listener);
+    if other {
+        r.resource(6, 2, 67, 2, 64, 64, BACKING_AT + 0x10000);
+        let mut at = hdr(CMD_CTX_ATTACH_RESOURCE, None, 1);
+        put32(&mut at, 6);
+        put32(&mut at, 0);
+        r.give(at);
+        r.give(submit(None, 1, &draw_into(6)));
+    }
+    let mut sc = hdr(0x0103, None, 0);
+    for v in [0, 0, 64, 64, 0, 5] {
+        put32(&mut sc, v);
+    }
+    r.give(sc);
+    let mut last = 0;
+    loop {
+        let (m, a) = sink.next();
+        last = m.id.max(last);
+        if (m.typ, u32_at(&a, 0)) == (SP_CTRL, 0x0103) {
+            break;
+        }
+    }
+    (sink, last)
+}
+
+/// Read the device's next `SP_EXPORT` and acknowledge it: (its request id, the resources).
+fn export_asked(sink: &mut Sink) -> (u64, Vec<u32>) {
+    let (e, a) = sink.next();
+    assert_eq!(e.typ, SP_EXPORT);
+    sink.ack_to(e.id);
+    (e.arg0, a.chunks_exact(4).map(|c| u32_at(c, 0)).collect())
+}
+
+#[test]
+fn a_slow_snapshot_export_that_keeps_sending_completes_after_more_than_2_s() {
+    let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+    let path = dir.as_path().join("gpu.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let mem = single_region_mem(0x200000);
+    let mut r = rig_with(&mem, cfg(path.to_str().unwrap()));
+    let (mut sink, last) = shown_texture(&mut r, &listener, false);
+    // A slow link: the piece of texture 5 arrives in 7 parts 500 ms apart (3 s in all, never
+    // 2 s with nothing).
+    let answer = std::thread::spawn(move || {
+        sink.ack_to(last);
+        let (req, ids) = export_asked(&mut sink);
+        assert_eq!(ids, [5]);
+        let mut x = vec![0u8; 48];
+        x[..4].copy_from_slice(&5u32.to_le_bytes());
+        let b = [5u8; 4096];
+        let mut m = export_hdr(1, SP_EXPORT_DATA, &x, &b, [0, 0, req])
+            .encode()
+            .to_vec();
+        m.extend_from_slice(&x);
+        m.extend_from_slice(&b);
+        for part in m.chunks(m.len().div_ceil(7)) {
+            sink.s.write_all(part).unwrap();
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        sink.say_args(2, SP_EXPORT_DONE, &[], &[], [1, 4096, req]);
+        sink
+    });
+    let t = Instant::now();
+    r.gpu.prepare_save();
+    let waited = t.elapsed();
+    let _sink = answer.join().unwrap();
+    assert!(waited > Duration::from_millis(2900), "{waited:?}");
+    assert_eq!(r.gpu.scanout_saved.len(), 1);
+    assert_eq!(r.gpu.scanout_saved[0].1, [5u8; 4096]);
+    assert!(r.gpu.saved_missing.is_empty());
+    let st = through_a_snapshot(&r.gpu);
+    assert!(st.side.as_ref().unwrap().scanout_missing.is_empty());
+}
+
+#[test]
+fn a_stalled_snapshot_export_ends_after_2_s_of_silence_and_is_recorded() {
+    let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+    let path = dir.as_path().join("gpu.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let mem = single_region_mem(0x200000);
+    let mut r = rig_with(&mem, cfg(path.to_str().unwrap()));
+    let (mut sink, last) = shown_texture(&mut r, &listener, false);
+    // The renderer takes the export and then sends nothing (stopped).
+    let answer = std::thread::spawn(move || {
+        sink.ack_to(last);
+        let (_, ids) = export_asked(&mut sink);
+        assert_eq!(ids, [5]);
+        (sink, Instant::now())
+    });
+    r.gpu.prepare_save();
+    let (_sink, asked) = answer.join().unwrap();
+    let silent = asked.elapsed();
+    assert!(
+        silent >= Duration::from_millis(1990) && silent < Duration::from_millis(2600),
+        "{silent:?}"
+    );
+    // the snapshot is taken, without the content, which is recorded as missing
+    assert!(!r.gpu.conns[USER].link.is_connected());
+    assert!(r.gpu.scanout_saved.is_empty());
+    assert_eq!(r.gpu.saved_missing, [5]);
+    let st = through_a_snapshot(&r.gpu);
+    assert_eq!(st.side.as_ref().unwrap().scanout_missing, [5]);
+}
+
+#[test]
+fn a_late_reply_of_a_first_export_does_not_complete_the_second() {
+    let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+    let path = dir.as_path().join("gpu.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let mem = single_region_mem(0x200000);
+    let mut r = rig_with(&mem, cfg(path.to_str().unwrap()));
+    let (mut sink, last) = shown_texture(&mut r, &listener, true);
+    // The renderer stalls on the first export (texture 5) past its 2 s of silence; the device
+    // asks for the second (texture 6); then the renderer answers the first, late, and 500 ms
+    // later the second.
+    let answer = std::thread::spawn(move || {
+        sink.ack_to(last);
+        let (req1, ids1) = export_asked(&mut sink);
+        let (req2, ids2) = export_asked(&mut sink);
+        assert_eq!((ids1.as_slice(), ids2.as_slice()), (&[5][..], &[6][..]));
+        assert_ne!(req1, req2);
+        sink.export_answer(1, req1, 5, 5);
+        std::thread::sleep(Duration::from_millis(500));
+        let t = Instant::now();
+        sink.export_answer(3, req2, 6, 6);
+        (sink, t)
+    });
+    r.gpu.prepare_save();
+    let ended = Instant::now();
+    let (_sink, second) = answer.join().unwrap();
+    // it waited for the second export's own reply
+    assert!(ended > second);
+    assert_eq!(r.gpu.scanout_saved.len(), 1);
+    assert_eq!(u32_at(&r.gpu.scanout_saved[0].0, 0), 6);
+    assert_eq!(r.gpu.scanout_saved[0].1, [6u8; 64]);
+    assert_eq!(r.gpu.saved_missing, [5]);
+    assert_eq!(r.gpu.counters.export_stale, 2);
+}
+
+#[test]
+fn the_side_files_record_of_missing_content_round_trips() {
+    let mem = single_region_mem(0x100000);
+    let mut r = rig_with(&mem, cfg("/nonexistent"));
+    r.gpu.saved_missing = vec![5, 1110, 7];
+    let st = through_a_snapshot(&r.gpu);
+    assert_eq!(st.side.as_ref().unwrap().scanout_missing, [5, 1110, 7]);
+    let g = Gpu::restore(
+        GpuConstructorArgs {
+            mem: mem.clone(),
+            filter: Arc::new(Vec::new()),
+        },
+        &st,
+    )
+    .unwrap();
+    assert_eq!(g.saved_missing, [5, 1110, 7]);
+    // a side file of the form before the record is refused
+    let mut bytes = Vec::new();
+    st.side.as_ref().unwrap().write_to(&mut bytes).unwrap();
+    bytes[..8].copy_from_slice(b"SPGPU001");
+    GpuSideState::read_from(&mut bytes.as_slice()).unwrap_err();
+}
+
+#[test]
+fn a_rollback_to_an_incomplete_snapshot_asks_for_the_redraw_at_once() {
+    let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+    let path = dir.as_path().join("gpu.sock");
+    let agent_path = dir.as_path().join("vsock.sock_5000");
+    let listener = UnixListener::bind(&path).unwrap();
+    let mem = single_region_mem(0x200000);
+    let mut c = cfg(path.to_str().unwrap());
+    c.agent_socket_path = Some(agent_path.to_str().unwrap().into());
+    let mut r = rig_with(&mem, c);
+    let (mut sink, last) = shown_texture(&mut r, &listener, false);
+    let answer = std::thread::spawn(move || {
+        sink.ack_to(last);
+        export_asked(&mut sink);
+        sink
+    });
+    r.gpu.prepare_save();
+    let sink = answer.join().unwrap();
+    assert_eq!(r.gpu.saved_missing, [5]);
+    let st = through_a_snapshot(&r.gpu);
+    drop(r);
+    drop(sink);
+    let n = st.conns[USER].tx_id;
+
+    // Rolled back, and the renderer does not keep texture 5 (it changed after the snapshot):
+    // the redraw is asked at once, not 2 s after the resume.
+    let mut g = restored(&mem, &st);
+    assert_eq!(g.saved_missing, [5]);
+    g.process_retry();
+    let mut sink = sink_on(&listener);
+    sink.hello(0xabc, st.session, n + 5, false);
+    pump(&mut g, |g| g.conns[USER].hello_done);
+    let (m, _) = sink.next();
+    assert_eq!((m.typ, m.arg0), (SP_STATE_RESET, n));
+    sink.say(1, SP_STATE_KEPT, &[], &[], n);
+    pump(&mut g, |g| g.switch.is_none());
+    assert!(!g.redraw_after_resume);
+    assert_eq!(g.redraw_at, None);
+    assert!(g.saved_missing.is_empty());
+    // the agent is not connected yet (the VM is paused): it is asked as soon as it is
+    let t = Instant::now();
+    g.kick();
+    let mut guest = UnixStream::connect(&agent_path).unwrap();
+    g.agent.as_mut().unwrap().accept().unwrap();
+    g.agent_connected();
+    g.process_ack_timer();
+    guest
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let mut got = [0u8; 7];
+    guest.read_exact(&mut got).unwrap();
+    assert_eq!(&got, b"REDRAW\n");
+    assert!(t.elapsed() < Duration::from_secs(1));
+    drop(g);
+    drop(sink);
+    drop(guest);
+
+    // The same snapshot, and a renderer that kept texture 5: nothing it needs is missing, and
+    // the redraw comes 2 s after the resume, as after a complete snapshot.
+    let mut g = restored(&mem, &st);
+    g.process_retry();
+    let mut sink = sink_on(&listener);
+    sink.hello(0xabc, st.session, n + 5, false);
+    pump(&mut g, |g| g.conns[USER].hello_done);
+    let (m, _) = sink.next();
+    assert_eq!((m.typ, m.arg0), (SP_STATE_RESET, n));
+    sink.say(1, SP_STATE_KEPT, &5u32.to_le_bytes(), &[], n);
+    pump(&mut g, |g| g.switch.is_none());
+    assert!(g.redraw_after_resume);
+    assert!(!g.redraw_pending);
 }

@@ -127,9 +127,11 @@ type Piece = (Vec<u8>, Vec<u8>);
 /// How many of the resources shown last are exported first at a snapshot (the compositor's swap
 /// chain).
 const SCANOUT_KEEP: usize = 4;
-/// How long a snapshot waits for each export of what the GPU drew (the shown resources, then
-/// the rest), after the drain.
-const SAVE_EXPORT_US: i64 = 2_000_000;
+/// A snapshot's export of what the GPU drew (the shown resources, then the rest) goes on while
+/// the renderer sends: it ends when it is complete, when the renderer is gone, or when the
+/// renderer has sent nothing for this long. A slow link makes the snapshot longer, not
+/// incomplete.
+const SAVE_EXPORT_SILENCE_US: i64 = 2_000_000;
 
 /// The connections: the user's renderer, and the renderer on this server's CPU.
 pub(crate) const USER: usize = 0;
@@ -286,6 +288,20 @@ pub(crate) struct Switch {
     /// The message id that the new renderer is reset to (`SP_STATE_RESET` N): 0 = it keeps
     /// nothing; after a rollback, the last id of the snapshot.
     reset_to: u64,
+    /// The request id of the export the switch waits for (0 = none).
+    export: u64,
+}
+
+/// A snapshot's export while it is taken.
+#[derive(Debug, Default)]
+struct SnapExport {
+    /// Its request id: the replies carry it.
+    id: u64,
+    done: bool,
+    /// What came, as `SP_IMPORT`s.
+    pieces: Vec<Piece>,
+    /// The resources the renderer said it did not export (`SP_EXPORT_DONE`).
+    skipped: Vec<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -331,6 +347,9 @@ pub(crate) struct Counters {
     /// Input of the sink, and the part of it with no input device to take it.
     n_input: u64,
     n_input_dropped: u64,
+    /// Replies (`SP_EXPORT_DATA`, `SP_EXPORT_DONE`) of an export that is not the one waited for
+    /// (a late reply of an export that ended without it): dropped.
+    pub(crate) export_stale: u64,
     /// Spacing of the guest's screen updates (`RESOURCE_FLUSH`).
     flush: DelayStat,
     flush_last: i64,
@@ -459,14 +478,21 @@ pub struct Gpu {
     resumed_at: Option<i64>,
     /// The resources shown last (`SET_SCANOUT`), the newest last: the compositor's swap chain.
     scanned: Vec<u32>,
-    /// A snapshot's export while it is taken: (done, pieces as `SP_IMPORT`s).
-    snap_export: Option<(bool, Vec<Piece>)>,
+    /// The request id of the last export asked of a renderer (each export has its own; the
+    /// first one is random, so that a reply to another device or process is not taken).
+    export_seq: u64,
+    /// A snapshot's export while it is taken.
+    snap_export: Option<SnapExport>,
     /// What the GPU drew into the resources it wrote (the shown ones first) at the last snapshot
     /// (for the side file), or, in a restored device, at the snapshot it was restored from:
     /// imported into a renderer that is reset to the snapshot and does not keep them (a
     /// rollback), so that they hold what the guest believes they hold. Dropped once the guest
     /// runs on.
     pub(crate) scanout_saved: Vec<Piece>,
+    /// The resources the GPU wrote whose content that snapshot lacks (an export did not
+    /// complete, or the renderer could not answer): in the side file; a rollback that does not
+    /// keep one of them asks for the redraw at once. Dropped with `scanout_saved`.
+    pub(crate) saved_missing: Vec<u32>,
 
     /// A snapshot is being taken: no command of the guest is taken.
     saving: bool,
@@ -606,8 +632,10 @@ impl Gpu {
             redraw_at: None,
             resumed_at: None,
             scanned: Vec::new(),
+            export_seq: random_session(),
             snap_export: None,
             scanout_saved: Vec::new(),
+            saved_missing: Vec::new(),
             saving: false,
             saved_wanted: None,
             cfg,
@@ -1570,9 +1598,13 @@ impl Gpu {
         if !self.active_up() || self.saving {
             return Ok(()); // resumed by the sink's HELLO, or when a switch is done
         }
-        if self.switch.is_none() && !self.scanout_saved.is_empty() && self.resumed_at.is_some() {
+        if self.switch.is_none()
+            && (!self.scanout_saved.is_empty() || !self.saved_missing.is_empty())
+            && self.resumed_at.is_some()
+        {
             // the guest runs on: the saved content is not what its buffers hold any more
             self.scanout_saved = Vec::new();
+            self.saved_missing = Vec::new();
         }
         loop {
             if self.conns[self.active].link.backlog() > self.tx_limit {
@@ -1800,18 +1832,7 @@ impl Gpu {
             }
             SP_DISPLAY if shown => self.display_event(h.arg0),
             SP_STATE_KEPT => self.switch_kept(ci, a),
-            SP_EXPORT_DATA if ci == self.active && self.snap_export.is_some() => {
-                if let Some((_, p)) = self.snap_export.as_mut() {
-                    p.push((a.to_vec(), b.to_vec()));
-                }
-            }
-            SP_EXPORT_DONE if ci == self.active && self.snap_export.is_some() => {
-                if let Some((done, _)) = self.snap_export.as_mut() {
-                    *done = true;
-                }
-            }
-            SP_EXPORT_DATA => self.switch_chunk(ci, a, b),
-            SP_EXPORT_DONE => self.switch_export_done(ci, h, a),
+            SP_EXPORT_DATA | SP_EXPORT_DONE => self.export_reply(ci, h, a, b),
             SP_DETACH => self.detach(ci),
             _ => {}
         }
@@ -1952,6 +1973,7 @@ impl Gpu {
             chunk_bytes: 0,
             why,
             reset_to,
+            export: 0,
         });
         let c = &mut self.conns[to];
         c.wanted = true;
@@ -2028,14 +2050,9 @@ impl Gpu {
         ));
     }
 
-    /// At a snapshot, after the drain: what the GPU drew, exported by the renderer, for the side
-    /// file. First the resources shown last (the compositor's swap chain), then every other
-    /// resource the GPU wrote: a rollback resets the renderer to the snapshot and drops what was
-    /// written after it, and the guest's programs go on using what they drew before the snapshot
-    /// (a compositor's swap chain, the cached pictures of a shell's panel) without drawing it
-    /// again; each part has its own bound, and a part that is not answered in time is left out.
-    fn save_scanouts(&mut self) {
-        self.scanout_saved = Vec::new();
+    /// The resources the GPU wrote: those shown last first (the compositor's swap chain), then
+    /// the rest.
+    fn written_shown_first(&self) -> (Vec<u32>, Vec<u32>) {
         let written = self.journal.gpu_written();
         let shown: Vec<u32> = self
             .scanned
@@ -2048,9 +2065,32 @@ impl Gpu {
             .copied()
             .filter(|r| !shown.contains(r))
             .collect();
-        let a = self.active;
+        (shown, rest)
+    }
+
+    /// At a snapshot, after the drain: what the GPU drew, exported by the renderer, for the side
+    /// file. First the resources shown last (the compositor's swap chain), then every other
+    /// resource the GPU wrote: a rollback resets the renderer to the snapshot and drops what was
+    /// written after it, and the guest's programs go on using what they drew before the snapshot
+    /// (a compositor's swap chain, the cached pictures of a shell's panel) without drawing it
+    /// again. Each export goes on while the renderer sends ([`SAVE_EXPORT_SILENCE_US`]); what an
+    /// export that does not complete was to bring is recorded as missing (`saved_missing`), and
+    /// the snapshot is taken all the same (a move must not depend on the export).
+    fn save_scanouts(&mut self) {
+        self.scanout_saved = Vec::new();
+        self.saved_missing = Vec::new();
+        let (shown, rest) = self.written_shown_first();
         // nothing shown, nothing saved: there is no picture to keep
-        if shown.is_empty() || !self.conns[a].up() || self.switch.is_some() {
+        if shown.is_empty() {
+            return;
+        }
+        let a = self.active;
+        if self.switch.is_some() || !self.conns[a].up() {
+            self.save_missing_all(if self.switch.is_some() {
+                "a switch is under way"
+            } else {
+                "the renderer is gone"
+            });
             return;
         }
         for (ids, what) in [
@@ -2062,49 +2102,147 @@ impl Gpu {
             }
             let t0 = now_us();
             let got = self.snapshot_export(&ids);
-            let n = got.as_ref().map_or(0, Vec::len);
-            let bytes: usize = got.iter().flatten().map(|(_, b)| b.len()).sum();
-            self.log_info(&format!(
-                "spacebox remote gpu: snapshot: {what} {} {} ({n} pieces, {bytes} bytes, {} ms)",
-                if ids.len() <= 8 {
-                    format!("{ids:?}")
-                } else {
-                    format!("({} resources)", ids.len())
-                },
-                if got.is_some() {
-                    "saved"
-                } else {
-                    "not saved (no answer in time)"
-                },
-                (now_us() - t0) / 1000
-            ));
-            self.scanout_saved.extend(got.unwrap_or_default());
+            let named = if ids.len() <= 8 {
+                format!("{ids:?}")
+            } else {
+                format!("({} resources)", ids.len())
+            };
+            let ms = (now_us() - t0) / 1000;
+            match got {
+                Ok((pieces, skipped)) => {
+                    let bytes: usize = pieces.iter().map(|(_, b)| b.len()).sum();
+                    self.log_info(&format!(
+                        "spacebox remote gpu: snapshot: {what} {named} saved ({} pieces, {bytes} bytes, {ms} ms){}",
+                        pieces.len(),
+                        if skipped.is_empty() {
+                            String::new()
+                        } else {
+                            format!("; the renderer did not export {skipped:?}")
+                        }
+                    ));
+                    self.scanout_saved.extend(pieces);
+                    self.saved_missing.extend(skipped);
+                }
+                Err(why) => {
+                    self.log_info(&format!(
+                        "spacebox remote gpu: snapshot: {what} {named} not saved: the export did not complete ({why}; {ms} ms)"
+                    ));
+                    self.saved_missing.extend(ids);
+                }
+            }
+        }
+        if !self.saved_missing.is_empty() {
+            self.log_incomplete("an export did not complete");
         }
     }
 
-    /// One export of `ids` from the active renderer during a snapshot, within
-    /// [`SAVE_EXPORT_US`]: its pieces, or `None` when it did not end in time.
-    fn snapshot_export(&mut self, ids: &[u32]) -> Option<Vec<Piece>> {
+    /// At a snapshot whose renderer cannot export now: everything the GPU wrote is missing from
+    /// it (if anything is shown).
+    fn save_missing_all(&mut self, why: &str) {
+        self.scanout_saved = Vec::new();
+        let (shown, rest) = self.written_shown_first();
+        self.saved_missing = if shown.is_empty() {
+            Vec::new()
+        } else {
+            [shown, rest].concat()
+        };
+        if !self.saved_missing.is_empty() {
+            self.log_incomplete(why);
+        }
+    }
+
+    fn log_incomplete(&mut self, why: &str) {
+        self.log_info(&format!(
+            "spacebox remote gpu: snapshot: its GPU content is incomplete ({why}): {} resources not saved {:?}, recorded in the side file; a rollback to it that lacks them asks for the redraw at once",
+            self.saved_missing.len(),
+            self.saved_missing
+        ));
+    }
+
+    /// The request id of a new export.
+    fn next_export_id(&mut self) -> u64 {
+        self.export_seq = self.export_seq.wrapping_add(1).max(1);
+        self.export_seq
+    }
+
+    /// One export of `ids` from the active renderer during a snapshot. It goes on while the
+    /// renderer sends: once it is complete, its pieces and the resources the renderer did not
+    /// export; otherwise why it did not complete (the renderer is gone, or it sent nothing for
+    /// [`SAVE_EXPORT_SILENCE_US`]).
+    fn snapshot_export(&mut self, ids: &[u32]) -> Result<(Vec<Piece>, Vec<u32>), &'static str> {
         let a = self.active;
-        let t0 = now_us();
-        self.snap_export = Some((false, Vec::new()));
+        let id = self.next_export_id();
+        self.snap_export = Some(SnapExport {
+            id,
+            ..Default::default()
+        });
         let req: Vec<u8> = ids.iter().flat_map(|r| r.to_le_bytes()).collect();
-        self.send(SP_EXPORT, 0, &req, &[], 0, 0, 0);
-        loop {
+        self.send(SP_EXPORT, 0, &req, &[], id, 0, 0);
+        let mut heard = (self.conns[a].link.rx_total(), now_us());
+        let why = loop {
             self.take_remote(a);
-            if self.snap_export.as_ref().is_some_and(|e| e.0) || !self.conns[a].up() {
-                break;
+            if self.snap_export.as_ref().is_some_and(|e| e.done) {
+                break None;
             }
-            let left = t0 + SAVE_EXPORT_US - now_us();
+            if !self.conns[a].up() {
+                break Some("the renderer is gone");
+            }
+            let (rx, now) = (self.conns[a].link.rx_total(), now_us());
+            if rx != heard.0 {
+                heard = (rx, now);
+            }
+            let left = heard.1 + SAVE_EXPORT_SILENCE_US - now;
             if left <= 0 {
-                break;
+                break Some("the renderer sent nothing for 2 s");
             }
             self.conns[a]
                 .link
                 .wait(Duration::from_micros(left.clamp(1, 10_000).unsigned_abs()));
+        };
+        let e = self.snap_export.take().unwrap_or_default();
+        match why {
+            None => Ok((e.pieces, e.skipped)),
+            Some(why) => Err(why),
         }
-        let (done, pieces) = self.snap_export.take().unwrap_or_default();
-        done.then_some(pieces)
+    }
+
+    /// A reply of an export (`SP_EXPORT_DATA`, `SP_EXPORT_DONE`, arg2 its request id): it goes
+    /// to the snapshot's or the switch's export that waits for it; a reply of another export
+    /// (a late one, of an export that ended without it) is dropped and counted.
+    fn export_reply(&mut self, ci: usize, h: &Hdr, a: &[u8], b: &[u8]) {
+        let rid = h.arg2;
+        if ci == self.active
+            && let Some(e) = self.snap_export.as_mut()
+            && e.id == rid
+        {
+            if h.typ == SP_EXPORT_DATA {
+                e.pieces.push((a.to_vec(), b.to_vec()));
+            } else {
+                e.done = true;
+                e.skipped = a.chunks_exact(4).map(|c| u32_at(c, 0)).collect();
+            }
+            return;
+        }
+        if rid != 0
+            && self
+                .switch
+                .as_ref()
+                .is_some_and(|sw| sw.from == Some(ci) && sw.export == rid)
+        {
+            if h.typ == SP_EXPORT_DATA {
+                self.switch_chunk(ci, a, b);
+            } else {
+                self.switch_export_done(ci, h, a);
+            }
+            return;
+        }
+        self.counters.export_stale += 1;
+        if h.typ == SP_EXPORT_DONE {
+            self.log_info(&format!(
+                "spacebox remote gpu: {} ended export {rid:#x}, which is not the export waited for: its replies are dropped ({} replies of other exports dropped so far)",
+                CONN_NAMES[ci], self.counters.export_stale
+            ));
+        }
     }
 
     /// In a planned switch, once the old renderer has answered everything: first the scanout,
@@ -2121,10 +2259,12 @@ impl Gpu {
         match self.journal.scanout_resource() {
             Some(s) if written.first() == Some(&s) && !kept.contains(&s) => {
                 self.send_rebuild(to, &kept, Some(s));
-                self.send_on(from, true, SP_EXPORT, 0, &s.to_le_bytes(), &[], 0, 0, 0);
+                let id = self.next_export_id();
+                self.send_on(from, true, SP_EXPORT, 0, &s.to_le_bytes(), &[], id, 0, 0);
                 let sw = self.switch.as_mut().unwrap();
                 sw.scanout = Some(s);
                 sw.phase = Phase::Scanout;
+                sw.export = id;
             }
             _ => self.switch_rest(from, to),
         }
@@ -2148,7 +2288,9 @@ impl Gpu {
         if ids.is_empty() {
             self.finish_switch();
         } else {
-            self.send_on(from, true, SP_EXPORT, 0, &ids, &[], 0, 0, 0);
+            let id = self.next_export_id();
+            self.send_on(from, true, SP_EXPORT, 0, &ids, &[], id, 0, 0);
+            self.switch.as_mut().unwrap().export = id;
         }
     }
 
@@ -2271,7 +2413,24 @@ impl Gpu {
             st.upload_bytes,
             st.log_entries
         ));
-        if sw.from.is_none() && sw.reset_to != 0 {
+        let missing = if sw.from.is_none() {
+            std::mem::take(&mut self.saved_missing)
+        } else {
+            Vec::new()
+        };
+        let written = self.journal.gpu_written();
+        let lacking: Vec<u32> = missing
+            .into_iter()
+            .filter(|r| !sw.kept.contains(r) && written.contains(r))
+            .collect();
+        if sw.from.is_none() && sw.reset_to != 0 && !lacking.is_empty() {
+            // a rollback to a snapshot whose export did not complete: what the renderer lacks
+            // is drawn again at once (K6)
+            self.log_info(&format!(
+                "spacebox remote gpu: the snapshot's GPU content was incomplete: the resources {lacking:?} were not saved at the snapshot and the renderer did not keep them; the redraw is asked at once"
+            ));
+            self.redraw();
+        } else if sw.from.is_none() && sw.reset_to != 0 {
             // a rollback: what changed after the snapshot is drawn again (K6), but only 2 s
             // after the VM resumes, so that the picture is first the snapshot's
             match self.resumed_at {
@@ -2669,7 +2828,7 @@ impl Gpu {
         if settled {
             self.save_scanouts();
         } else {
-            self.scanout_saved = Vec::new();
+            self.save_missing_all("not everything was answered before the snapshot");
         }
         for ci in 0..self.conns.len() {
             if self.conns[ci].up() && self.conns[ci].rx_id != self.conns[ci].rx_id_acked {

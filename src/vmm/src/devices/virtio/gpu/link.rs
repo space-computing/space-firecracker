@@ -307,6 +307,8 @@ struct Shared {
     /// Bytes read from the socket, and after uncompressing.
     wire_rx: AtomicU64,
     rx_bytes: AtomicU64,
+    /// Bytes read from the socket since the link was made (never reset).
+    rx_total: AtomicU64,
     z_level: i32,
 }
 
@@ -377,6 +379,7 @@ impl Link {
             rx_cond: Condvar::new(),
             wire_rx: AtomicU64::new(0),
             rx_bytes: AtomicU64::new(0),
+            rx_total: AtomicU64::new(0),
             z_level,
         });
         let (in_tx, rx) = mpsc::channel();
@@ -442,6 +445,11 @@ impl Link {
             self.shared.wire_rx.swap(0, Ordering::Relaxed),
             self.shared.rx_bytes.swap(0, Ordering::Relaxed),
         )
+    }
+
+    /// Bytes read from the socket since the link was made: it changes while the peer sends.
+    pub(crate) fn rx_total(&self) -> u64 {
+        self.shared.rx_total.load(Ordering::Relaxed)
     }
 
     /// Try to connect; on success write `hello` (the queue stays closed until the peer answers).
@@ -601,6 +609,7 @@ fn reader(sh: &Shared, out: &Sender<RxEvent>, ev: &EventFd) {
                 Err(_) => break None,
             };
             sh.wire_rx.fetch_add(n as u64, Ordering::Relaxed);
+            sh.rx_total.fetch_add(n as u64, Ordering::Relaxed);
             rxw.extend_from_slice(&tmp[..n]);
             loop {
                 let had = rx.len();
