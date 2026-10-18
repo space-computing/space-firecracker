@@ -19,8 +19,8 @@
 //! each export goes on while the renderer sends, and ends when it is complete, when the
 //! renderer is gone, or after 2 s in which the renderer sent nothing. What an export that does
 //! not complete lacks is recorded in the side file (`scanout_missing`), and the snapshot is
-//! taken all the same; a rollback that lacks it asks for the redraw at once. Then the device
-//! closes its connections. The snapshot is a mark
+//! taken all the same; a rollback that lacks it logs it, and its redraw comes 2 s after the
+//! resume as after every rollback. Then the device closes its connections. The snapshot is a mark
 //! point of every connection (`Conn::marked`): a resource that is written after it is listed
 //! in an `SP_WMARK` again, so that a renderer that ran on after the snapshot can be reset to
 //! the snapshot's last message id.
@@ -158,7 +158,7 @@ pub struct GpuSideState {
     pub scanout_saved: Vec<(Vec<u8>, Vec<u8>)>,
     /// The resources the GPU wrote whose content the snapshot lacks (an export did not
     /// complete, or the renderer could not answer): a rollback that does not keep one of them
-    /// asks for the redraw at once.
+    /// logs it.
     pub scanout_missing: Vec<u32>,
 }
 

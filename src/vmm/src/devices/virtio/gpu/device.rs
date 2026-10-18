@@ -491,7 +491,8 @@ pub struct Gpu {
     pub(crate) scanout_saved: Vec<Piece>,
     /// The resources the GPU wrote whose content that snapshot lacks (an export did not
     /// complete, or the renderer could not answer): in the side file; a rollback that does not
-    /// keep one of them asks for the redraw at once. Dropped with `scanout_saved`.
+    /// keep one of them logs it (the redraw still comes 2 s after the resume). Dropped with
+    /// `scanout_saved`.
     pub(crate) saved_missing: Vec<u32>,
 
     /// A snapshot is being taken: no command of the guest is taken.
@@ -2153,7 +2154,7 @@ impl Gpu {
 
     fn log_incomplete(&mut self, why: &str) {
         self.log_info(&format!(
-            "spacebox remote gpu: snapshot: its GPU content is incomplete ({why}): {} resources not saved {:?}, recorded in the side file; a rollback to it that lacks them asks for the redraw at once",
+            "spacebox remote gpu: snapshot: its GPU content is incomplete ({why}): {} resources not saved {:?}, recorded in the side file; a rollback to it that lacks them logs it",
             self.saved_missing.len(),
             self.saved_missing
         ));
@@ -2423,16 +2424,17 @@ impl Gpu {
             .into_iter()
             .filter(|r| !sw.kept.contains(r) && written.contains(r))
             .collect();
-        if sw.from.is_none() && sw.reset_to != 0 && !lacking.is_empty() {
+        if sw.from.is_none() && sw.reset_to != 0 {
             // a rollback to a snapshot whose export did not complete: what the renderer lacks
-            // is drawn again at once (K6)
-            self.log_info(&format!(
-                "spacebox remote gpu: the snapshot's GPU content was incomplete: the resources {lacking:?} were not saved at the snapshot and the renderer did not keep them; the redraw is asked at once"
-            ));
-            self.redraw();
-        } else if sw.from.is_none() && sw.reset_to != 0 {
+            // holds nothing the guest drew until the redraw
+            if !lacking.is_empty() {
+                self.log_info(&format!(
+                    "spacebox remote gpu: the snapshot's GPU content was incomplete: the resources {lacking:?} were not saved at the snapshot and the renderer did not keep them"
+                ));
+            }
             // a rollback: what changed after the snapshot is drawn again (K6), but only 2 s
-            // after the VM resumes, so that the picture is first the snapshot's
+            // after the VM resumes, so that the picture is first the snapshot's (the user's
+            // choice, also for a snapshot whose GPU content is incomplete)
             match self.resumed_at {
                 Some(t) => self.redraw_at = Some(t + ROLLBACK_REDRAW_US),
                 None => self.redraw_after_resume = true,

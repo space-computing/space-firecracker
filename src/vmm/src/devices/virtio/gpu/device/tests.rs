@@ -1944,14 +1944,16 @@ fn the_side_files_record_of_missing_content_round_trips() {
 }
 
 #[test]
-fn a_rollback_to_an_incomplete_snapshot_asks_for_the_redraw_at_once() {
+fn a_rollback_to_an_incomplete_snapshot_logs_the_lack_and_redraws_2_s_after_the_resume() {
     let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
     let path = dir.as_path().join("gpu.sock");
     let agent_path = dir.as_path().join("vsock.sock_5000");
+    let log = dir.as_path().join("gpu.log");
     let listener = UnixListener::bind(&path).unwrap();
     let mem = single_region_mem(0x200000);
     let mut c = cfg(path.to_str().unwrap());
     c.agent_socket_path = Some(agent_path.to_str().unwrap().into());
+    c.stats_path = Some(log.to_str().unwrap().into());
     let mut r = rig_with(&mem, c);
     let (mut sink, last) = shown_texture(&mut r, &listener, false);
     let answer = std::thread::spawn(move || {
@@ -1966,9 +1968,11 @@ fn a_rollback_to_an_incomplete_snapshot_asks_for_the_redraw_at_once() {
     drop(r);
     drop(sink);
     let n = st.conns[USER].tx_id;
+    let lack = "the snapshot's GPU content was incomplete: the resources [5] were not saved";
 
     // Rolled back, and the renderer does not keep texture 5 (it changed after the snapshot):
-    // the redraw is asked at once, not 2 s after the resume.
+    // the lack is logged, and the redraw comes 2 s after the resume, as after every rollback
+    // (the user's choice), not before.
     let mut g = restored(&mem, &st);
     assert_eq!(g.saved_missing, [5]);
     g.process_retry();
@@ -1979,29 +1983,52 @@ fn a_rollback_to_an_incomplete_snapshot_asks_for_the_redraw_at_once() {
     assert_eq!((m.typ, m.arg0), (SP_STATE_RESET, n));
     sink.say(1, SP_STATE_KEPT, &[], &[], n);
     pump(&mut g, |g| g.switch.is_none());
-    assert!(!g.redraw_after_resume);
+    assert!(std::fs::read_to_string(&log).unwrap().contains(lack));
+    assert!(g.redraw_after_resume);
     assert_eq!(g.redraw_at, None);
+    assert!(!g.redraw_pending);
     assert!(g.saved_missing.is_empty());
-    // the agent is not connected yet (the VM is paused): it is asked as soon as it is
-    let t = Instant::now();
+    let t = now_us();
     g.kick();
+    let at = g.redraw_at.unwrap();
+    assert!(at >= t + 2_000_000 && at < now_us() + 2_000_000 + 1);
+    // the agent connects after the resume: it is not asked before the 2 s are over
     let mut guest = UnixStream::connect(&agent_path).unwrap();
     g.agent.as_mut().unwrap().accept().unwrap();
     g.agent_connected();
+    let mut got = [0u8; 7];
+    guest
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    while now_us() < at - 150_000 {
+        g.process_ack_timer();
+        guest.read_exact(&mut got).unwrap_err();
+    }
+    assert_eq!(g.redraw_at, Some(at));
+    assert!(
+        !std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("asked the guest agent to redraw")
+    );
+    // when it is due the ack timer asks for it
+    std::thread::sleep(Duration::from_micros(
+        u64::try_from(at - now_us()).unwrap_or(0) + 1000,
+    ));
     g.process_ack_timer();
+    assert_eq!(g.redraw_at, None);
     guest
         .set_read_timeout(Some(Duration::from_secs(1)))
         .unwrap();
-    let mut got = [0u8; 7];
     guest.read_exact(&mut got).unwrap();
     assert_eq!(&got, b"REDRAW\n");
-    assert!(t.elapsed() < Duration::from_secs(1));
+    assert!(now_us() >= t + 2_000_000);
     drop(g);
     drop(sink);
     drop(guest);
 
-    // The same snapshot, and a renderer that kept texture 5: nothing it needs is missing, and
-    // the redraw comes 2 s after the resume, as after a complete snapshot.
+    // The same snapshot, and a renderer that kept texture 5: nothing it needs is missing,
+    // nothing is logged as lacking, and the redraw comes 2 s after the resume as well.
+    std::fs::write(&log, b"").unwrap();
     let mut g = restored(&mem, &st);
     g.process_retry();
     let mut sink = sink_on(&listener);
@@ -2011,6 +2038,7 @@ fn a_rollback_to_an_incomplete_snapshot_asks_for_the_redraw_at_once() {
     assert_eq!((m.typ, m.arg0), (SP_STATE_RESET, n));
     sink.say(1, SP_STATE_KEPT, &5u32.to_le_bytes(), &[], n);
     pump(&mut g, |g| g.switch.is_none());
+    assert!(!std::fs::read_to_string(&log).unwrap().contains(lack));
     assert!(g.redraw_after_resume);
     assert!(!g.redraw_pending);
 }
