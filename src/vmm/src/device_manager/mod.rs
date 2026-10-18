@@ -462,12 +462,12 @@ impl DeviceManager {
     /// device is readied by `prepare_move` in the place of `prepare_save`.
     pub fn save_move(&self) -> DevicesState {
         let virtio_state = match &self.virtio_devices {
-            VirtioDevices::Mmio(mmio_devices) => VirtioDevicesState::Mmio(
-                mmio_devices.save_with(&|device| device.prepare_move()),
-            ),
-            VirtioDevices::Pci(pci_devices) => VirtioDevicesState::Pci(
-                pci_devices.save_with(&|device| device.prepare_move()),
-            ),
+            VirtioDevices::Mmio(mmio_devices) => {
+                VirtioDevicesState::Mmio(mmio_devices.save_with(&|device| device.prepare_move()))
+            }
+            VirtioDevices::Pci(pci_devices) => {
+                VirtioDevicesState::Pci(pci_devices.save_with(&|device| device.prepare_move()))
+            }
         };
 
         DevicesState {

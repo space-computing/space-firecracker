@@ -394,6 +394,9 @@ pub(crate) mod tests {
             },
             &mut fresh,
         ));
-        assert_eq!(read_gpu(&four), (Some(vec![8; 3]), vec![(1, Some(vec![3; 5]))]));
+        assert_eq!(
+            read_gpu(&four),
+            (Some(vec![8; 3]), vec![(1, Some(vec![3; 5]))])
+        );
     }
 }

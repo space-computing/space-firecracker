@@ -265,7 +265,9 @@ impl GpuSideState {
         let n = zstd_safe::decompress(&mut data[..], skeleton)
             .map_err(|code| GpuPersistError::Side(zstd_error("decompress", code)))?;
         if n != data.len() {
-            return Err(GpuPersistError::Side("the structure is shorter than it says".into()));
+            return Err(GpuPersistError::Side(
+                "the structure is shorter than it says".into(),
+            ));
         }
         let mut side: GpuSideState =
             bitcode::deserialize(&data).map_err(|e| GpuPersistError::Side(e.to_string()))?;
