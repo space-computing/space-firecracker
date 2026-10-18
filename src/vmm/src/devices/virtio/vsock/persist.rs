@@ -119,6 +119,10 @@ where
         vsock.avail_features = state.virtio_state.avail_features;
         vsock.device_state = DeviceState::Inactive;
         vsock.pending_event_ack = state.pending_event_ack;
+        // A snapshot published a reset event before it saved (`prepare_save`); a checkpoint
+        // did not (`prepare_checkpoint` keeps the connections), and the restored backend has
+        // none of them.
+        vsock.reset_on_kick = state.virtio_state.activated && !state.pending_event_ack;
         Ok(vsock)
     }
 }
@@ -169,6 +173,70 @@ pub(crate) mod tests {
             .unwrap();
             assert_eq!(restored.pending_event_ack, armed);
         }
+    }
+
+    #[test]
+    fn test_a_device_restored_from_a_checkpoint_resets_the_guests_connections_at_its_first_kick() {
+        use crate::devices::virtio::queue::VIRTQ_DESC_F_WRITE;
+        use crate::devices::virtio::vsock::device::EVQ_INDEX;
+
+        let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_event_handler_context();
+        // the event queue of the guest has a buffer for an event
+        ctx.guest_evvq.dtable[0].set(0x0040_2000, 4, VIRTQ_DESC_F_WRITE, 0);
+        ctx.guest_evvq.avail.ring[0].set(0);
+        ctx.guest_evvq.avail.idx.set(1);
+        ctx.device.queues[EVQ_INDEX] = ctx.guest_evvq.create_queue();
+        ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
+        // a checkpoint keeps the connections: no reset event is published
+        ctx.device.prepare_checkpoint();
+        assert!(!ctx.device.pending_event_ack);
+        let state = ctx.device.save();
+        assert!(state.virtio_state.activated && !state.pending_event_ack);
+        let mut restored = Vsock::restore(
+            VsockConstructorArgs {
+                mem: test_ctx.mem.clone(),
+                backend: TestBackend::new(),
+            },
+            &state,
+        )
+        .unwrap();
+        assert!(restored.reset_on_kick);
+        restored
+            .activate(test_ctx.mem.clone(), test_ctx.interrupt.clone())
+            .unwrap();
+        restored.kick();
+        assert!(restored.pending_event_ack);
+        assert!(!restored.reset_on_kick);
+        assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
+        // a later kick (a resume after a pause) publishes nothing more
+        restored.kick();
+        assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
+
+        // a snapshot published its reset before it saved: nothing more at the kick
+        ctx.device.pending_event_ack = true;
+        let state = ctx.device.save();
+        let restored = Vsock::restore(
+            VsockConstructorArgs {
+                mem: test_ctx.mem.clone(),
+                backend: TestBackend::new(),
+            },
+            &state,
+        )
+        .unwrap();
+        assert!(!restored.reset_on_kick);
+        // nor a device that the guest had not activated
+        let state = TestContext::new().device.save();
+        assert!(!state.virtio_state.activated);
+        let restored = Vsock::restore(
+            VsockConstructorArgs {
+                mem: test_ctx.mem.clone(),
+                backend: TestBackend::new(),
+            },
+            &state,
+        )
+        .unwrap();
+        assert!(!restored.reset_on_kick);
     }
 
     #[test]

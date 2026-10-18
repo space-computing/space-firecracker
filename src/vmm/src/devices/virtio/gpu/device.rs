@@ -126,6 +126,20 @@ const ROLLBACK_REDRAW_US: i64 = 2_000_000;
 /// A piece of a renderer's export, as an `SP_IMPORT` (the header, the bytes).
 type Piece = (Vec<u8>, Vec<u8>);
 
+/// What the device's last save was readied for (`prepare_save`, `prepare_move`,
+/// `prepare_checkpoint`): the saved state says what a rollback to it lacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SaveKind {
+    /// A snapshot: the device waited for its renderer and exported what the GPU drew.
+    Snapshot,
+    /// The stop of a move (a snapshot of the state only): nothing waited for, nothing exported;
+    /// the connections closed.
+    Move,
+    /// A checkpoint of a running guest: nothing waited for, nothing exported, the connections
+    /// kept.
+    Checkpoint,
+}
+
 /// How many of the resources shown last are exported first at a snapshot (the compositor's swap
 /// chain).
 const SCANOUT_KEEP: usize = 4;
@@ -499,6 +513,8 @@ pub struct Gpu {
 
     /// A snapshot is being taken: no command of the guest is taken.
     saving: bool,
+    /// What the last save was readied for.
+    pub(crate) save_kind: SaveKind,
     /// Which renderers were wanted before the snapshot closed the connections: wanted again
     /// when the VM resumes (`kick`).
     saved_wanted: Option<Vec<bool>>,
@@ -640,6 +656,7 @@ impl Gpu {
             scanout_saved: Vec::new(),
             saved_missing: Vec::new(),
             saving: false,
+            save_kind: SaveKind::Snapshot,
             saved_wanted: None,
             cfg,
         };
@@ -690,6 +707,10 @@ impl Gpu {
     fn log_error(&mut self, msg: &str) {
         error!("{msg}");
         self.report(msg);
+    }
+
+    pub(crate) fn log_error_line(&mut self, msg: &str) {
+        self.log_error(msg);
     }
 
     // ---- sending -------------------------------------------------------------------------
@@ -1920,6 +1941,10 @@ impl Gpu {
         if let Err(err) = self.process_ctrl_queue() {
             error!("gpu: control queue: {err}");
         }
+        if self.redraw_pending {
+            // a redraw that waited for the renderer (`redraw`)
+            self.redraw();
+        }
     }
 
     /// Renderer `ci` holds nothing of this guest.
@@ -2451,10 +2476,15 @@ impl Gpu {
     }
 
     /// Ask the guest agent to make every program draw again; if it is not connected (after a
-    /// restore it connects again), as soon as it is.
+    /// restore it connects again), as soon as it is, and only while the renderer that runs the
+    /// guest is there: the agent changes the monitor's scale and back, and the compositor that
+    /// applies a scale waits for its GPU work, so with no renderer it did not answer the agent
+    /// in time and the scale stayed changed (a takeover, fix-gpu, 2026-10-18). A redraw that
+    /// waits for the renderer is asked for when the renderer is paired again (`hello`).
     pub(crate) fn redraw(&mut self) {
+        let renderer = self.active_up();
         match self.agent.as_mut() {
-            Some(ag) if ag.is_connected() => {
+            Some(ag) if ag.is_connected() && renderer => {
                 ag.send(b"REDRAW\n");
                 self.redraw_pending = false;
                 self.log_info("spacebox remote gpu: asked the guest agent to redraw");
@@ -2854,6 +2884,45 @@ impl Gpu {
         self.saving = false;
     }
 
+    /// The stop of a move (a snapshot of the state only): the guest goes on at the destination,
+    /// whose device resumes the same renderer, so nothing is waited for and nothing is exported
+    /// (what was not answered or acknowledged is in the state and goes on there). The stop is a
+    /// mark point, and the connections close, as at a snapshot. A VM that goes on here after it
+    /// (the way back of a move whose destination ran) says that it was restored, so that a
+    /// renderer that the destination's device ran on goes back to this stop.
+    fn move_prepare(&mut self) {
+        let wanted = self.conns.iter().map(|c| c.wanted).collect();
+        let pending = self.pending.len();
+        let unacked: u64 = self
+            .conns
+            .iter()
+            .map(|c| c.link.lock().q.unacked as u64)
+            .sum();
+        for c in &mut self.conns {
+            c.marked.clear();
+            c.wanted = false;
+            c.restored = true;
+            if c.link.is_connected() {
+                c.link.disconnect();
+                c.hello_done = false;
+            }
+        }
+        self.saved_wanted.get_or_insert(wanted);
+        self.log_info(&format!(
+            "spacebox remote gpu: the stop of a move: {pending} commands not answered and {unacked} bytes not acknowledged go with the state; the connections closed"
+        ));
+    }
+
+    /// A checkpoint of a running guest: the guest goes on at once, so nothing is waited for,
+    /// nothing is exported and no connection closes. The checkpoint is a mark point of every
+    /// connection: a resource written after it is marked again, so that a renderer that ran on
+    /// after it can be reset to it (a takeover from it).
+    fn checkpoint_prepare(&mut self) {
+        for c in &mut self.conns {
+            c.marked.clear();
+        }
+    }
+
     /// The VM resumes (after a snapshot, or a restore): connect to the renderers again.
     fn resume_kick(&mut self) {
         let now = now_us();
@@ -3203,7 +3272,18 @@ impl VirtioDevice for Gpu {
     }
 
     fn prepare_save(&mut self) {
+        self.save_kind = SaveKind::Snapshot;
         self.save_prepare();
+    }
+
+    fn prepare_move(&mut self) {
+        self.save_kind = SaveKind::Move;
+        self.move_prepare();
+    }
+
+    fn prepare_checkpoint(&mut self) {
+        self.save_kind = SaveKind::Checkpoint;
+        self.checkpoint_prepare();
     }
 
     fn kick(&mut self) {
@@ -3215,7 +3295,9 @@ impl VirtioDevice for Gpu {
 }
 
 mod persist;
-pub use persist::{GpuConstructorArgs, GpuPersistError, GpuSideState, GpuState, side_path};
+pub use persist::{
+    GpuConstructorArgs, GpuPersistError, GpuSideState, GpuState, SIDE_LOST, SideParts, side_path,
+};
 
 #[cfg(test)]
 mod tests;

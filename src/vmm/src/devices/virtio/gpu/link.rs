@@ -30,6 +30,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 
+use gpu_journal::Blob;
 use vmm_sys_util::eventfd::EventFd;
 
 use super::protocol::{Filter, HDR_LEN, Hdr, SP_F_ZSTD, SP_HELLO, ZPacker, ZUnpacker};
@@ -67,10 +68,11 @@ impl DelayStat {
     }
 }
 
-/// One message as it goes on the wire before compression: header, a, b.
+/// One message as it goes on the wire before compression: header, a, b. Its bytes are shared
+/// with the snapshots and checkpoints that hold it as not acknowledged.
 #[derive(Debug)]
 pub(crate) struct TxBuf {
-    pub data: Vec<u8>,
+    pub data: Blob,
     pub t_us: i64,
     pub filter: Option<Filter>,
 }
@@ -121,7 +123,11 @@ impl TxQueue {
         self.backlog += data.len();
         self.unacked += data.len();
         self.entries.push_back(TxEntry {
-            buf: Arc::new(TxBuf { data, t_us, filter }),
+            buf: Arc::new(TxBuf {
+                data: Arc::new(data),
+                t_us,
+                filter,
+            }),
             id,
             writing: false,
         });
@@ -195,7 +201,7 @@ impl TxQueue {
     }
 
     /// The reliable messages the peer has not acknowledged, with their ids (for a snapshot).
-    pub(crate) fn unacked_messages(&self) -> Vec<(u64, Vec<u8>)> {
+    pub(crate) fn unacked_messages(&self) -> Vec<(u64, Blob)> {
         self.entries
             .iter()
             .filter(|e| e.id != 0)
@@ -205,7 +211,7 @@ impl TxQueue {
 
     /// The queue of a snapshot: the last id given out and the messages not acknowledged. The
     /// queue stays closed until the peer's HELLO.
-    pub(crate) fn restore(&mut self, tx_id: u64, unacked: &[(u64, Vec<u8>)], t_us: i64) {
+    pub(crate) fn restore(&mut self, tx_id: u64, unacked: &[(u64, Blob)], t_us: i64) {
         self.forget();
         for (id, data) in unacked {
             self.backlog += data.len();

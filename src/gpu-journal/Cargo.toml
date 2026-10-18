@@ -15,7 +15,7 @@ path = "src/bin/gpu-replay.rs"
 bench = false
 
 [dependencies]
-serde = { version = "1.0.228", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive", "rc"] }
 
 [lints]
 workspace = true

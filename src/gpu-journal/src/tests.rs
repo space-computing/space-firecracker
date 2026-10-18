@@ -171,6 +171,56 @@ fn uploads_kept_and_covered() {
 }
 
 #[test]
+fn blobs_split_and_put_back() {
+    let mut j = base();
+    let up = |j: &mut Journal, x: u32, v: u8| {
+        j.ctrl(
+            &req(
+                CMD_TRANSFER_TO_HOST_3D,
+                1,
+                &[x, 0, 0, 4, 1, 1, x * 4, 0, 5, 0, 256, 0],
+            ),
+            &[v; 16],
+            &mut none,
+        );
+    };
+    up(&mut j, 0, 1);
+    up(&mut j, 8, 2);
+    let blobs = j.blobs();
+    assert_eq!(blobs.len(), 2);
+    assert_eq!(j.blob_count(), 2);
+    // a copy shares the bytes: the same allocation, not a copy
+    let copy = j.clone();
+    assert!(Arc::ptr_eq(&copy.blobs()[0], &blobs[0]));
+    // the structure holds no bytes; put back, it rebuilds the same as the journal
+    let mut bare = j.without_blobs();
+    assert!(bare.blobs().iter().all(|b| b.is_empty()));
+    let bytes = bitcode_free_len(&bare);
+    assert!(bytes < 16);
+    let mut it = blobs.clone().into_iter();
+    bare.put_blobs(&mut it).unwrap();
+    assert!(it.next().is_none());
+    let all = BTreeSet::new();
+    assert_eq!(rebuilt(&bare, &all), rebuilt(&j, &all));
+    // fewer bytes than uploads
+    let mut short = j.without_blobs();
+    short
+        .put_blobs(&mut blobs[..1].iter().cloned())
+        .unwrap_err();
+    // a later upload is new bytes; the one it does not cover keeps its allocation
+    up(&mut j, 16, 3);
+    let after = j.blobs();
+    assert_eq!(after.len(), 3);
+    assert!(Arc::ptr_eq(&after[0], &blobs[0]));
+    assert!(Arc::ptr_eq(&after[1], &blobs[1]));
+}
+
+/// The bytes of the uploads that a journal holds.
+fn bitcode_free_len(j: &Journal) -> usize {
+    j.blobs().iter().map(|b| b.len()).sum()
+}
+
+#[test]
 fn in_stream_uploads() {
     let mut j = base();
     // a staging buffer 6 with backing

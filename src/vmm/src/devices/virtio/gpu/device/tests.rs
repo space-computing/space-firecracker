@@ -1430,7 +1430,9 @@ fn through_a_snapshot(gpu: &Gpu) -> GpuState {
     let mut st: GpuState = bitcode::deserialize(&bitcode::serialize(&st).unwrap()).unwrap();
     assert!(st.side.is_none());
     st.side = Some(Arc::new(
-        GpuSideState::read_from(&mut bytes.as_slice()).unwrap(),
+        GpuSideState::read_from(&mut bytes.as_slice())
+            .unwrap()
+            .unwrap(),
     ));
     st
 }
@@ -1654,6 +1656,172 @@ fn a_restored_device_rebuilds_a_renderer_that_does_not_know_it() {
     sink.say(1, SP_STATE_KEPT, &[], &[], 0);
     pump(&mut g, |g| g.switch.is_none());
     assert_eq!(sink.take(1), [(SP_CTRL, CMD_CTX_CREATE)]);
+}
+
+#[test]
+fn a_checkpoint_waits_for_nothing_keeps_the_connection_and_is_a_mark_point() {
+    let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+    let path = dir.as_path().join("gpu.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let mem = single_region_mem(0x200000);
+    let mut r = rig_with(&mem, cfg(path.to_str().unwrap()));
+    let (mut sink, tx_id) = paired_with_a_drawn_texture(&mut r, &listener);
+    assert!(r.gpu.conns[USER].marked.contains(&5));
+    // a fenced command that waits for the sink, not acknowledged
+    r.gpu.fence_window = 0;
+    r.give(submit(Some(7), 1, &[]));
+    assert_eq!(r.gpu.pending.len(), 1);
+    let t = Instant::now();
+    r.gpu.prepare_checkpoint();
+    assert!(t.elapsed() < Duration::from_millis(100));
+    // nothing answered here, nothing closed; a mark point
+    assert_eq!(r.gpu.pending.len(), 1);
+    assert!(r.gpu.conns[USER].link.is_connected());
+    assert!(r.gpu.conns[USER].hello_done);
+    assert!(r.gpu.conns[USER].wanted);
+    assert!(r.gpu.conns[USER].marked.is_empty());
+    // the side state has the command and the message, and no export
+    let st = through_a_snapshot(&r.gpu);
+    let side = st.side.as_ref().unwrap();
+    assert_eq!(side.pending.len(), 1);
+    assert_eq!(side.pending[0].fence_id, 7);
+    assert_eq!(
+        side.unacked[USER].iter().map(|m| m.0).collect::<Vec<_>>(),
+        [tx_id + 1]
+    );
+    assert!(side.scanout_saved.is_empty());
+    assert_eq!(st.conns[USER].tx_id, tx_id + 1);
+    // the guest goes on: the texture drawn again is marked again
+    r.give(submit(None, 1, &draw_into(5)));
+    let got: Vec<(u32, u32)> = (0..3)
+        .map(|_| {
+            let (m, a) = sink.next();
+            (m.typ, u32_at(&a, 0))
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (SP_CTRL, CMD_SUBMIT_3D),
+            (SP_WMARK, 5),
+            (SP_CTRL, CMD_SUBMIT_3D)
+        ]
+    );
+}
+
+#[test]
+fn the_stop_of_a_move_waits_for_nothing_and_the_destination_resumes_what_was_not_answered() {
+    let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+    let path = dir.as_path().join("gpu.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let mem = single_region_mem(0x200000);
+    let mut r = rig_with(&mem, cfg(path.to_str().unwrap()));
+    let (sink, tx_id) = paired_with_a_drawn_texture(&mut r, &listener);
+    r.gpu.fence_window = 0;
+    r.give(submit(Some(7), 1, &[]));
+    assert_eq!(r.gpu.pending.len(), 1);
+    let t = Instant::now();
+    r.gpu.prepare_move();
+    assert!(t.elapsed() < Duration::from_millis(100));
+    // closed, a mark point, the command still waits
+    assert!(!r.gpu.conns[USER].link.is_connected());
+    assert!(r.gpu.conns[USER].marked.is_empty());
+    assert!(!r.gpu.conns[USER].wanted);
+    assert_eq!(r.gpu.pending.len(), 1);
+    let st = through_a_snapshot(&r.gpu);
+    let side = st.side.as_ref().unwrap();
+    assert_eq!(side.pending.len(), 1);
+    assert_eq!(side.unacked[USER].len(), 1);
+    assert!(side.scanout_saved.is_empty());
+    assert!(st.conns[USER].wanted);
+    drop(sink);
+
+    // The destination resumes the same renderer, which lacks the command: it is sent again,
+    // and its answer completes the guest's command there.
+    let mut g = restored(&mem, &st);
+    g.process_retry();
+    let mut sink = sink_on(&listener);
+    sink.hello(0xabc, st.session, tx_id, false);
+    pump(&mut g, |g| g.conns[USER].hello_done);
+    assert!(g.switch.is_none());
+    let (m, a) = sink.next();
+    assert_eq!(
+        (m.typ, m.id, u32_at(&a, 0)),
+        (SP_CTRL, tx_id + 1, CMD_SUBMIT_3D)
+    );
+    sink.send(
+        Hdr {
+            typ: SP_RESP,
+            id: 1,
+            ack: m.id,
+            seq: m.seq,
+            a_len: 24,
+            ..Default::default()
+        },
+        &hdr(RESP_OK_NODATA, Some(7), 1),
+    );
+    pump(&mut g, |g| g.pending.is_empty());
+    drop(g);
+    drop(sink);
+
+    // The way back: the source goes on, and says that it was restored at its stop, so that a
+    // renderer that the destination ran on goes back to it.
+    r.gpu.kick();
+    r.gpu.process_retry();
+    let sink = sink_on(&listener);
+    let h = sink.last_hello.unwrap();
+    assert_eq!((h.seq, h.flags & SP_F_RESTORED), (tx_id + 1, SP_F_RESTORED));
+}
+
+#[test]
+fn a_device_whose_large_state_is_lost_is_restored_without_it() {
+    let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+    let path = dir.as_path().join("gpu.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let mem = single_region_mem(0x200000);
+    let mut r = rig_with(&mem, cfg(path.to_str().unwrap()));
+    let (sink, tx_id) = paired_with_a_drawn_texture(&mut r, &listener);
+    r.gpu.prepare_checkpoint();
+    let mut st = through_a_snapshot(&r.gpu);
+    drop(r);
+    drop(sink);
+    // the side file that says so
+    assert!(
+        GpuSideState::read_from(&mut SIDE_LOST.as_slice())
+            .unwrap()
+            .is_none()
+    );
+    st.side = None;
+    st.side_lost = true;
+    let mut g = restored(&mem, &st);
+    assert_eq!(g.session, st.session);
+    assert!(g.resources.is_empty());
+    assert_eq!(g.journal.stats().resources, 0);
+    assert!(g.pending.is_empty());
+    assert_eq!(g.conns[USER].link.lock().q.tx_id, tx_id);
+    // it names no session of a renderer: the renderer starts empty, and gets the (empty)
+    // journal
+    g.process_retry();
+    let mut sink = sink_on(&listener);
+    assert_eq!(sink.last_hello.unwrap().arg1, 0);
+    sink.hello(0xabc, st.session, tx_id, false);
+    pump(&mut g, |g| g.conns[USER].hello_done);
+    let (m, _) = sink.next();
+    assert_eq!((m.typ, m.arg0), (SP_STATE_RESET, 0));
+    sink.say(1, SP_STATE_KEPT, &[], &[], 0);
+    pump(&mut g, |g| g.switch.is_none());
+    // with no large state and no word that it is lost, the restore is refused
+    st.side_lost = false;
+    assert!(matches!(
+        Gpu::restore(
+            GpuConstructorArgs {
+                mem: mem.clone(),
+                filter: Arc::new(Vec::new()),
+            },
+            &st
+        ),
+        Err(GpuPersistError::NoSide)
+    ));
 }
 
 #[test]
@@ -1941,6 +2109,40 @@ fn the_side_files_record_of_missing_content_round_trips() {
     st.side.as_ref().unwrap().write_to(&mut bytes).unwrap();
     bytes[..8].copy_from_slice(b"SPGPU001");
     GpuSideState::read_from(&mut bytes.as_slice()).unwrap_err();
+}
+
+#[test]
+fn a_redraw_waits_until_the_renderer_is_paired() {
+    let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+    let path = dir.as_path().join("gpu.sock");
+    let agent_path = dir.as_path().join("vsock.sock_5000");
+    let listener = UnixListener::bind(&path).unwrap();
+    let mem = single_region_mem(0x200000);
+    let mut c = cfg(path.to_str().unwrap());
+    c.agent_socket_path = Some(agent_path.to_str().unwrap().into());
+    let mut r = rig_with(&mem, c);
+    let mut guest = UnixStream::connect(&agent_path).unwrap();
+    r.gpu.agent.as_mut().unwrap().accept().unwrap();
+    r.gpu.agent_connected();
+    guest
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    // no renderer: the compositor could not answer the agent's change of scale; it waits
+    r.gpu.redraw();
+    assert!(r.gpu.redraw_pending);
+    let mut got = [0u8; 7];
+    guest.read_exact(&mut got).unwrap_err();
+    // the renderer is paired: the redraw is asked for then
+    r.gpu.process_retry();
+    let mut sink = sink_on(&listener);
+    sink.hello(0xabc, r.gpu.session, 0, false);
+    pump(&mut r.gpu, |g| g.conns[USER].hello_done);
+    guest
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    guest.read_exact(&mut got).unwrap();
+    assert_eq!(&got, b"REDRAW\n");
+    assert!(!r.gpu.redraw_pending);
 }
 
 #[test]

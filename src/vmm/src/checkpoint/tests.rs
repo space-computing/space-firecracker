@@ -117,6 +117,8 @@ struct Seen {
     /// Offset, pages, data.
     records: Vec<(u64, u64, bool)>,
     state: Vec<u8>,
+    /// The GPU device's part (empty: the guest has no GPU device).
+    gpu: Vec<u8>,
 }
 
 impl Seen {
@@ -238,7 +240,7 @@ impl Place {
                 Begin::New => {
                     let h = read_exact(&mut s, 12).unwrap();
                     assert_eq!(&h[..4], b"SBFH");
-                    assert_eq!(be32(&h[4..]), 1);
+                    assert_eq!(be32(&h[4..]), 2);
                     let r = be32(&h[8..]) as usize;
                     let regions = read_exact(&mut s, 24 * r).unwrap();
                     assert_eq!(be64(&regions[8..]), MEM as u64);
@@ -260,7 +262,7 @@ impl Place {
                 }
             }
             loop {
-                let Some(h) = read_exact(&mut s, 28) else {
+                let Some(h) = read_exact(&mut s, 36) else {
                     return;
                 };
                 let held = match &h[..4] {
@@ -269,16 +271,19 @@ impl Place {
                     other => panic!("a frame begins with {other:?}"),
                 };
                 let n = be64(&h[4..]);
-                let (pages_len, state_len) = (be64(&h[12..]), be64(&h[20..]));
+                let (pages_len, state_len, gpu_len) =
+                    (be64(&h[12..]), be64(&h[20..]), be64(&h[28..]));
                 let (records, len) = read_records(&mut s, &image).unwrap();
                 assert_eq!(len as u64, pages_len);
                 let state = read_exact(&mut s, u64_to_usize(state_len)).unwrap();
+                let gpu = read_exact(&mut s, u64_to_usize(gpu_len)).unwrap();
                 assert_eq!(read_exact(&mut s, 4).unwrap(), b"SBCE");
                 frames.lock().unwrap().push(Seen {
                     n,
                     held,
                     records,
                     state,
+                    gpu,
                 });
                 while n >= answer_below.load(Ordering::SeqCst) {
                     if stop.load(Ordering::SeqCst) {
@@ -391,6 +396,8 @@ fn test_full_copy_frame_zero_and_frames() {
         state.data.vm_state.memory.regions[0].size, MEM,
         "the state of the guest"
     );
+    // A guest with no GPU device: the frame has no GPU part.
+    assert!(f0.gpu.is_empty());
 
     // Frame 1 has what changed since frame 0, and nothing else of the guest.
     write_page(&vmm, 7, 0x77);

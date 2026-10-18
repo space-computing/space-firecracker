@@ -458,6 +458,26 @@ impl DeviceManager {
         failed
     }
 
+    /// Saves the state of the devices for a snapshot of the state only (the stop of a move): each
+    /// device is readied by `prepare_move` in the place of `prepare_save`.
+    pub fn save_move(&self) -> DevicesState {
+        let virtio_state = match &self.virtio_devices {
+            VirtioDevices::Mmio(mmio_devices) => {
+                VirtioDevicesState::Mmio(mmio_devices.save_with(&|device| device.prepare_move()))
+            }
+            VirtioDevices::Pci(pci_devices) => {
+                VirtioDevicesState::Pci(pci_devices.save_with(&|device| device.prepare_move()))
+            }
+        };
+
+        DevicesState {
+            virtio_state,
+            mmio_platform_state: self.mmio_platform_devices.save(),
+            acpi_state: self.acpi_devices.save(),
+            serial_state: self.serial_state(),
+        }
+    }
+
     /// Saves the state of the devices for a checkpoint: each device is readied by
     /// `prepare_checkpoint` in the place of `prepare_save` (no `fsync` of a drive; vsock keeps
     /// its connections).
