@@ -6,6 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- [#6128](https://github.com/firecracker-microvm/firecracker/pull/6128),
+  [#6131](https://github.com/firecracker-microvm/firecracker/pull/6131),
+  [#6132](https://github.com/firecracker-microvm/firecracker/pull/6132),
+  [#6197](https://github.com/firecracker-microvm/firecracker/pull/6197): Added
+  an optional `num_queues` field to the virtio-block drive configuration. When
+  set, the drive exposes that number of queues to the guest and processes each
+  of them on a dedicated host worker thread instead of the VMM thread, enabling
+  virtio-blk multiqueue for values greater than `1`. The queue count cannot
+  exceed the vCPU count. Custom seccomp filters must include the new
+  `blk_worker` thread category. See
+  [block documentation](docs/block.md#threaded-mode-and-multiqueue).
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
 ## [1.17.0]
 
 ### Added

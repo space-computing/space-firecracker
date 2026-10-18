@@ -420,9 +420,11 @@ pub struct GuestMemorySlot<'a> {
     pub(crate) slice: VolatileSlice<'a, BS<'a, Option<AtomicBitmap>>>,
 }
 
-impl From<&GuestMemorySlot<'_>> for kvm_userspace_memory_region {
-    fn from(mem_slot: &GuestMemorySlot) -> Self {
-        let flags = if mem_slot.slice.bitmap().is_some() {
+impl GuestMemorySlot<'_> {
+    /// The KVM memory region of this slot, with KVM's dirty log on or off.
+    pub(crate) fn kvm_region(&self, log_dirty: bool) -> kvm_userspace_memory_region {
+        let mem_slot = self;
+        let flags = if log_dirty {
             KVM_MEM_LOG_DIRTY_PAGES
         } else {
             0
@@ -702,7 +704,7 @@ impl GuestRegionMmapExt {
 
         // Commit the bitmap only once the protection and the KVM slot have both changed, rolling
         // back the first step if the second fails. A failed rollback has no way back, so it panics.
-        let kvm_region = kvm_userspace_memory_region::from(mem_slot);
+        let kvm_region = mem_slot.kvm_region(vm.log_dirty());
         if plug {
             // make it accessible _before_ adding it to KVM
             mem_slot.protect(false)?;
@@ -1212,7 +1214,11 @@ impl GuestMemoryExtension for GuestMemoryMmap {
     fn discard_range(&self, addr: GuestAddress, range_len: usize) -> Result<(), GuestMemoryError> {
         self.try_for_each_region_in_range(addr, range_len, |region, start, len| {
             region.discard_range(start, len)
-        })
+        })?;
+        // The pages read as zeros from now on, with no write of the guest: under checkpoints
+        // they go to the receiving place as zeros.
+        crate::checkpoint::note_discarded(addr, range_len);
+        Ok(())
     }
 
     fn check_range_plugged(&self, addr: GuestAddress, len: usize) -> Result<(), GuestMemoryError> {

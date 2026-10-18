@@ -190,6 +190,9 @@ impl Vcpu {
         let vcpu_fd = self
             .copy_kvm_vcpu_fd(vm)
             .map_err(StartThreadedError::CopyFd)?;
+        // The statistics of the vCPU, opened here: KVM_GET_STATS_FD waits for the vCPU's lock,
+        // which KVM_RUN holds while the vCPU runs.
+        let stats = BlockingStat::open(&self.kvm_vcpu.fd).map(Arc::new);
         let vcpu_thread = thread::Builder::new()
             .name(format!("fc_vcpu {}", self.kvm_vcpu.index))
             .spawn(move || {
@@ -201,12 +204,9 @@ impl Vcpu {
             })
             .map_err(StartThreadedError::Spawn)?;
 
-        Ok(VcpuHandle::new(
-            event_sender,
-            response_receiver,
-            vcpu_fd,
-            vcpu_thread,
-        ))
+        let mut handle = VcpuHandle::new(event_sender, response_receiver, vcpu_fd, vcpu_thread);
+        handle.stats = stats;
+        Ok(handle)
     }
 
     /// Main loop of the vCPU thread.
@@ -577,6 +577,69 @@ impl fmt::Debug for VcpuResponse {
     }
 }
 
+/// The KVM statistic `blocking` of a vCPU: 1 while the thread of the vCPU sleeps in the kernel
+/// after a halt of the guest. It is read from the statistics file of the vCPU, with no lock of
+/// the vCPU and with no exit of the guest, from any thread.
+#[derive(Debug)]
+pub struct BlockingStat {
+    file: std::fs::File,
+    offset: u64,
+}
+
+/// `KVM_GET_STATS_FD`: `_IO(KVMIO, 0xce)`.
+const KVM_GET_STATS_FD: libc::c_ulong = 0xaece;
+
+impl BlockingStat {
+    /// Opens the statistics of the vCPU `fd` and finds `blocking`; None when KVM has no such
+    /// statistic.
+    pub fn open(fd: &kvm_ioctls::VcpuFd) -> Option<BlockingStat> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::fs::FileExt;
+
+        // SAFETY: an ioctl with no argument on a vCPU descriptor; it returns a new descriptor.
+        #[allow(clippy::cast_possible_truncation)]
+        let stats_fd = unsafe { libc::ioctl(fd.as_raw_fd(), KVM_GET_STATS_FD as _) };
+        if stats_fd < 0 {
+            return None;
+        }
+        // SAFETY: the descriptor is new and is owned here.
+        let file = unsafe { std::fs::File::from_raw_fd(stats_fd) };
+        // The header: flags, name_size, num_desc, id_offset, desc_offset, data_offset (u32 each).
+        let mut header = [0u8; 24];
+        file.read_exact_at(&mut header, 0).ok()?;
+        let word = |i: usize| u32::from_ne_bytes(header[4 * i..4 * i + 4].try_into().unwrap());
+        let (name_size, num_desc, desc_offset, data_offset) =
+            (word(1) as usize, word(2) as usize, word(4), word(5));
+        // A descriptor: flags u32, exponent i16, size u16, offset u32, bucket_size u32, name.
+        let desc_size = 16 + name_size;
+        let mut descs = vec![0u8; desc_size * num_desc];
+        file.read_exact_at(&mut descs, u64::from(desc_offset))
+            .ok()?;
+        for d in descs.chunks_exact(desc_size) {
+            let name = &d[16..];
+            let name = &name[..name.iter().position(|c| *c == 0).unwrap_or(name.len())];
+            let size = u16::from_ne_bytes([d[6], d[7]]);
+            if name == b"blocking" && size == 1 {
+                let offset = u32::from_ne_bytes(d[8..12].try_into().unwrap());
+                return Some(BlockingStat {
+                    file,
+                    offset: u64::from(data_offset) + u64::from(offset),
+                });
+            }
+        }
+        None
+    }
+
+    /// Whether the thread of the vCPU sleeps after a halt; None when it cannot be told.
+    pub fn read(&self) -> Option<bool> {
+        use std::os::unix::fs::FileExt;
+
+        let mut value = [0u8; 8];
+        self.file.read_exact_at(&mut value, self.offset).ok()?;
+        Some(u64::from_ne_bytes(value) != 0)
+    }
+}
+
 /// Wrapper over Vcpu that hides the underlying interactions with the Vcpu thread.
 #[derive(Debug)]
 pub struct VcpuHandle {
@@ -584,6 +647,8 @@ pub struct VcpuHandle {
     response_receiver: Receiver<VcpuResponse>,
     /// VcpuFd
     pub vcpu_fd: VcpuFd,
+    // The statistic `blocking` of the vCPU, for the checkpoints by need.
+    stats: Option<Arc<BlockingStat>>,
     // Rust JoinHandles have to be wrapped in Option if you ever plan on 'join()'ing them.
     // We want to be able to join these threads in tests.
     vcpu_thread: Option<thread::JoinHandle<()>>,
@@ -611,8 +676,14 @@ impl VcpuHandle {
             event_sender,
             response_receiver,
             vcpu_fd,
+            stats: None,
             vcpu_thread: Some(vcpu_thread),
         }
+    }
+
+    /// The statistic `blocking` of the vCPU, if KVM has it.
+    pub fn blocking_stat(&self) -> Option<Arc<BlockingStat>> {
+        self.stats.clone()
     }
     /// Sends event to vCPU.
     ///

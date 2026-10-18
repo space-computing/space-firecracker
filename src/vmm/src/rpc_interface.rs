@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fmt::{self, Debug};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use serde_json::Value;
 use utils::time::{ClockType, get_time_us};
@@ -13,6 +15,7 @@ use super::resources::VmResources;
 use super::{Vmm, VmmError};
 use crate::EventManager;
 use crate::builder::StartMicrovmError;
+use crate::checkpoint::CheckpointError;
 use crate::cpu_config::templates::{CustomCpuTemplate, GuestConfigError};
 use crate::device_manager::pci_mngr::PciManagerError;
 use crate::devices::virtio::balloon::device::{HintingStatus, StartHintingCmd};
@@ -29,6 +32,9 @@ use crate::vmm_config::balloon::{
     BalloonUpdateStatsConfig,
 };
 use crate::vmm_config::boot_source::{BootSourceConfig, BootSourceConfigError};
+use crate::vmm_config::checkpoint::{
+    CheckpointFinish, CheckpointInfo, CheckpointSetParams, CheckpointTrackParams,
+};
 use crate::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig, DriveError};
 use crate::vmm_config::entropy::{EntropyDeviceConfig, EntropyDeviceError};
 use crate::vmm_config::instance_info::InstanceInfo;
@@ -44,6 +50,7 @@ use crate::vmm_config::net::{
 use crate::vmm_config::pmem::{PmemConfig, PmemConfigError, PmemDeviceUpdateConfig};
 use crate::vmm_config::serial::SerialConfig;
 use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, SnapshotType};
+use crate::vmm_config::space::{FillStatus, MemoryRegions};
 use crate::vmm_config::vsock::{VsockConfigError, VsockDeviceConfig};
 use crate::vmm_config::{self, RateLimiterUpdate};
 
@@ -153,6 +160,22 @@ pub enum VmmAction {
     UpdateMachineConfiguration(MachineConfigUpdate),
     /// Hot-unplug a device.
     HotUnplugDevice(VirtioDeviceId),
+    /// Get the regions of guest memory (`GET /space/memory`).
+    GetSpaceMemory,
+    /// Start the fill of guest memory (`PUT /space/fill`).
+    StartSpaceFill,
+    /// Get what the fill of guest memory is doing (`GET /space/fill`).
+    GetSpaceFill,
+    /// Set and start the checkpoint mode (`PUT /space/checkpoint`).
+    SetCheckpoint(CheckpointSetParams),
+    /// Turn the tracking of changed pages on or off (`PUT /space/checkpoint/track`).
+    TrackCheckpoint(CheckpointTrackParams),
+    /// Take the last checkpoint and end the mode (`PUT /space/checkpoint/finish`).
+    FinishCheckpoint,
+    /// Let the held output go and end the mode (`PUT /space/checkpoint/release`).
+    ReleaseCheckpoint,
+    /// Get the state of the checkpoint mode (`GET /space/checkpoint`).
+    GetCheckpoint,
 }
 
 /// Wrapper for all errors associated with VMM actions.
@@ -218,6 +241,8 @@ pub enum VmmActionError {
     PciNotEnabled,
     /// PCI manager error: {0}
     PciManager(#[from] PciManagerError),
+    /// Checkpoints: {0}
+    Checkpoint(#[from] CheckpointError),
 }
 
 /// The enum represents the response sent by the VMM in case of success. The response is either
@@ -245,6 +270,14 @@ pub enum VmmData {
     VirtioMemStatus(VirtioMemStatus),
     /// The status of the virtio-balloon hinting run
     HintingStatus(HintingStatus),
+    /// The regions of guest memory.
+    SpaceMemory(MemoryRegions),
+    /// What the fill of guest memory is doing.
+    SpaceFill(FillStatus),
+    /// The state of the checkpoint mode.
+    Checkpoint(Box<CheckpointInfo>),
+    /// The last checkpoint of a finish.
+    CheckpointFinish(CheckpointFinish),
 }
 
 fn mmds_patch_data(
@@ -320,6 +353,9 @@ pub enum LoadSnapshotError {
     /// Failed to resume microVM: {0}
     ResumeMicrovm(#[from] VmmError),
 }
+
+/// The longest time for which the loop of a stopped guest waits for an API request.
+pub const STOPPED_LOOP_TICK: Duration = Duration::from_millis(100);
 
 /// Shorthand type for a request containing a boxed VmmAction.
 pub type ApiRequest = Box<VmmAction>;
@@ -515,7 +551,15 @@ impl<'a> PrebootApiController<'a> {
             | StartFreePageHinting(_)
             | GetFreePageHintingStatus
             | StopFreePageHinting
-            | HotUnplugDevice(_) => Err(VmmActionError::OperationNotSupportedPreBoot),
+            | HotUnplugDevice(_)
+            | GetSpaceMemory
+            | StartSpaceFill
+            | GetSpaceFill
+            | SetCheckpoint(_)
+            | TrackCheckpoint(_)
+            | FinishCheckpoint
+            | ReleaseCheckpoint
+            | GetCheckpoint => Err(VmmActionError::OperationNotSupportedPreBoot),
             #[cfg(target_arch = "x86_64")]
             SendCtrlAltDel => Err(VmmActionError::OperationNotSupportedPreBoot),
         }
@@ -531,6 +575,9 @@ impl<'a> PrebootApiController<'a> {
 
     fn insert_block_device(&mut self, cfg: BlockDeviceConfig) -> Result<VmmData, VmmActionError> {
         self.boot_path = true;
+        self.vm_resources
+            .machine_config
+            .validate_num_queues(&cfg.drive_id, cfg.num_queues)?;
         self.vm_resources
             .set_block_device(cfg)
             .map(|()| VmmData::Empty)
@@ -700,6 +747,14 @@ impl RuntimeApiController {
         event_manager: &mut EventManager,
     ) -> Result<VmmData, VmmActionError> {
         use self::VmmAction::*;
+        if !matches!(request, FinishCheckpoint) {
+            // The stop of a checkpoint that a finish left open (its hook has not answered) ends
+            // first: every other call waits for it, as it waits while a stop runs.
+            self.vmm
+                .lock()
+                .expect("Poisoned lock")
+                .checkpoint_end_open_stop();
+        }
         match request {
             // Supported operations allowed post-boot.
             CreateSnapshot(snapshot_create_cfg) => self.create_snapshot(&snapshot_create_cfg),
@@ -844,6 +899,49 @@ impl RuntimeApiController {
                 .update_memory_hotplug_size(cfg.requested_size_mib)
                 .map(|_| VmmData::Empty)
                 .map_err(VmmActionError::MemoryHotplugUpdate),
+            GetSpaceMemory => Ok(VmmData::SpaceMemory(
+                self.vmm.lock().expect("Poisoned lock").memory_regions(),
+            )),
+            StartSpaceFill => self
+                .vmm
+                .lock()
+                .expect("Poisoned lock")
+                .start_fill()
+                .map(|()| VmmData::Empty)
+                .map_err(VmmActionError::InternalVmm),
+            GetSpaceFill => Ok(VmmData::SpaceFill(
+                self.vmm.lock().expect("Poisoned lock").fill_status(),
+            )),
+            SetCheckpoint(params) => {
+                self.vmm
+                    .lock()
+                    .expect("Poisoned lock")
+                    .checkpoint_set(&params)?;
+                Ok(VmmData::Empty)
+            }
+            TrackCheckpoint(params) => {
+                self.vmm
+                    .lock()
+                    .expect("Poisoned lock")
+                    .checkpoint_track(&params)?;
+                Ok(VmmData::Empty)
+            }
+            FinishCheckpoint => Ok(VmmData::CheckpointFinish(
+                self.vmm
+                    .lock()
+                    .expect("Poisoned lock")
+                    .checkpoint_finish()?,
+            )),
+            ReleaseCheckpoint => {
+                self.vmm
+                    .lock()
+                    .expect("Poisoned lock")
+                    .checkpoint_release()?;
+                Ok(VmmData::Empty)
+            }
+            GetCheckpoint => Ok(VmmData::Checkpoint(Box::new(
+                self.vmm.lock().expect("Poisoned lock").checkpoint_info(),
+            ))),
             // Operations not allowed post-boot.
             ConfigureBootSource(_)
             | ConfigureLogger(_)
@@ -864,6 +962,45 @@ impl RuntimeApiController {
     /// Creates a new `RuntimeApiController`.
     pub fn new(vmm: Arc<Mutex<Vmm>>) -> Self {
         Self { vmm }
+    }
+
+    /// Serves API requests while the guest is stopped, with no turn of the event loop, so that
+    /// no device runs: the stop of every kind (a pause request, the end of a lease, a disk
+    /// error, a load with no resume) freezes the devices. `recv` waits at most its argument
+    /// for the next request and `respond` answers it. Returns when a resume succeeded (a
+    /// refused or failed resume leaves the guest stopped and the loop going on) or when the
+    /// VMM is to exit. Wakes at least each [`STOPPED_LOOP_TICK`] for [`Vmm::stopped_tick`], and
+    /// when one of the descriptors that `recv` gets is ready (the events of the checkpoint loop,
+    /// which a stopped guest keeps).
+    pub fn serve_while_stopped<R, S>(
+        &mut self,
+        event_manager: &mut EventManager,
+        mut recv: R,
+        mut respond: S,
+    ) where
+        R: FnMut(Duration, &[std::os::fd::RawFd]) -> Result<ApiRequest, RecvTimeoutError>,
+        S: FnMut(ApiResponse),
+    {
+        loop {
+            let fds = {
+                let vmm = self.vmm.lock().expect("Poisoned lock");
+                if !vmm.is_stopped() || vmm.shutdown_exit_code().is_some() {
+                    return;
+                }
+                vmm.stopped_wait_fds()
+            };
+            match recv(STOPPED_LOOP_TICK, &fds) {
+                Ok(request) => {
+                    let response = self.handle_request(*request, event_manager);
+                    respond(Box::new(response));
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    panic!("The channel's sending half was disconnected. Cannot receive data.")
+                }
+            }
+            self.vmm.lock().expect("Poisoned lock").stopped_tick();
+        }
     }
 
     /// Pauses the microVM by pausing the vCPUs.
@@ -926,6 +1063,14 @@ impl RuntimeApiController {
         }
 
         let mut locked_vmm = self.vmm.lock().unwrap();
+        if create_params.mem_file_path.is_some() && locked_vmm.checkpoint_owns_dirty_pages() {
+            // Such a snapshot reads and resets the dirty bitmaps that the checkpoints rely on.
+            return Err(VmmActionError::Checkpoint(CheckpointError::Refused(
+                "A snapshot with memory is refused while the checkpoint mode or its tracking \
+                 runs"
+                    .into(),
+            )));
+        }
         let vm_info = VmInfo::from(&*locked_vmm);
         let create_start_us = get_time_us(ClockType::Monotonic);
 
@@ -1207,6 +1352,9 @@ mod tests {
             );
         }
 
+        check_unsupported(preboot_request(VmmAction::GetSpaceMemory));
+        check_unsupported(preboot_request(VmmAction::StartSpaceFill));
+        check_unsupported(preboot_request(VmmAction::GetSpaceFill));
         check_unsupported(preboot_request(VmmAction::FlushMetrics));
         check_unsupported(preboot_request(VmmAction::Pause));
         check_unsupported(preboot_request(VmmAction::Resume));
@@ -1241,7 +1389,7 @@ mod tests {
             CreateSnapshotParams {
                 snapshot_type: SnapshotType::Full,
                 snapshot_path: PathBuf::new(),
-                mem_file_path: PathBuf::new(),
+                mem_file_path: Some(PathBuf::new()),
                 sync_snapshot_files: true,
             },
         )));
@@ -1259,6 +1407,101 @@ mod tests {
         let mut runtime = RuntimeApiController::new(vmm.clone());
         let mut event_manager = EventManager::new().unwrap();
         runtime.handle_request(request, &mut event_manager)
+    }
+
+    #[test]
+    fn test_runtime_space() {
+        match runtime_request(VmmAction::GetSpaceMemory).unwrap() {
+            VmmData::SpaceMemory(regions) => {
+                assert!(!regions.regions.is_empty());
+                assert_eq!(regions.regions[0].offset, 0);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            runtime_request(VmmAction::GetSpaceFill).unwrap(),
+            VmmData::SpaceFill(FillStatus::default())
+        );
+        // The default Vmm of the tests has no fill thread.
+        runtime_request(VmmAction::StartSpaceFill).unwrap_err();
+    }
+
+    /// A runtime controller over a Vmm that counts as running (it has no vCPU threads).
+    fn running_runtime() -> (Arc<Mutex<Vmm>>, RuntimeApiController) {
+        let vmm = Arc::new(Mutex::new(default_vmm()));
+        vmm.lock().unwrap().instance_info.state =
+            crate::vmm_config::instance_info::VmState::Running;
+        let runtime = RuntimeApiController::new(vmm.clone());
+        (vmm, runtime)
+    }
+
+    #[test]
+    fn test_stopped_loop_leaves_only_on_a_successful_resume() {
+        use crate::vmm_config::instance_info::{PausedReason, VmState};
+
+        let (vmm, mut runtime) = running_runtime();
+        let mut event_manager = EventManager::new().unwrap();
+        runtime
+            .handle_request(VmmAction::Pause, &mut event_manager)
+            .unwrap();
+        assert!(vmm.lock().unwrap().is_stopped());
+        vmm.lock()
+            .unwrap()
+            .refuse_resume(Some("the lease is over".to_string()));
+
+        // What the API sends, one step at each wait of the loop.
+        let mut calls = 0;
+        let mut responses = Vec::new();
+        let loop_vmm = vmm.clone();
+        runtime.serve_while_stopped(
+            &mut event_manager,
+            |timeout, _| {
+                assert_eq!(timeout, STOPPED_LOOP_TICK);
+                calls += 1;
+                match calls {
+                    // A refused resume.
+                    1 => Ok(Box::new(VmmAction::Resume)),
+                    // A wait with no request: the loop wakes and goes on.
+                    2 => Err(RecvTimeoutError::Timeout),
+                    3 => Ok(Box::new(VmmAction::GetVmInstanceInfo)),
+                    // The refusal ends; the next resume succeeds and the loop ends.
+                    4 => {
+                        loop_vmm.lock().unwrap().refuse_resume(None);
+                        Ok(Box::new(VmmAction::Resume))
+                    }
+                    _ => panic!("the loop did not end at a successful resume"),
+                }
+            },
+            |response| responses.push(*response),
+        );
+        assert_eq!(calls, 4);
+        assert_eq!(responses.len(), 3);
+        assert!(matches!(
+            &responses[0],
+            Err(VmmActionError::InternalVmm(VmmError::ResumeRefused(_)))
+        ));
+        match &responses[1] {
+            Ok(VmmData::InstanceInformation(info)) => {
+                assert_eq!(info.state, VmState::Paused);
+                assert_eq!(info.paused_reason, Some(PausedReason::Api));
+                assert!(!info.ran_since_load);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(responses[2].as_ref().unwrap(), &VmmData::Empty);
+        assert!(!vmm.lock().unwrap().is_stopped());
+        assert!(vmm.lock().unwrap().instance_info.ran_since_load);
+    }
+
+    #[test]
+    fn test_stopped_loop_ends_at_once_for_a_running_guest() {
+        let (_vmm, mut runtime) = running_runtime();
+        let mut event_manager = EventManager::new().unwrap();
+        runtime.serve_while_stopped(
+            &mut event_manager,
+            |_, _| panic!("a running guest waits for no request here"),
+            |_| {},
+        );
     }
 
     #[test]

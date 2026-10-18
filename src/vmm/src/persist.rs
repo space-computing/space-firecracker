@@ -162,8 +162,10 @@ pub enum CreateSnapshotError {
     SnapshotBackingFile(&'static str, io::Error),
 }
 
-/// Snapshot version
-pub const SNAPSHOT_VERSION: Version = Version::new(12, 0, 0);
+/// Snapshot version. Majors 13 and 14 are the fork's: the state of a block device holds the
+/// requests that a disk error kept (13), for each of its queues, with the number of its queues
+/// and the poll window of their worker threads (14).
+pub const SNAPSHOT_VERSION: Version = Version::new(14, 0, 0);
 
 /// Creates a Microvm snapshot.
 pub fn create_snapshot(
@@ -181,13 +183,18 @@ pub fn create_snapshot(
         params.sync_snapshot_files,
     )?;
 
+    // A snapshot of the state only: no memory is written and no dirty bitmap is read or reset.
+    let Some(mem_file_path) = &params.mem_file_path else {
+        return Ok(());
+    };
+
     let kvm_vm = vmm.vm.as_kvm().ok_or_else(|| {
         CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(
             "snapshot requires KVM".into(),
         ))
     })?;
     kvm_vm.snapshot_memory_to_file(
-        &params.mem_file_path,
+        mem_file_path,
         params.snapshot_type,
         params.sync_snapshot_files,
     )?;
@@ -464,7 +471,6 @@ pub fn restore_from_snapshot(
                 guest_memory_from_file(
                     mem_backend_path,
                     mem_state,
-                    track_dirty_pages,
                     vm_resources.machine_config.huge_pages,
                 )
                 .map_err(RestoreFromSnapshotGuestMemoryError::File)?,
@@ -474,7 +480,6 @@ pub fn restore_from_snapshot(
         MemBackendType::Uffd => guest_memory_from_uffd(
             mem_backend_path,
             mem_state,
-            track_dirty_pages,
             vm_resources.machine_config.huge_pages,
         )
         .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
@@ -525,15 +530,15 @@ pub enum GuestMemoryFromFileError {
     HugetlbfsSnapshot,
 }
 
+// Firecracker's own bitmap of changed pages exists for every guest from its load: the
+// checkpoint loop may track a guest that was loaded with no `track_dirty_pages`.
 fn guest_memory_from_file(
     mem_file_path: &Path,
     mem_state: &GuestMemoryState,
-    track_dirty_pages: bool,
     huge_pages: HugePageConfig,
 ) -> Result<Vec<GuestRegionMmap>, GuestMemoryFromFileError> {
     let mem_file = File::open(mem_file_path)?;
-    let guest_mem =
-        memory::snapshot_file(mem_file, mem_state.regions(), track_dirty_pages, huge_pages)?;
+    let guest_mem = memory::snapshot_file(mem_file, mem_state.regions(), true, huge_pages)?;
     Ok(guest_mem)
 }
 
@@ -555,11 +560,9 @@ pub enum GuestMemoryFromUffdError {
 fn guest_memory_from_uffd(
     mem_uds_path: &Path,
     mem_state: &GuestMemoryState,
-    track_dirty_pages: bool,
     huge_pages: HugePageConfig,
 ) -> Result<(Vec<GuestRegionMmap>, Option<Uffd>), GuestMemoryFromUffdError> {
-    let (guest_memory, backend_mappings) =
-        create_guest_memory(mem_state, track_dirty_pages, huge_pages)?;
+    let (guest_memory, backend_mappings) = create_guest_memory(mem_state, huge_pages)?;
 
     let mut uffd_builder = UffdBuilder::new();
 
@@ -588,10 +591,9 @@ fn guest_memory_from_uffd(
 
 fn create_guest_memory(
     mem_state: &GuestMemoryState,
-    track_dirty_pages: bool,
     huge_pages: HugePageConfig,
 ) -> Result<(Vec<GuestRegionMmap>, Vec<GuestRegionUffdMapping>), GuestMemoryFromUffdError> {
-    let guest_memory = memory::anonymous(mem_state.regions(), track_dirty_pages, huge_pages)?;
+    let guest_memory = memory::anonymous(mem_state.regions(), true, huge_pages)?;
     let mut backend_mappings = Vec::with_capacity(guest_memory.len());
     let mut offset = 0;
     for mem_region in guest_memory.iter() {
@@ -773,7 +775,7 @@ mod tests {
             #[cfg(target_arch = "aarch64")]
             vm_state: vmm.vm.as_kvm().unwrap().save_state(&mpidrs).unwrap(),
             #[cfg(target_arch = "x86_64")]
-            vm_state: vmm.vm.as_kvm().unwrap().save_state().unwrap(),
+            vm_state: vmm.vm.as_kvm().unwrap().save_state(None).unwrap(),
         };
 
         let serialized_data = bitcode::serialize(&microvm_state).unwrap();
@@ -801,8 +803,7 @@ mod tests {
             }],
         };
 
-        let (_, uffd_regions) =
-            create_guest_memory(&mem_state, false, HugePageConfig::None).unwrap();
+        let (_, uffd_regions) = create_guest_memory(&mem_state, HugePageConfig::None).unwrap();
 
         assert_eq!(uffd_regions.len(), 1);
         assert_eq!(uffd_regions[0].size, 0x20000);

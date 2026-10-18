@@ -38,6 +38,7 @@ use crate::devices::virtio::vsock::persist::{
 use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
 use crate::mmds::data_store::MmdsVersion;
 use crate::resources::VmResources;
+use crate::seccomp::BpfProgram;
 use crate::snapshot::Persist;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vstate::memory::GuestMemoryMmap;
@@ -137,6 +138,7 @@ pub struct MMIODevManagerConstructorArgs<'a> {
     pub event_manager: &'a mut EventManager,
     pub vm_resources: &'a mut VmResources,
     pub instance_id: &'a str,
+    pub blk_worker_filter: Option<Arc<BpfProgram>>,
 }
 
 pub struct MMIOPlatformDevicesConstructorArgs<'a> {
@@ -266,12 +268,10 @@ impl<'a> Persist<'a> for MMIOPlatformDevices {
     }
 }
 
-impl<'a> Persist<'a> for MMIOVirtioDevices {
-    type State = DeviceStates;
-    type ConstructorArgs = MMIODevManagerConstructorArgs<'a>;
-    type Error = DevicePersistError;
-
-    fn save(&self) -> Self::State {
+impl MMIOVirtioDevices {
+    /// Saves the state of the devices; `prepare` readies each device first (`prepare_save`
+    /// for a snapshot, `prepare_checkpoint` for a checkpoint).
+    pub(crate) fn save_with(&self, prepare: &dyn Fn(&mut dyn VirtioDevice)) -> DeviceStates {
         let mut states = DeviceStates::default();
 
         let _: Result<(), ()> = self.for_each_virtio_mmio_device(|_, devid, device| {
@@ -280,7 +280,7 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
             // We need to call `prepare_save()` on the device before saving the transport
             // so that, if we modify the transport state while preparing the device, e.g. sending
             // an interrupt to the guest, this is correctly captured in the saved transport state.
-            locked_device.prepare_save();
+            prepare(&mut *locked_device);
             let transport_state = mmio_transport_locked.save();
             let device_info = device.resources;
             let device_id = devid.clone();
@@ -397,6 +397,16 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
         });
         states
     }
+}
+
+impl<'a> Persist<'a> for MMIOVirtioDevices {
+    type State = DeviceStates;
+    type ConstructorArgs = MMIODevManagerConstructorArgs<'a>;
+    type Error = DevicePersistError;
+
+    fn save(&self) -> Self::State {
+        self.save_with(&|device| device.prepare_save())
+    }
 
     fn restore(
         constructor_args: Self::ConstructorArgs,
@@ -478,6 +488,11 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
                 BlockConstructorArgs { mem: mem.clone() },
                 &block_state.device_state,
             )?));
+
+            device
+                .lock()
+                .expect("Poisoned lock")
+                .spawn_worker(constructor_args.blk_worker_filter.clone())?;
 
             constructor_args
                 .vm_resources
@@ -806,6 +821,7 @@ mod tests {
             event_manager: &mut event_manager,
             vm_resources,
             instance_id: "microvm-id",
+            blk_worker_filter: None,
         };
         let _restored_dev_manager = MMIOVirtioDevices::restore(restore_args, mmio_state).unwrap();
 
@@ -826,6 +842,8 @@ mod tests {
       "cache_type": "Unsafe",
       "is_read_only": true,
       "discard": false,
+      "num_queues": null,
+      "poll_us": null,
       "path_on_host": "{}",
       "rate_limiter": null,
       "io_engine": "Sync",

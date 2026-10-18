@@ -16,6 +16,8 @@ use libc::{EAGAIN, iovec};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::NET_QUEUE_MAX_SIZE;
+use crate::checkpoint::hold::{HOLD, HeldQueue};
+use crate::checkpoint::lease::host_us;
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::device::{ActiveState, DeviceState, VirtioDevice, VirtioDeviceType};
 use crate::devices::virtio::generated::virtio_config::VIRTIO_F_VERSION_1;
@@ -33,7 +35,9 @@ use crate::devices::virtio::net::tap::Tap;
 use crate::devices::virtio::net::{
     MAX_BUFFER_SIZE, NET_QUEUE_SIZES, NetError, NetQueue, RX_INDEX, TX_INDEX, generated,
 };
-use crate::devices::virtio::queue::{DescriptorChain, InvalidAvailIdx, Queue};
+use crate::devices::virtio::queue::{
+    DescriptorChain, InvalidAvailIdx, Queue, QueueConfig, QueueError,
+};
 use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
 use crate::devices::{DeviceError, report_net_event_fail};
 use crate::dumbo::pdu::arp::ETH_IPV4_FRAME_LEN;
@@ -280,6 +284,9 @@ pub struct Net {
 
     tx_buffer: IoVecBuffer,
     pub(crate) rx_buffer: RxBuffers,
+
+    /// The frames that the guest sent while the output is held under checkpoints.
+    held: HeldQueue,
 }
 
 impl Net {
@@ -345,6 +352,7 @@ impl Net {
             metrics: NetMetricsPerDevice::alloc(id),
             tx_buffer: Default::default(),
             rx_buffer: RxBuffers::new()?,
+            held: HeldQueue::default(),
         })
     }
 
@@ -527,6 +535,7 @@ impl Net {
     // Tries to detour the frame to MMDS and if MMDS doesn't accept it, sends it on the host TAP.
     //
     // Returns whether MMDS consumed the frame.
+    #[allow(clippy::too_many_arguments)]
     fn write_to_mmds_or_tap(
         mmds_ns: Option<&mut MmdsNetworkStack>,
         rate_limiter: &mut RateLimiter,
@@ -535,6 +544,7 @@ impl Net {
         tap: &mut Tap,
         guest_mac: Option<MacAddr>,
         net_metrics: &NetDeviceMetrics,
+        held: Option<(&mut HeldQueue, &str)>,
     ) -> Result<bool, NetError> {
         // There is a potential for a TOCTOU race condition here where,
         // when MMDS is enabled, the guest can rewrite packet headers between
@@ -603,6 +613,19 @@ impl Net {
                     net_metrics.tx_spoofed_mac_count.inc();
                 }
             });
+        }
+
+        // While the output is held under checkpoints the frame, with its virtio-net header,
+        // waits for the answer to the checkpoint that covers it; its descriptor goes back to
+        // the guest now.
+        if let Some((queue, id)) = held
+            && HOLD.holding()
+        {
+            let mut frame = vec![0u8; frame_iovec.len() as usize];
+            if frame_iovec.read_exact_volatile_at(&mut frame, 0).is_ok() {
+                queue.take(id, &frame, vnet_hdr_len(), host_us());
+            }
+            return Ok(false);
         }
 
         let _metric = net_metrics.tap_write_agg.record_latency_metrics();
@@ -787,6 +810,7 @@ impl Net {
                 &mut self.tap,
                 self.guest_mac,
                 &self.metrics,
+                Some((&mut self.held, &self.id)),
             )
             .unwrap_or(false);
             if frame_consumed_by_mmds && self.rx_buffer.used_bytes == 0 {
@@ -882,6 +906,53 @@ impl Net {
 
     fn write_tap(tap: &mut Tap, buf: &IoVecBuffer) -> std::io::Result<usize> {
         tap.write_iovec(buf)
+    }
+
+    /// Writes the held frames up to the mark `upto` to the tap, in their order.
+    pub fn release_held(&mut self, upto: u64) {
+        let tap = &mut self.tap;
+        let metrics = &self.metrics;
+        self.held.release(upto, |frame| match tap.write_buf(frame) {
+            Ok(_) => {
+                let len = frame.len() as u64;
+                metrics.tx_bytes_count.add(len);
+                metrics.tx_packets_count.inc();
+                metrics.tx_count.inc();
+            }
+            Err(err) => {
+                error!("Failed to write a held frame to tap: {:?}", err);
+                metrics.tap_write_fails.inc();
+            }
+        });
+    }
+
+    /// Throws the held frames away.
+    pub fn discard_held(&mut self) {
+        self.held.discard();
+    }
+
+    /// The frames that this device holds.
+    pub fn held_frames(&self) -> usize {
+        self.held.len()
+    }
+
+    /// Holds `frame` as if the guest had sent it (for tests of the checkpoint loop).
+    #[cfg(test)]
+    pub(crate) fn hold_for_test(&mut self, frame: &[u8]) -> bool {
+        self.held.take(&self.id, frame, vnet_hdr_len(), host_us())
+    }
+
+    /// After the stop of a checkpoint of a running guest: the receive buffers, which the state
+    /// rewound, are parsed again, as if the guest had posted them.
+    pub fn kick_receive(&mut self) {
+        if self.is_activated()
+            && let Err(err) = self.queue_evts[RX_INDEX].write(1)
+        {
+            error!(
+                "Failed to kick the receive queue after a checkpoint: {}",
+                err
+            );
+        }
     }
 
     /// Process a single RX queue event.
@@ -1009,16 +1080,20 @@ impl VirtioDevice for Net {
         self.acked_features = acked_features;
     }
 
-    fn queues(&self) -> &[Queue] {
-        &self.queues
+    fn num_queues(&self) -> usize {
+        self.queues.len()
     }
 
-    fn queues_mut(&mut self) -> &mut [Queue] {
-        &mut self.queues
+    fn queue_config(&self, index: usize) -> Option<&QueueConfig> {
+        self.queues.get(index).map(|queue| &queue.config)
     }
 
-    fn queue_events(&self) -> &[EventFd] {
-        &self.queue_evts
+    fn queue_config_mut(&mut self, index: usize) -> Option<&mut QueueConfig> {
+        self.queues.get_mut(index).map(|queue| &mut queue.config)
+    }
+
+    fn queue_event(&self, index: usize) -> Option<&EventFd> {
+        self.queue_evts.get(index)
     }
 
     fn interrupt_trigger(&self) -> &dyn VirtioInterrupt {
@@ -1088,6 +1163,17 @@ impl VirtioDevice for Net {
         self.rx_buffer.clear();
         self.tx_buffer.clear();
         true
+    }
+
+    fn reset_queues(&mut self) {
+        self.queues.iter_mut().for_each(Queue::reset);
+    }
+
+    fn mark_queue_memory_dirty(&mut self, mem: &GuestMemoryMmap) -> Result<(), QueueError> {
+        for queue in &mut self.queues {
+            queue.initialize(mem)?;
+        }
+        Ok(())
     }
 
     /// Prepare saving state
@@ -2009,6 +2095,67 @@ pub mod tests {
         assert_eq!(&buf[..600], &frame_2[..600]);
     }
 
+    #[test]
+    fn test_tx_held_until_released() {
+        HOLD.reset_for_test();
+        let mem = single_region_mem(2 * MAX_BUFFER_SIZE);
+        let mut th = TestHelper::get_default(&mem);
+        th.activate_net();
+        let tap_traffic_simulator = TapTrafficSimulator::new(if_index(&th.net().tap));
+        let start = HOLD.counts();
+
+        // The hold is on, and the open number is 4.
+        HOLD.set(true, 4);
+        let desc_list = [(0, 50, 0), (1, 100, 0), (2, 150, 0)];
+        th.add_desc_chain(NetQueue::Tx, 0, &desc_list);
+        let frame_1 = th.write_tx_frame(&desc_list, 300);
+        check_metric_after_block!(
+            th.net().metrics.tx_packets_count,
+            0,
+            th.event_manager.run_with_timeout(100).unwrap()
+        );
+        // The descriptor went back to the guest; the frame waits, with its virtio-net header.
+        assert_eq!(th.txq.used.idx.get(), 1);
+        th.txq.check_used_elem(0, 0, 0);
+        assert_eq!(th.net().held_frames(), 1);
+        assert_eq!(HOLD.waiting().0, 1);
+
+        // The mark of checkpoint 4; the next frame waits for 5.
+        HOLD.mark(4);
+        let desc_list = [(3, 100, 0), (4, 200, 0), (5, 300, 0)];
+        th.add_desc_chain(NetQueue::Tx, 500, &desc_list);
+        let frame_2 = th.write_tx_frame(&desc_list, 600);
+        th.event_manager.run_with_timeout(100).unwrap();
+        assert_eq!(th.txq.used.idx.get(), 2);
+        assert_eq!(th.net().held_frames(), 2);
+
+        // The answer to 4 lets the first go to the tap, and not the second.
+        check_metric_after_block!(th.net().metrics.tx_packets_count, 1, {
+            th.net().release_held(4)
+        });
+        assert_eq!(th.net().held_frames(), 1);
+        let mut buf = vec![0; 300];
+        assert!(tap_traffic_simulator.pop_rx_packet(&mut buf[vnet_hdr_len()..]));
+        assert_eq!(&buf[..300], &frame_1[..300]);
+        th.net().release_held(5);
+        let mut buf = vec![0; 600];
+        assert!(tap_traffic_simulator.pop_rx_packet(&mut buf[vnet_hdr_len()..]));
+        assert_eq!(&buf[..600], &frame_2[..600]);
+
+        // An end with no release throws what waits away.
+        let desc_list = [(6, 100, 0)];
+        th.add_desc_chain(NetQueue::Tx, 900, &desc_list);
+        th.write_tx_frame(&desc_list, 100);
+        th.event_manager.run_with_timeout(100).unwrap();
+        th.net().discard_held();
+        assert_eq!(th.net().held_frames(), 0);
+        let end = HOLD.counts();
+        assert_eq!(end.held - start.held, 3);
+        assert_eq!(end.released - start.released, 2);
+        assert_eq!(end.discarded - start.discarded, 1);
+        HOLD.reset_for_test();
+    }
+
     fn create_arp_request(
         src_mac: MacAddr,
         src_ip: Ipv4Addr,
@@ -2087,6 +2234,7 @@ pub mod tests {
                     &mut net.tap,
                     Some(src_mac),
                     &net.metrics,
+                    None,
                 )
                 .unwrap()
             )
@@ -2126,6 +2274,7 @@ pub mod tests {
                 &mut net.tap,
                 Some(guest_mac),
                 &net.metrics,
+                None,
             )
         );
 
@@ -2141,6 +2290,7 @@ pub mod tests {
                 &mut net.tap,
                 Some(not_guest_mac),
                 &net.metrics,
+                None,
             )
         );
     }
@@ -2574,13 +2724,14 @@ pub mod tests {
         let net = th.net.lock().unwrap();
 
         // Test queues count (TX and RX).
-        let queues = net.queues();
+        let queues = &net.queues;
         assert_eq!(queues.len(), NET_QUEUE_SIZES.len());
-        assert_eq!(queues[RX_INDEX].size, th.rxq.size());
-        assert_eq!(queues[TX_INDEX].size, th.txq.size());
+        assert_eq!(queues[RX_INDEX].config.size, th.rxq.size());
+        assert_eq!(queues[TX_INDEX].config.size, th.txq.size());
 
         // Test corresponding queues events.
-        assert_eq!(net.queue_events().len(), NET_QUEUE_SIZES.len());
+        assert_eq!(net.num_queues(), NET_QUEUE_SIZES.len());
+        assert!((0..net.num_queues()).all(|index| net.queue_event(index).is_some()));
 
         // Test interrupts.
         assert!(
@@ -2603,7 +2754,7 @@ pub mod tests {
         th.activate_net();
 
         let net = th.net();
-        let queues = net.queues();
+        let queues = &net.queues;
         assert!(queues[RX_INDEX].uses_notif_suppression);
         assert!(queues[TX_INDEX].uses_notif_suppression);
     }

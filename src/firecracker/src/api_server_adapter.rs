@@ -3,7 +3,7 @@
 
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -67,6 +67,22 @@ impl ApiServerAdapter {
         }));
         event_manager.add_subscriber(api_adapter.clone());
         loop {
+            // A stopped guest (a pause request, the end of a lease, a disk error, a load with no
+            // resume) freezes the devices: the event loop does not turn until a resume succeeds.
+            let stopped = vmm.lock().unwrap().is_stopped();
+            if stopped {
+                api_adapter
+                    .lock()
+                    .expect("Poisoned lock")
+                    .serve_while_stopped(event_manager);
+            }
+
+            match vmm.lock().unwrap().shutdown_exit_code() {
+                Some(FcExitCode::Ok) => break,
+                Some(exit_code) => return Err(ApiServerError::MicroVMStoppedWithError(exit_code)),
+                None => {}
+            }
+
             event_manager
                 .run()
                 .expect("EventManager events driver fatal error");
@@ -95,27 +111,57 @@ impl ApiServerAdapter {
 
     fn handle_request(&mut self, event_manager: &mut EventManager) {
         if let Some(api_request) = self.request.take() {
-            let request_is_pause = *api_request == VmmAction::Pause;
             self._handle_request(*api_request, event_manager);
-
-            // If the latest req is a pause request, temporarily switch to a mode where we
-            // do blocking `recv`s on the `from_api` receiver in a loop, until we get
-            // unpaused. The device emulation is implicitly paused since we do not
-            // relinquish control to the event manager because we're not returning from
-            // `process`.
-            if request_is_pause {
-                // This loop only attempts to process API requests, so things like the
-                // metric flush timerfd handling are frozen as well.
-                loop {
-                    let req = self.from_api.recv().expect("Error receiving API request.");
-                    let req_is_resume = *req == VmmAction::Resume;
-                    self._handle_request(*req, event_manager);
-                    if req_is_resume {
-                        break;
-                    }
-                }
-            }
         }
+    }
+
+    /// Serves API requests while the guest is stopped, with no turn of the event loop, so that
+    /// device emulation (and things like the metric flush timerfd) is frozen. Returns when a
+    /// resume succeeded or the VMM is to exit.
+    fn serve_while_stopped(&mut self, event_manager: &mut EventManager) {
+        let from_api = &self.from_api;
+        let api_event_fd = &self.api_event_fd;
+        let to_api = &self.to_api;
+        self.controller.serve_while_stopped(
+            event_manager,
+            |timeout, fds| {
+                // The API event and the events of the checkpoint loop wake the loop.
+                let mut polled: Vec<libc::pollfd> = std::iter::once(api_event_fd.as_raw_fd())
+                    .chain(fds.iter().copied())
+                    .map(|fd| libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    })
+                    .collect();
+                let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+                // SAFETY: `polled` holds valid pollfds for its length.
+                let ready = unsafe {
+                    libc::poll(
+                        polled.as_mut_ptr(),
+                        libc::nfds_t::try_from(polled.len()).unwrap(),
+                        timeout_ms,
+                    )
+                };
+                if ready <= 0 || polled[0].revents & libc::POLLIN == 0 {
+                    return Err(RecvTimeoutError::Timeout);
+                }
+                // The API thread writes the event right after the request.
+                let request = from_api.recv_timeout(timeout)?;
+                // Also consume the API event that goes with the request, as the loop before
+                // the boot does.
+                api_event_fd
+                    .read()
+                    .expect("VMM: Failed to read the API event_fd");
+                Ok(request)
+            },
+            |response| {
+                to_api
+                    .send(response)
+                    .map_err(|_| ())
+                    .expect("one-shot channel closed")
+            },
+        );
     }
 }
 impl MutEventSubscriber for ApiServerAdapter {

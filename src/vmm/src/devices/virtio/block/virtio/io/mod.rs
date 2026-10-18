@@ -7,7 +7,7 @@ pub mod sync_io;
 use std::fmt::Debug;
 use std::fs::File;
 
-pub use self::async_io::{AsyncFileEngine, AsyncIoError};
+pub use self::async_io::{AsyncFileEngine, AsyncIoError, DirectAlignment, DriveBlocks};
 pub use self::sync_io::{SyncFileEngine, SyncIoError};
 use crate::devices::virtio::block::virtio::PendingRequest;
 use crate::devices::virtio::block::virtio::device::FileEngineType;
@@ -40,6 +40,12 @@ impl BlockIoError {
             _ => false,
         }
     }
+
+    /// Whether the disk failed the request (an error of the `Async` engine's I/O). Such a
+    /// request stops the guest and is kept; every other error is answered to the guest.
+    pub fn is_disk_error(&self) -> bool {
+        matches!(self, BlockIoError::Async(AsyncIoError::IO(_)))
+    }
 }
 
 #[derive(Debug)]
@@ -57,18 +63,32 @@ pub enum FileEngine {
 }
 
 impl FileEngine {
-    pub fn from_file(file: File, engine_type: FileEngineType) -> Result<FileEngine, BlockIoError> {
+    /// An engine of `engine_type` over `file`. The `Async` engine aligns its requests to
+    /// `align` (`DirectAlignment::NONE` for a file opened with no `O_DIRECT`), and shares
+    /// `blocks` with the engines of the other queues of its drive.
+    pub fn from_file(
+        file: File,
+        engine_type: FileEngineType,
+        align: DirectAlignment,
+        blocks: Option<std::sync::Arc<DriveBlocks>>,
+    ) -> Result<FileEngine, BlockIoError> {
         match engine_type {
             FileEngineType::Async => Ok(FileEngine::Async(
-                AsyncFileEngine::from_file(file).map_err(BlockIoError::Async)?,
+                AsyncFileEngine::from_file(file, align, blocks).map_err(BlockIoError::Async)?,
             )),
             FileEngineType::Sync => Ok(FileEngine::Sync(SyncFileEngine::from_file(file))),
         }
     }
 
-    pub fn update_file_path(&mut self, file: File) -> Result<(), BlockIoError> {
+    pub fn update_file_path(
+        &mut self,
+        file: File,
+        align: DirectAlignment,
+    ) -> Result<(), BlockIoError> {
         match self {
-            FileEngine::Async(engine) => engine.update_file(file).map_err(BlockIoError::Async)?,
+            FileEngine::Async(engine) => engine
+                .update_file(file, align)
+                .map_err(BlockIoError::Async)?,
             FileEngine::Sync(engine) => engine.update_file(file),
         };
 
@@ -277,7 +297,8 @@ pub mod tests {
         let mem = create_mem();
         // Create backing file.
         let file = TempFile::new().unwrap().into_file();
-        let mut engine = FileEngine::from_file(file, FileEngineType::Sync).unwrap();
+        let mut engine =
+            FileEngine::from_file(file, FileEngineType::Sync, DirectAlignment::NONE, None).unwrap();
 
         let data = vmm_sys_util::rand::rand_alphanumerics(FILE_LEN as usize)
             .as_bytes()
@@ -361,7 +382,9 @@ pub mod tests {
     fn test_async() {
         // Create backing file.
         let file = TempFile::new().unwrap().into_file();
-        let mut engine = FileEngine::from_file(file, FileEngineType::Async).unwrap();
+        let mut engine =
+            FileEngine::from_file(file, FileEngineType::Async, DirectAlignment::NONE, None)
+                .unwrap();
 
         let data = vmm_sys_util::rand::rand_alphanumerics(FILE_LEN as usize)
             .as_bytes()
@@ -413,5 +436,184 @@ pub mod tests {
 
         engine.drain(true).unwrap();
         engine.drain_and_flush(true).unwrap();
+    }
+
+    #[test]
+    fn test_async_aligned_buffer() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        // A file opened with O_DIRECT, its requests aligned to 4096 bytes: a write and a read
+        // that are not aligned go through an aligned buffer.
+        let tmp = TempFile::new().unwrap();
+        tmp.as_file().set_len(0x4000).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(tmp.as_path())
+            .unwrap();
+        let align = DirectAlignment {
+            offset: 4096,
+            mem: 4096,
+        };
+        let mut engine = FileEngine::from_file(file, FileEngineType::Async, align, None).unwrap();
+        let data = vmm_sys_util::rand::rand_alphanumerics(300)
+            .as_bytes()
+            .to_vec();
+
+        let mem = create_mem();
+        let addr = GuestAddress(100);
+        mem.write(&data, addr).unwrap();
+        assert_queued!(engine.write(5000, &mem, addr, 300, PendingRequest::default()));
+        assert_async_execution(&mem, &mut engine, 300);
+
+        // The read marks as changed only the guest's range, not the aligned range around it.
+        let mem = create_mem();
+        let addr = GuestAddress(50);
+        assert_queued!(engine.read(5000, &mem, addr, 300, PendingRequest::default()));
+        assert_async_execution(&mem, &mut engine, 300);
+        let mut buf = vec![0u8; 300];
+        mem.read_slice(&mut buf, addr).unwrap();
+        assert_eq!(buf, data);
+        check_dirty_mem(&mem, addr, 300);
+        check_clean_mem(&mem, GuestAddress(4096), 4096);
+
+        // The rest of the file is as it was.
+        let mut all = vec![0u8; 0x4000];
+        std::os::unix::fs::FileExt::read_exact_at(tmp.as_file(), &mut all, 0).unwrap();
+        assert!(all[..5000].iter().all(|&b| b == 0));
+        assert_eq!(&all[5000..5300], data.as_slice());
+        assert!(all[5300..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_blocks_inside() {
+        use super::async_io::{blocks_inside, parts_outside};
+
+        assert_eq!(blocks_inside(512, 8192, 4096), Some((4096, 4096)));
+        assert_eq!(blocks_inside(0, 8192, 4096), Some((0, 8192)));
+        assert_eq!(blocks_inside(512, 4096, 4096), None);
+        assert_eq!(blocks_inside(4096, 512, 4096), None);
+        assert_eq!(blocks_inside(1024, 512, 512), Some((1024, 512)));
+
+        assert_eq!(
+            parts_outside(512, 8192, Some((4096, 4096))),
+            vec![(512, 3584), (8192, 512)]
+        );
+        assert_eq!(parts_outside(0, 8192, Some((0, 8192))), vec![]);
+        assert_eq!(parts_outside(512, 1024, None), vec![(512, 1024)]);
+        assert_eq!(
+            parts_outside(4096, 4608, Some((4096, 4096))),
+            vec![(8192, 512)]
+        );
+    }
+
+    #[test]
+    fn test_engines_of_one_drive_wait_for_each_other() {
+        use std::os::unix::fs::{FileExt, OpenOptionsExt};
+        use std::sync::Arc;
+
+        // Two engines of one drive (two queues) on a file opened with O_DIRECT, aligned to
+        // 4096 bytes: a read-modify-write of one and a request of the other on the same block
+        // do not run at the same time.
+        let tmp = TempFile::new().unwrap();
+        tmp.as_file().set_len(0x4000).unwrap();
+        let open = || {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_DIRECT)
+                .open(tmp.as_path())
+                .unwrap()
+        };
+        let align = DirectAlignment {
+            offset: 4096,
+            mem: 4096,
+        };
+        let blocks = Arc::new(DriveBlocks::default());
+        let mut e0 = AsyncFileEngine::from_file(open(), align, Some(blocks.clone())).unwrap();
+        let mut e1 = AsyncFileEngine::from_file(open(), align, Some(blocks.clone())).unwrap();
+        let mem = create_mem();
+        mem.write_slice(&[0x11; 512], GuestAddress(0x0)).unwrap();
+        mem.write_slice(&[0x22; 512], GuestAddress(0x200)).unwrap();
+        mem.write_slice(&[0x33; 4096], GuestAddress(0x400)).unwrap();
+        let req = PendingRequest::default;
+
+        // Queue 0 writes sector 1: a read-modify-write of block 0.
+        e0.push_write(512, &mem, GuestAddress(0x0), 512, req())
+            .map_err(|err| err.error)
+            .unwrap();
+        e0.kick_submission_queue().unwrap();
+        assert_eq!(blocks.claims(), 1);
+        // Queue 1 writes sector 2, in the same block: it waits.
+        e1.push_write(1024, &mem, GuestAddress(0x200), 512, req())
+            .map_err(|err| err.error)
+            .unwrap();
+        assert_eq!(e1.waiting_jobs(), 1);
+        // A write of queue 1 to another block does not wait.
+        e1.push_write(8192, &mem, GuestAddress(0x400), 4096, req())
+            .map_err(|err| err.error)
+            .unwrap();
+        assert_eq!(e1.waiting_jobs(), 1);
+        assert_eq!(blocks.claims(), 2);
+
+        // Queue 0's write ends and lets the block go; queue 1 is woken and runs its write.
+        e0.drain(false).unwrap();
+        assert!(e1.completion_evt().read().unwrap() >= 1);
+        e1.drain(false).unwrap();
+        assert_eq!(e1.waiting_jobs(), 0);
+        assert_eq!(blocks.claims(), 0);
+        let mut answers = 0;
+        while let Some(cqe) = e0.pop(&mem).unwrap() {
+            assert_eq!(cqe.count(), 512);
+            answers += 1;
+        }
+        while let Some(cqe) = e1.pop(&mem).unwrap() {
+            assert!(cqe.count() == 512 || cqe.count() == 4096);
+            answers += 1;
+        }
+        assert_eq!(answers, 3);
+        let mut file = vec![0u8; 0x4000];
+        tmp.as_file().read_exact_at(&mut file, 0).unwrap();
+        assert!(file[..512].iter().all(|&b| b == 0));
+        assert!(file[512..1024].iter().all(|&b| b == 0x11));
+        assert!(file[1024..1536].iter().all(|&b| b == 0x22));
+        assert!(file[1536..8192].iter().all(|&b| b == 0));
+        assert!(file[8192..12288].iter().all(|&b| b == 0x33));
+
+        // A read of queue 1 of the block of a read-modify-write of queue 0 waits too, and a
+        // drain of queue 1 waits until queue 0's thread lets the block go.
+        mem.write_slice(&[0x44; 512], GuestAddress(0x0)).unwrap();
+        e0.push_write(1536, &mem, GuestAddress(0x0), 512, req())
+            .map_err(|err| err.error)
+            .unwrap();
+        e0.kick_submission_queue().unwrap();
+        e1.push_read(0, &mem, GuestAddress(0x1000), 4096, req())
+            .map_err(|err| err.error)
+            .unwrap();
+        assert_eq!(e1.waiting_jobs(), 1);
+        let other = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            e0.drain(false).unwrap();
+            e0
+        });
+        e1.drain(false).unwrap();
+        let mut e0 = other.join().unwrap();
+        assert_eq!(blocks.claims(), 0);
+        assert_eq!(e0.pop(&mem).unwrap().unwrap().count(), 512);
+        assert_eq!(e1.pop(&mem).unwrap().unwrap().count(), 4096);
+        let mut read = vec![0u8; 4096];
+        mem.read_slice(&mut read, GuestAddress(0x1000)).unwrap();
+        assert!(read[512..1024].iter().all(|&b| b == 0x11));
+        assert!(read[1024..1536].iter().all(|&b| b == 0x22));
+        assert!(read[1536..2048].iter().all(|&b| b == 0x44));
+
+        // Jobs that are thrown away let their blocks go.
+        e0.push_write(512, &mem, GuestAddress(0x0), 512, req())
+            .map_err(|err| err.error)
+            .unwrap();
+        assert_eq!(blocks.claims(), 1);
+        e0.drain(true).unwrap();
+        assert_eq!(blocks.claims(), 0);
     }
 }

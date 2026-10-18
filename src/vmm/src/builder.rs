@@ -16,9 +16,12 @@ use utils::time::TimestampUs;
 use vm_allocator::AllocPolicy;
 use vm_memory::GuestAddress;
 
+#[cfg(target_arch = "x86_64")]
+use crate::StoppedClock;
 #[cfg(target_arch = "aarch64")]
 use crate::Vcpu;
 use crate::arch::{ConfigurationError, configure_system_for_boot, load_kernel};
+use crate::checkpoint::Checkpointer;
 #[cfg(target_arch = "aarch64")]
 use crate::construct_kvm_mpidrs;
 use crate::cpu_config::templates::{GetCpuTemplate, GetCpuTemplateError, GuestConfigError};
@@ -29,6 +32,7 @@ use crate::device_manager::{
     DeviceRestoreArgs,
 };
 use crate::devices::virtio::balloon::Balloon;
+use crate::devices::virtio::block::BlockError;
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::device::VirtioDevice;
 use crate::devices::virtio::mem::{VIRTIO_MEM_DEFAULT_SLOT_SIZE_MIB, VirtioMem};
@@ -46,11 +50,12 @@ use crate::persist::{MicrovmState, MicrovmStateError};
 use crate::resources::VmResources;
 use crate::seccomp::BpfThreadMap;
 use crate::snapshot::Persist;
+use crate::space::Filler;
 use crate::utils::{u32_mib_to_bytes, u64_to_usize};
 use crate::vmm_config::boot_source::{
     DEFAULT_KERNEL_CMDLINE, append_root_device_cmdline, build_cmdline,
 };
-use crate::vmm_config::instance_info::{InstanceInfo, VmState};
+use crate::vmm_config::instance_info::{InstanceInfo, PausedReason};
 use crate::vmm_config::machine_config::MachineConfigError;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vmm_config::pmem::PmemConfig;
@@ -109,6 +114,8 @@ pub enum StartMicrovmError {
     NetDeviceNotConfigured,
     /// Cannot open the block device backing file: {0}
     OpenBlockDevice(io::Error),
+    /// Failed to spawn the block worker thread: {0}
+    SpawnBlockWorker(BlockError),
     /// Cannot restore microvm state: {0}
     RestoreMicrovmState(MicrovmStateError),
     /// Cannot set vm resources: {0}
@@ -125,6 +132,10 @@ pub enum StartMicrovmError {
     VcpuFdCloneError(#[from] crate::vstate::vcpu::CopyKvmFdError),
     /// Error with the KvmVm object: {0}
     KvmVm(#[from] VmError),
+    /// Cannot start the fill thread: {0}
+    FillThread(io::Error),
+    /// Cannot start the threads of the checkpoint loop: {0}
+    CheckpointThreads(io::Error),
 }
 
 /// It's convenient to automatically convert `linux_loader::cmdline::Error`s
@@ -177,6 +188,7 @@ pub fn build_microvm_for_boot(
     // Build custom CPU config if a custom template is provided.
     let mut vm = KvmVm::new(kvm)?;
     let mut vcpus = vm.create_vcpus(vm_resources.machine_config.vcpu_count)?;
+    vm.set_log_dirty_at_start(vm_resources.machine_config.track_dirty_pages);
     vm.register_dram_memory_regions(guest_memory)?;
 
     // Allocate memory as soon as possible to make hotpluggable memory available to all consumers,
@@ -208,6 +220,7 @@ pub fn build_microvm_for_boot(
         vm_resources.serial_out_path.as_ref(),
         vm_resources.serial_rate_limiter(),
         vm_resources.pci_enabled,
+        seccomp_filters.get("blk_worker").cloned(),
     )?;
 
     let guest_memory = kvm_vm.guest_memory();
@@ -320,13 +333,33 @@ pub fn build_microvm_for_boot(
         boot_cmdline,
     )?;
 
+    let filler = Filler::spawn(
+        seccomp_filters
+            .get("fill")
+            .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("fill".to_string()))?
+            .clone(),
+    )
+    .map_err(StartMicrovmError::FillThread)?;
+    let checkpoint = Checkpointer::spawn(
+        seccomp_filters
+            .get("checkpoint")
+            .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("checkpoint".to_string()))?
+            .clone(),
+    )
+    .map_err(StartMicrovmError::CheckpointThreads)?;
+
     let vmm = Vmm {
+        checkpoint,
         instance_info: instance_info.clone(),
         machine_config: vm_resources.machine_config.clone(),
         boot_source_config: vm_resources.boot_source.config.clone(),
         shutdown_exit_code: None,
         vm,
         device_manager,
+        #[cfg(target_arch = "x86_64")]
+        stopped_clock: None,
+        resume_refused: None,
+        filler,
     };
     let vmm = Arc::new(Mutex::new(vmm));
 
@@ -348,7 +381,11 @@ pub fn build_microvm_for_boot(
                 .clone(),
         )
         .map_err(VmmError::VcpuStart)?;
-    vmm.lock().unwrap().instance_info.state = VmState::Paused;
+    // The guest has not run yet; the boot resumes it at once.
+    vmm.lock()
+        .unwrap()
+        .instance_info
+        .set_paused(PausedReason::Load);
 
     #[cfg(feature = "gdb")]
     if let Some(gdb_socket_path) = &vm_resources.machine_config.gdb_socket_path {
@@ -417,6 +454,14 @@ pub enum BuildMicrovmFromSnapshotError {
     RestoreDevices(#[from] DeviceManagerPersistError),
     /// clock_realtime is not supported on aarch64.
     UnsupportedClockRealtime,
+    /// Failed to start the fill thread as no fill seccomp filter found.
+    MissingFillSeccompFilter,
+    /// Cannot start the fill thread: {0}
+    FillThread(io::Error),
+    /// Failed to start the threads of the checkpoint loop as no checkpoint seccomp filter found.
+    MissingCheckpointSeccompFilter,
+    /// Cannot start the threads of the checkpoint loop: {0}
+    CheckpointThreads(io::Error),
 }
 
 /// Builds and starts a microVM based on the provided MicrovmState.
@@ -447,6 +492,7 @@ pub fn build_microvm_from_snapshot(
         .create_vcpus(vm_resources.machine_config.vcpu_count)
         .map_err(StartMicrovmError::KvmVm)?;
 
+    vm.set_log_dirty_at_start(vm_resources.machine_config.track_dirty_pages);
     vm.restore_memory_regions(guest_memory, &microvm_state.vm_state.memory)
         .map_err(StartMicrovmError::KvmVm)?;
 
@@ -505,18 +551,44 @@ pub fn build_microvm_from_snapshot(
         vm_resources,
         instance_id: &instance_info.id,
         vcpus_exit_evt: kvm_vm.vcpus_exit_evt(),
+        blk_worker_filter: seccomp_filters.get("blk_worker").cloned(),
     };
     #[allow(unused_mut)]
     let mut device_manager =
         DeviceManager::restore(device_ctor_args, &microvm_state.device_states)?;
 
+    let filler = Filler::spawn(
+        seccomp_filters
+            .get("fill")
+            .ok_or(BuildMicrovmFromSnapshotError::MissingFillSeccompFilter)?
+            .clone(),
+    )
+    .map_err(BuildMicrovmFromSnapshotError::FillThread)?;
+    let checkpoint = Checkpointer::spawn(
+        seccomp_filters
+            .get("checkpoint")
+            .ok_or(BuildMicrovmFromSnapshotError::MissingCheckpointSeccompFilter)?
+            .clone(),
+    )
+    .map_err(BuildMicrovmFromSnapshotError::CheckpointThreads)?;
+
     let vmm = Vmm {
+        checkpoint,
         instance_info: instance_info.clone(),
         machine_config: vm_resources.machine_config.clone(),
         boot_source_config: vm_resources.boot_source.config.clone(),
         shutdown_exit_code: None,
         vm,
         device_manager,
+        // The clock of the state is set by the resume that follows the load, not here: the
+        // time for which the guest waits loaded is not time of the guest.
+        #[cfg(target_arch = "x86_64")]
+        stopped_clock: Some(StoppedClock {
+            clock: *microvm_state.vm_state.clock(),
+            realtime: clock_realtime,
+        }),
+        resume_refused: None,
+        filler,
     };
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
@@ -528,8 +600,14 @@ pub fn build_microvm_from_snapshot(
             .clone(),
     )?;
 
+    // A loaded guest is stopped until its resume: the worker threads of its drives take no
+    // request until then (the queues of a drive on the VMM thread wait with that thread).
+    vmm.device_manager.quiesce_virtio_devices();
     let vmm = Arc::new(Mutex::new(vmm));
-    vmm.lock().unwrap().instance_info.state = VmState::Paused;
+    vmm.lock()
+        .unwrap()
+        .instance_info
+        .set_paused(PausedReason::Load);
     event_manager.add_subscriber(vmm.clone());
 
     debug!("event_end: build microvm from snapshot");
@@ -675,6 +753,13 @@ fn attach_block_devices<'a, I: Iterator<Item = &'a Arc<Mutex<Block>>> + Debug>(
             }
             (locked.id().to_string(), locked.is_vhost_user())
         };
+
+        block
+            .lock()
+            .expect("Poisoned lock")
+            .spawn_worker(device_manager.blk_worker_filter.clone())
+            .map_err(StartMicrovmError::SpawnBlockWorker)?;
+
         // The device mutex mustn't be locked here otherwise it will deadlock.
         device_manager.attach_boot_virtio_device(
             vm,
@@ -776,6 +861,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::device_manager::tests::{default_device_manager, default_device_manager_with_pci};
     use crate::devices::virtio::block::CacheType;
+    use crate::devices::virtio::block::virtio::device::FileEngineType;
     use crate::devices::virtio::device::VirtioDeviceType;
     use crate::devices::virtio::rng::device::ENTROPY_DEV_ID;
     use crate::devices::virtio::vsock::VSOCK_DEV_ID;
@@ -801,6 +887,8 @@ pub(crate) mod tests {
         partuuid: Option<String>,
         is_read_only: bool,
         cache_type: CacheType,
+        // The worker threads of the drive: `num_queues` and `poll_us`, with the Async engine.
+        workers: Option<(std::num::NonZeroU16, u32)>,
     }
 
     impl CustomBlockConfig {
@@ -817,7 +905,15 @@ pub(crate) mod tests {
                 partuuid,
                 is_read_only,
                 cache_type,
+                workers: None,
             }
+        }
+
+        /// The drive on `num_queues` worker threads that poll for `poll_us`, with the Async
+        /// engine.
+        pub(crate) fn with_workers(mut self, num_queues: u16, poll_us: u32) -> Self {
+            self.workers = Some((std::num::NonZeroU16::new(num_queues).unwrap(), poll_us));
+            self
         }
     }
 
@@ -849,12 +945,17 @@ pub(crate) mod tests {
         let _ = vm.create_vcpus(1).unwrap();
 
         Vmm {
+            checkpoint: Default::default(),
             instance_info: InstanceInfo::default(),
             machine_config: MachineConfig::default(),
             boot_source_config: BootSourceConfig::default(),
             shutdown_exit_code: None,
             vm: Vm::Kvm(Arc::new(vm)),
             device_manager: default_device_manager(),
+            #[cfg(target_arch = "x86_64")]
+            stopped_clock: None,
+            resume_refused: None,
+            filler: Default::default(),
         }
     }
 
@@ -867,12 +968,17 @@ pub(crate) mod tests {
         let device_manager = default_device_manager_with_pci(&vm);
 
         Vmm {
+            checkpoint: Default::default(),
             instance_info: InstanceInfo::default(),
             machine_config: MachineConfig::default(),
             boot_source_config: BootSourceConfig::default(),
             shutdown_exit_code: None,
             vm: Vm::Kvm(vm),
             device_manager,
+            #[cfg(target_arch = "x86_64")]
+            stopped_clock: None,
+            resume_refused: None,
+            filler: Default::default(),
         }
     }
 
@@ -895,6 +1001,8 @@ pub(crate) mod tests {
 
                 is_read_only: Some(custom_block_cfg.is_read_only),
                 discard: None,
+                num_queues: custom_block_cfg.workers.map(|(n, _)| n),
+                poll_us: custom_block_cfg.workers.map(|(_, us)| us),
                 path_on_host: Some(
                     block_files
                         .last()
@@ -905,12 +1013,22 @@ pub(crate) mod tests {
                         .to_string(),
                 ),
                 rate_limiter: None,
-                file_engine_type: None,
+                file_engine_type: custom_block_cfg.workers.map(|_| FileEngineType::Async),
                 blk_size: None,
                 topology: None,
 
                 socket: None,
             };
+            if custom_block_cfg.workers.is_some() {
+                // A drive of the Async engine opens its file with O_DIRECT: the file has a
+                // size of whole blocks.
+                block_files
+                    .last()
+                    .unwrap()
+                    .as_file()
+                    .set_len(0x10000)
+                    .unwrap();
+            }
 
             block_dev_configs
                 .insert(block_device_config, false)

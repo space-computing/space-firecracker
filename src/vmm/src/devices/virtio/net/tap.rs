@@ -194,6 +194,17 @@ impl Tap {
         Ok(usize::try_from(ret).unwrap())
     }
 
+    /// Writes one frame (with its virtio-net header) from a buffer.
+    pub(crate) fn write_buf(&mut self, buf: &[u8]) -> Result<usize, IoError> {
+        // SAFETY: `write` is safe. Called with a valid tap fd and a valid buffer, and we check
+        // the return value.
+        let ret = unsafe { libc::write(self.tap_file.as_raw_fd(), buf.as_ptr().cast(), buf.len()) };
+        if ret == -1 {
+            return Err(IoError::last_os_error());
+        }
+        Ok(usize::try_from(ret).unwrap())
+    }
+
     /// Read from tap to an `IoVecBufferMut`
     pub(crate) fn read_iovec(&mut self, buffer: &mut [libc::iovec]) -> Result<usize, IoError> {
         let iov = buffer.as_mut_ptr();

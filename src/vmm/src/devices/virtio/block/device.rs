@@ -12,10 +12,11 @@ use super::vhost_user::device::{VhostUserBlock, VhostUserBlockConfig};
 use super::virtio::device::{VirtioBlock, VirtioBlockConfig};
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
-use crate::devices::virtio::queue::{InvalidAvailIdx, Queue};
+use crate::devices::virtio::queue::{InvalidAvailIdx, QueueConfig, QueueError};
 use crate::devices::virtio::transport::VirtioInterrupt;
 use crate::impl_device_type;
 use crate::rate_limiter::BucketUpdate;
+use crate::seccomp::BpfProgram;
 use crate::snapshot::Persist;
 use crate::vmm_config::drive::BlockDeviceConfig;
 use crate::vstate::memory::GuestMemoryMmap;
@@ -89,22 +90,30 @@ impl Block {
 
     pub fn root_device(&self) -> bool {
         match self {
-            Self::Virtio(b) => b.root_device,
+            Self::Virtio(b) => b.config.is_root_device,
             Self::VhostUser(b) => b.root_device,
         }
     }
 
     pub fn read_only(&self) -> bool {
         match self {
-            Self::Virtio(b) => b.read_only,
+            Self::Virtio(b) => b.config.is_read_only,
             Self::VhostUser(b) => b.read_only,
         }
     }
 
     pub fn partuuid(&self) -> &Option<String> {
         match self {
-            Self::Virtio(b) => &b.partuuid,
+            Self::Virtio(b) => &b.config.partuuid,
             Self::VhostUser(b) => &b.partuuid,
+        }
+    }
+
+    /// Whether a disk error of this drive waits for the Vmm to stop the guest (given once).
+    pub fn take_disk_error(&mut self) -> bool {
+        match self {
+            Self::Virtio(b) => b.take_disk_error(),
+            Self::VhostUser(_) => false,
         }
     }
 
@@ -112,6 +121,19 @@ impl Block {
         match self {
             Self::Virtio(_) => false,
             Self::VhostUser(_) => true,
+        }
+    }
+
+    pub(crate) fn spawn_worker(
+        &mut self,
+        seccomp_filter: Option<Arc<BpfProgram>>,
+    ) -> Result<(), BlockError> {
+        match self {
+            // A set `num_queues` means the block device runs on worker threads.
+            Self::Virtio(b) if b.config.num_queues.is_some() => b
+                .spawn_worker(seccomp_filter.ok_or(BlockError::MissingSeccompFilter)?)
+                .map_err(BlockError::VirtioBackend),
+            Self::Virtio(_) | Self::VhostUser(_) => Ok(()),
         }
     }
 }
@@ -147,24 +169,31 @@ impl VirtioDevice for Block {
         }
     }
 
-    fn queues(&self) -> &[Queue] {
+    fn num_queues(&self) -> usize {
         match self {
-            Self::Virtio(b) => &b.queues,
-            Self::VhostUser(b) => &b.queues,
+            Self::Virtio(b) => b.num_queues(),
+            Self::VhostUser(b) => b.num_queues(),
         }
     }
 
-    fn queues_mut(&mut self) -> &mut [Queue] {
+    fn queue_config(&self, index: usize) -> Option<&QueueConfig> {
         match self {
-            Self::Virtio(b) => &mut b.queues,
-            Self::VhostUser(b) => &mut b.queues,
+            Self::Virtio(b) => b.queue_config(index),
+            Self::VhostUser(b) => b.queue_config(index),
         }
     }
 
-    fn queue_events(&self) -> &[EventFd] {
+    fn queue_config_mut(&mut self, index: usize) -> Option<&mut QueueConfig> {
         match self {
-            Self::Virtio(b) => &b.queue_evts,
-            Self::VhostUser(b) => &b.queue_evts,
+            Self::Virtio(b) => b.queue_config_mut(index),
+            Self::VhostUser(b) => b.queue_config_mut(index),
+        }
+    }
+
+    fn queue_event(&self, index: usize) -> Option<&EventFd> {
+        match self {
+            Self::Virtio(b) => b.queue_event(index),
+            Self::VhostUser(b) => b.queue_event(index),
         }
     }
 
@@ -202,7 +231,7 @@ impl VirtioDevice for Block {
 
     fn is_activated(&self) -> bool {
         match self {
-            Self::Virtio(b) => b.device_state.is_activated(),
+            Self::Virtio(b) => b.is_activated(),
             Self::VhostUser(b) => b.device_state.is_activated(),
         }
     }
@@ -221,10 +250,53 @@ impl VirtioDevice for Block {
         }
     }
 
+    fn reset_queues(&mut self) {
+        match self {
+            Self::Virtio(b) => b.reset_queues(),
+            Self::VhostUser(b) => b.reset_queues(),
+        }
+    }
+
+    fn mark_queue_memory_dirty(&mut self, mem: &GuestMemoryMmap) -> Result<(), QueueError> {
+        match self {
+            Self::Virtio(b) => b.mark_queue_memory_dirty(mem),
+            Self::VhostUser(b) => b.mark_queue_memory_dirty(mem),
+        }
+    }
+
+    fn kick(&mut self) {
+        match self {
+            Self::Virtio(b) => b.kick(),
+            Self::VhostUser(b) => b.kick(),
+        }
+    }
+
     fn prepare_save(&mut self) {
         match self {
             Self::Virtio(b) => b.prepare_save(),
             Self::VhostUser(b) => b.prepare_save(),
+        }
+    }
+
+    fn prepare_checkpoint(&mut self) {
+        match self {
+            Self::Virtio(b) => b.drain(),
+            // A guest with a vhost-user drive cannot be saved.
+            Self::VhostUser(_) => {}
+        }
+    }
+
+    fn quiesce(&mut self) {
+        match self {
+            Self::Virtio(b) => b.drain(),
+            Self::VhostUser(_) => {}
+        }
+    }
+
+    fn resume_after_checkpoint(&mut self) {
+        match self {
+            Self::Virtio(b) => b.resume_after_checkpoint(),
+            Self::VhostUser(_) => {}
         }
     }
 }
@@ -270,5 +342,28 @@ impl Persist<'_> for Block {
                     .map_err(BlockError::VhostUserBackend)?,
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::devices::virtio::block::virtio::device::FileEngineType;
+    use crate::devices::virtio::block::virtio::test_utils::default_block;
+
+    #[test]
+    fn test_spawn_worker_filter() {
+        let mut inline = Block::Virtio(default_block(FileEngineType::Sync));
+        inline.spawn_worker(None).unwrap();
+
+        let mut threaded = default_block(FileEngineType::Sync);
+        threaded.config.num_queues = std::num::NonZeroU16::new(1);
+        let mut threaded = Block::Virtio(threaded);
+
+        assert!(matches!(
+            threaded.spawn_worker(None),
+            Err(BlockError::MissingSeccompFilter)
+        ));
+        threaded.spawn_worker(Some(Arc::new(vec![]))).unwrap();
     }
 }

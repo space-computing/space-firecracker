@@ -7,7 +7,9 @@ use std::path::Path;
 
 use vmm::seccomp::{BpfThreadMap, DeserializationError, deserialize_binary, get_empty_filters};
 
-const THREAD_CATEGORIES: [&str; 3] = ["vmm", "api", "vcpu"];
+const ALLOWED_THREAD_CATEGORIES: [&str; 6] =
+    ["vmm", "api", "vcpu", "fill", "checkpoint", "blk_worker"];
+const MANDATORY_THREAD_CATEGORIES: [&str; 5] = ["vmm", "api", "vcpu", "fill", "checkpoint"];
 
 /// Error retrieving seccomp filters.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -76,11 +78,12 @@ fn get_custom_filters<R: Read + Debug>(reader: R) -> Result<BpfThreadMap, Filter
     filter_thread_categories(map)
 }
 
-/// Return an error if the BpfThreadMap contains invalid thread categories.
+/// Return an error if the BpfThreadMap contains invalid thread categories or omits a mandatory
+/// category.
 fn filter_thread_categories(map: BpfThreadMap) -> Result<BpfThreadMap, FilterError> {
     let (filters, invalid_filters): (BpfThreadMap, BpfThreadMap) = map
         .into_iter()
-        .partition(|(k, _)| THREAD_CATEGORIES.contains(&k.as_str()));
+        .partition(|(k, _)| ALLOWED_THREAD_CATEGORIES.contains(&k.as_str()));
     if !invalid_filters.is_empty() {
         // build the error message
         let mut thread_categories_string =
@@ -95,7 +98,7 @@ fn filter_thread_categories(map: BpfThreadMap) -> Result<BpfThreadMap, FilterErr
         return Err(FilterError::ThreadCategories(thread_categories_string));
     }
 
-    for &category in THREAD_CATEGORIES.iter() {
+    for &category in MANDATORY_THREAD_CATEGORIES.iter() {
         let category_string = category.to_string();
         if !filters.contains_key(&category_string) {
             return Err(FilterError::MissingThreadCategory(category_string));
@@ -117,16 +120,22 @@ mod tests {
     #[test]
     fn test_get_filters() {
         let mut filters = get_empty_filters();
-        assert_eq!(filters.len(), 3);
+        assert_eq!(filters.len(), 6);
         assert!(filters.remove("vmm").is_some());
         assert!(filters.remove("api").is_some());
         assert!(filters.remove("vcpu").is_some());
+        assert!(filters.remove("fill").is_some());
+        assert!(filters.remove("checkpoint").is_some());
+        assert!(filters.remove("blk_worker").is_some());
 
         let mut filters = get_empty_filters();
-        assert_eq!(filters.len(), 3);
+        assert_eq!(filters.len(), 6);
         assert_eq!(filters.remove("vmm").unwrap().len(), 0);
         assert_eq!(filters.remove("api").unwrap().len(), 0);
         assert_eq!(filters.remove("vcpu").unwrap().len(), 0);
+        assert_eq!(filters.remove("fill").unwrap().len(), 0);
+        assert_eq!(filters.remove("checkpoint").unwrap().len(), 0);
+        assert_eq!(filters.remove("blk_worker").unwrap().len(), 0);
 
         let file = TempFile::new().unwrap().into_file();
 
@@ -140,8 +149,21 @@ mod tests {
         map.insert("vcpu".to_string(), Arc::new(vec![]));
         map.insert("vmm".to_string(), Arc::new(vec![]));
         map.insert("api".to_string(), Arc::new(vec![]));
+        map.insert("fill".to_string(), Arc::new(vec![]));
+        map.insert("checkpoint".to_string(), Arc::new(vec![]));
+        map.insert("blk_worker".to_string(), Arc::new(vec![]));
 
-        assert_eq!(filter_thread_categories(map).unwrap().len(), 3);
+        assert_eq!(filter_thread_categories(map).unwrap().len(), 6);
+
+        // optional category omitted
+        let mut map = BpfThreadMap::new();
+        map.insert("vcpu".to_string(), Arc::new(vec![]));
+        map.insert("vmm".to_string(), Arc::new(vec![]));
+        map.insert("api".to_string(), Arc::new(vec![]));
+        map.insert("fill".to_string(), Arc::new(vec![]));
+        map.insert("checkpoint".to_string(), Arc::new(vec![]));
+
+        assert_eq!(filter_thread_categories(map).unwrap().len(), 5);
 
         // invalid categories
         let mut map = BpfThreadMap::new();

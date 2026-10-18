@@ -59,6 +59,8 @@ pub enum ProcessingResult {
     Submitted,
     Throttled,
     Executed(FinishedRequest),
+    /// The disk failed the request; it is kept, not answered (the `Async` engine only).
+    Failed(PendingRequest),
 }
 
 #[derive(Debug)]
@@ -94,15 +96,40 @@ impl Status {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct PendingRequest {
     r#type: RequestType,
     data_len: u32,
     status_addr: GuestAddress,
     desc_idx: u16,
+    // What a request that is kept after a disk error needs to run again from its start.
+    sector: u64,
+    data_addr: GuestAddress,
 }
 
 impl PendingRequest {
+    /// The head of the descriptor chain of the request.
+    pub fn desc_idx(&self) -> u16 {
+        self.desc_idx
+    }
+
+    /// Whether a completion of `count` bytes is a read or a write that moved fewer bytes than
+    /// the request asked (0 bytes among them).
+    pub fn is_short(&self, count: u32) -> bool {
+        matches!(self.r#type, RequestType::In | RequestType::Out) && count < self.data_len
+    }
+
+    /// The request, to run it again from its start.
+    pub fn to_request(&self) -> Request {
+        Request {
+            r#type: self.r#type,
+            data_len: self.data_len,
+            status_addr: self.status_addr,
+            sector: self.sector,
+            data_addr: self.data_addr,
+        }
+    }
+
     fn write_status_and_finish(
         self,
         status: &Status,
@@ -429,6 +456,8 @@ impl Request {
             data_len: self.data_len,
             status_addr: self.status_addr,
             desc_idx,
+            sector: self.sector,
+            data_addr: self.data_addr,
         }
     }
 
@@ -485,6 +514,8 @@ impl Request {
             Err(err) => {
                 if err.error.is_throttling_err() {
                     ProcessingResult::Throttled
+                } else if err.error.is_disk_error() {
+                    ProcessingResult::Failed(err.req)
                 } else {
                     ProcessingResult::Executed(err.req.finish(
                         mem,
@@ -493,6 +524,51 @@ impl Request {
                     ))
                 }
             }
+        }
+    }
+}
+
+/// The state of a request that a disk error kept, in a snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct KeptRequestState {
+    request_type: u32,
+    data_len: u32,
+    status_addr: u64,
+    desc_idx: u16,
+    sector: u64,
+    data_addr: u64,
+}
+
+impl From<&PendingRequest> for KeptRequestState {
+    fn from(req: &PendingRequest) -> Self {
+        let request_type = match req.r#type {
+            RequestType::In => VIRTIO_BLK_T_IN,
+            RequestType::Out => VIRTIO_BLK_T_OUT,
+            RequestType::Discard => VIRTIO_BLK_T_DISCARD,
+            RequestType::Flush => VIRTIO_BLK_T_FLUSH,
+            RequestType::GetDeviceID => VIRTIO_BLK_T_GET_ID,
+            RequestType::Unsupported(t) => t,
+        };
+        KeptRequestState {
+            request_type,
+            data_len: req.data_len,
+            status_addr: req.status_addr.0,
+            desc_idx: req.desc_idx,
+            sector: req.sector,
+            data_addr: req.data_addr.0,
+        }
+    }
+}
+
+impl From<&KeptRequestState> for PendingRequest {
+    fn from(state: &KeptRequestState) -> Self {
+        PendingRequest {
+            r#type: RequestType::from(state.request_type),
+            data_len: state.data_len,
+            status_addr: GuestAddress(state.status_addr),
+            desc_idx: state.desc_idx,
+            sector: state.sector,
+            data_addr: GuestAddress(state.data_addr),
         }
     }
 }
@@ -517,6 +593,8 @@ mod tests {
                 data_len: 0,
                 status_addr: Default::default(),
                 desc_idx: 0,
+                sector: 0,
+                data_addr: Default::default(),
             }
         }
     }

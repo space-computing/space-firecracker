@@ -36,6 +36,7 @@ use crate::logger::{debug, warn};
 use crate::pci::PciSBDF;
 use crate::pci::bus::PciRootError;
 use crate::resources::VmResources;
+use crate::seccomp::BpfProgram;
 use crate::snapshot::Persist;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vstate::bus::BusError;
@@ -133,7 +134,7 @@ impl PciDevices {
 
         // Allocate one MSI vector per queue, plus one for configuration
         let msix_num =
-            u16::try_from(device.lock().expect("Poisoned lock").queues().len() + 1).unwrap();
+            u16::try_from(device.lock().expect("Poisoned lock").num_queues() + 1).unwrap();
 
         let msix_vectors = KvmVm::create_msix_group(vm.clone(), msix_num)?;
 
@@ -332,6 +333,7 @@ pub struct PciDevicesConstructorArgs<'a> {
     pub vm_resources: &'a mut VmResources,
     pub instance_id: &'a str,
     pub event_manager: &'a mut EventManager,
+    pub blk_worker_filter: Option<Arc<BpfProgram>>,
 }
 
 impl<'a> Debug for PciDevicesConstructorArgs<'a> {
@@ -345,12 +347,10 @@ impl<'a> Debug for PciDevicesConstructorArgs<'a> {
     }
 }
 
-impl<'a> Persist<'a> for PciDevices {
-    type State = PciDevicesState;
-    type ConstructorArgs = PciDevicesConstructorArgs<'a>;
-    type Error = DevicePersistError;
-
-    fn save(&self) -> Self::State {
+impl PciDevices {
+    /// Saves the state of the devices; `prepare` readies each device first (`prepare_save`
+    /// for a snapshot, `prepare_checkpoint` for a checkpoint).
+    pub(crate) fn save_with(&self, prepare: &dyn Fn(&mut dyn VirtioDevice)) -> PciDevicesState {
         let mut state = PciDevicesState::default();
 
         for pci_dev in self.virtio_devices.values() {
@@ -360,7 +360,7 @@ impl<'a> Persist<'a> for PciDevices {
             // so that, if we modify the transport state while preparing the device, e.g. sending
             // an interrupt to the guest, this is correctly captured in the saved transport state.
             let mut locked_virtio_dev = virtio_dev.lock().expect("Poisoned lock");
-            locked_virtio_dev.prepare_save();
+            prepare(&mut *locked_virtio_dev);
             let transport_state = locked_pci_dev.state();
 
             let sbdf = transport_state.sbdf;
@@ -489,6 +489,16 @@ impl<'a> Persist<'a> for PciDevices {
 
         state
     }
+}
+
+impl<'a> Persist<'a> for PciDevices {
+    type State = PciDevicesState;
+    type ConstructorArgs = PciDevicesConstructorArgs<'a>;
+    type Error = DevicePersistError;
+
+    fn save(&self) -> Self::State {
+        self.save_with(&|device| device.prepare_save())
+    }
 
     fn restore(
         constructor_args: Self::ConstructorArgs,
@@ -522,6 +532,11 @@ impl<'a> Persist<'a> for PciDevices {
                 BlockConstructorArgs { mem: mem.clone() },
                 &block_state.device_state,
             )?));
+
+            device
+                .lock()
+                .expect("Poisoned lock")
+                .spawn_worker(constructor_args.blk_worker_filter.clone())?;
 
             constructor_args
                 .vm_resources
@@ -834,6 +849,7 @@ mod tests {
             vm_resources,
             instance_id: "microvm-id",
             event_manager: &mut event_manager,
+            blk_worker_filter: None,
         };
         let _restored_dev_manager = PciDevices::restore(restore_args, pci_state).unwrap();
 
@@ -854,6 +870,8 @@ mod tests {
       "cache_type": "Unsafe",
       "is_read_only": true,
       "discard": false,
+      "num_queues": null,
+      "poll_us": null,
       "path_on_host": "{}",
       "rate_limiter": null,
       "io_engine": "Sync",
