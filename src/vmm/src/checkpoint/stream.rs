@@ -34,7 +34,7 @@
 //! allocation, which the device never changes). The first frame on a connection sends all its
 //! blobs. The receiving place writes the side file from the newest whole frame at its seal.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::devices::virtio::gpu::SideParts;
@@ -136,12 +136,14 @@ impl GpuPiece {
 }
 
 /// What the receiving place has of the GPU's state on this connection: the structure of the
-/// frame before and its blobs (the blobs are kept, so that their allocations stay theirs).
+/// frame before and its blobs (the blobs are kept, so that their allocations stay theirs). Its
+/// maps are ordered maps: a `HashMap` takes its random keys from `getrandom` the first time a
+/// thread makes one, and the seccomp filter of the sender thread does not allow that call.
 #[derive(Debug, Default)]
 pub struct GpuKnown {
     next_id: u64,
     skeleton: Option<Vec<u8>>,
-    blobs: HashMap<usize, (u64, Blob)>,
+    blobs: BTreeMap<usize, (u64, Blob)>,
 }
 
 /// The GPU's part of a frame for `parts`, in pieces; `known` becomes what the receiving place
@@ -157,7 +159,7 @@ pub fn gpu_section(parts: SideParts, known: &mut GpuKnown) -> Vec<GpuPiece> {
         head.extend_from_slice(&parts.skeleton);
     }
     head.extend_from_slice(&u32::try_from(parts.blobs.len()).unwrap().to_be_bytes());
-    let mut now: HashMap<usize, (u64, Blob)> = HashMap::with_capacity(parts.blobs.len());
+    let mut now: BTreeMap<usize, (u64, Blob)> = BTreeMap::new();
     for b in parts.blobs {
         let key = Arc::as_ptr(&b) as usize;
         if let Some((id, _)) = now.get(&key).or_else(|| known.blobs.get(&key)) {
