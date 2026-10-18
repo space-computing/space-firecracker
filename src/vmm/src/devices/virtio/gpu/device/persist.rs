@@ -32,16 +32,43 @@
 //! rollback): it goes back with the stream to that id, and the device resets it to that id
 //! (`SP_STATE_RESET` N keeps what did not change after the snapshot) and builds the rest again
 //! from the journal. A renderer that does not know the device starts empty and gets all of it.
+//!
+//! A checkpoint ([`Gpu::prepare_checkpoint`](super::Gpu)) and the stop of a move (a snapshot of
+//! the state only, [`Gpu::prepare_move`](super::Gpu)) wait for nothing and export nothing: the
+//! guest goes on at once after a checkpoint, and a move resumes the same renderer. Their side
+//! state records every resource the GPU wrote as missing, so a rollback to one of them is
+//! redrawn as the rollback to a snapshot whose export did not complete. A checkpoint is a mark
+//! point as a snapshot is; a move closes the connections as a snapshot does.
+//!
+//! The side state is in two parts: its structure (the journal with its uploads empty, the
+//! messages not acknowledged with no bytes, the rest as it is), compressed, and the bytes it
+//! keeps that never change (each upload's, each message's, each exported piece's), the blobs,
+//! in a fixed order ([`GpuSideState::split`]). A checkpoint sends the structure each time and
+//! a blob once on its connection (`checkpoint::sender`). The side file (version 3, all integers
+//! little-endian):
+//!
+//! ```text
+//! "SPGPU003" | u64 S | S bytes: the structure (a zstd frame of its bitcode)
+//!            | u64 N | N × (u64 L | L bytes: a blob)
+//!            | u64 C: the CRC64 (`crc64` 2.0) of every byte after the magic and before C
+//! ```
+//!
+//! The receiving place of the checkpoints writes this file at its seal from what the stream
+//! carried. A side file of the 8 bytes [`SIDE_LOST`] says that the large state is lost (a place
+//! that has none): the device is restored without it, so that a guest whose place lacks it
+//! still runs (a takeover must not leave it nowhere). Such a device has no journal and no
+//! commands of before; its renderer starts empty, and what the guest's GPU stack held of
+//! before is gone (its screen may not come back until the guest's display stack restarts).
 
 use std::collections::{HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use gpu_journal::Journal;
+use gpu_journal::{Blob, Journal};
 use serde::{Deserialize, Serialize};
 
-use super::{Cmd, Conn, Gpu, Parked, Pending, Resource, now_us};
+use super::{Cmd, Conn, Gpu, Parked, Pending, Resource, SaveKind, now_us};
 use crate::devices::virtio::device::VirtioDeviceType;
 use crate::devices::virtio::gpu::GPU_NUM_QUEUES;
 use crate::devices::virtio::persist::{PersistError as VirtioStateError, VirtioDeviceState};
@@ -52,7 +79,15 @@ use crate::vmm_config::gpu::GpuConfig;
 use crate::vstate::memory::{GuestAddress, GuestMemoryMmap};
 
 /// The first bytes of a side file.
-const SIDE_MAGIC: &[u8; 8] = b"SPGPU002";
+pub const SIDE_MAGIC: &[u8; 8] = b"SPGPU003";
+/// A side file that says that the device's large state is lost (see the module).
+pub const SIDE_LOST: &[u8; 8] = b"SPGPULST";
+/// The largest structure and the largest blob that a reader takes, and the most blobs.
+const MAX_SKELETON: u64 = 1 << 32;
+const MAX_BLOB: u64 = 1 << 32;
+const MAX_BLOBS: u64 = 1 << 24;
+/// The level of zstd for the structure.
+const SKELETON_ZSTD_LEVEL: i32 = 1;
 
 /// The file beside the snapshot `snapshot_path` that holds the GPU device's large state.
 pub fn side_path(snapshot_path: &Path) -> PathBuf {
@@ -102,6 +137,9 @@ pub struct GpuState {
     /// The large state, read from or written to the side file (not in the state file).
     #[serde(skip)]
     pub side: Option<Arc<GpuSideState>>,
+    /// The side file said that the large state is lost: the device is restored without it.
+    #[serde(skip)]
+    pub side_lost: bool,
 }
 
 /// A resource of the device's bookkeeping: id, format, width, height, backing entries.
@@ -152,46 +190,186 @@ pub struct GpuSideState {
     pub pending: Vec<PendingState>,
     pub parked: Vec<ParkedState>,
     /// For each connection: the reliable messages its renderer has not acknowledged.
-    pub unacked: Vec<Vec<(u64, Vec<u8>)>>,
+    pub unacked: Vec<Vec<(u64, Blob)>>,
     /// What the GPU drew into the resources it wrote (those shown last first), as `SP_IMPORT`s
     /// (header, bytes), exported at the snapshot (imported at a rollback).
-    pub scanout_saved: Vec<(Vec<u8>, Vec<u8>)>,
+    pub scanout_saved: Vec<(Vec<u8>, Blob)>,
     /// The resources the GPU wrote whose content the snapshot lacks (an export did not
     /// complete, or the renderer could not answer): a rollback that does not keep one of them
     /// logs it.
     pub scanout_missing: Vec<u32>,
 }
 
+/// The side state in its two parts (see the module): the compressed structure, and the blobs
+/// in their order.
+#[derive(Debug, Clone)]
+pub struct SideParts {
+    pub skeleton: Vec<u8>,
+    pub blobs: Vec<Blob>,
+}
+
 impl GpuSideState {
-    /// The side file: the magic, the bitcode of the state, and its CRC64.
+    /// The blobs, in their fixed order: the journal's uploads, the messages not acknowledged of
+    /// each connection, the exported pieces.
+    fn blob_list(&self) -> Vec<Blob> {
+        let mut v = self.journal.blobs();
+        v.extend(self.unacked.iter().flatten().map(|(_, b)| b.clone()));
+        v.extend(self.scanout_saved.iter().map(|(_, b)| b.clone()));
+        v
+    }
+
+    /// The two parts. The structure is a copy whose blobs are empty; no blob's bytes are
+    /// copied.
+    pub fn split(&self) -> Result<SideParts, GpuPersistError> {
+        let empty = Blob::default();
+        let bare = GpuSideState {
+            side_id: self.side_id,
+            journal: self.journal.without_blobs(),
+            resources: self.resources.clone(),
+            queries: self.queries.clone(),
+            query_bufs: self.query_bufs.clone(),
+            custom_bufs: self.custom_bufs.clone(),
+            pending: self.pending.clone(),
+            parked: self.parked.clone(),
+            unacked: self
+                .unacked
+                .iter()
+                .map(|c| c.iter().map(|(id, _)| (*id, empty.clone())).collect())
+                .collect(),
+            scanout_saved: self
+                .scanout_saved
+                .iter()
+                .map(|(h, _)| (h.clone(), empty.clone()))
+                .collect(),
+            scanout_missing: self.scanout_missing.clone(),
+        };
+        let data = bitcode::serialize(&bare).map_err(|e| GpuPersistError::Side(e.to_string()))?;
+        let mut skeleton = vec![0u8; zstd_safe::compress_bound(data.len())];
+        let n = zstd_safe::compress(&mut skeleton[..], &data, SKELETON_ZSTD_LEVEL)
+            .map_err(|code| GpuPersistError::Side(zstd_error("compress", code)))?;
+        skeleton.truncate(n);
+        Ok(SideParts {
+            skeleton,
+            blobs: self.blob_list(),
+        })
+    }
+
+    /// The side state from its two parts.
+    pub fn join(skeleton: &[u8], blobs: Vec<Blob>) -> Result<Self, GpuPersistError> {
+        let len = zstd_safe::get_frame_content_size(skeleton)
+            .ok()
+            .flatten()
+            .filter(|&n| n <= MAX_SKELETON)
+            .ok_or_else(|| GpuPersistError::Side("the structure is not a zstd frame".into()))?;
+        let mut data = vec![0u8; usize::try_from(len).unwrap_or(0)];
+        let n = zstd_safe::decompress(&mut data[..], skeleton)
+            .map_err(|code| GpuPersistError::Side(zstd_error("decompress", code)))?;
+        if n != data.len() {
+            return Err(GpuPersistError::Side("the structure is shorter than it says".into()));
+        }
+        let mut side: GpuSideState =
+            bitcode::deserialize(&data).map_err(|e| GpuPersistError::Side(e.to_string()))?;
+        let want = side.journal.blob_count()
+            + side.unacked.iter().map(Vec::len).sum::<usize>()
+            + side.scanout_saved.len();
+        if blobs.len() != want {
+            return Err(GpuPersistError::Side(format!(
+                "{} blobs for a structure of {want}",
+                blobs.len()
+            )));
+        }
+        let mut it = blobs.into_iter();
+        side.journal
+            .put_blobs(&mut it)
+            .map_err(|e| GpuPersistError::Side(e.into()))?;
+        for (_, b) in side.unacked.iter_mut().flatten() {
+            *b = it.next().unwrap();
+        }
+        for (_, b) in &mut side.scanout_saved {
+            *b = it.next().unwrap();
+        }
+        Ok(side)
+    }
+
+    /// The side file (see the module).
     pub fn write_to(&self, w: &mut impl Write) -> Result<(), GpuPersistError> {
-        let data = bitcode::serialize(self).map_err(|e| GpuPersistError::Side(e.to_string()))?;
+        let parts = self.split()?;
         w.write_all(SIDE_MAGIC)?;
-        w.write_all(&(data.len() as u64).to_le_bytes())?;
-        w.write_all(&data)?;
-        w.write_all(&crc64::crc64(0, &data).to_le_bytes())?;
+        let mut crc = 0u64;
+        let mut put = |w: &mut dyn Write, b: &[u8]| -> std::io::Result<()> {
+            crc = crc64::crc64(crc, b);
+            w.write_all(b)
+        };
+        put(w, &(parts.skeleton.len() as u64).to_le_bytes())?;
+        put(w, &parts.skeleton)?;
+        put(w, &(parts.blobs.len() as u64).to_le_bytes())?;
+        for b in &parts.blobs {
+            put(w, &(b.len() as u64).to_le_bytes())?;
+            put(w, b)?;
+        }
+        w.write_all(&crc.to_le_bytes())?;
         Ok(())
     }
 
-    pub fn read_from(r: &mut impl Read) -> Result<Self, GpuPersistError> {
-        let mut head = [0u8; 16];
-        r.read_exact(&mut head)?;
-        if &head[..8] != SIDE_MAGIC {
+    /// Reads a side file. `Ok(None)`: the file says that the large state is lost.
+    pub fn read_from(r: &mut impl Read) -> Result<Option<Self>, GpuPersistError> {
+        let mut magic = [0u8; 8];
+        r.read_exact(&mut magic)?;
+        if &magic == SIDE_LOST {
+            return Ok(None);
+        }
+        if &magic != SIDE_MAGIC {
             return Err(GpuPersistError::Side(
                 "not a side file of this version".into(),
             ));
         }
-        let len = usize::try_from(u64::from_le_bytes(head[8..16].try_into().unwrap()))
-            .map_err(|_| GpuPersistError::Side("too long".into()))?;
-        let mut data = vec![0u8; len];
-        r.read_exact(&mut data)?;
-        let mut crc = [0u8; 8];
-        r.read_exact(&mut crc)?;
-        if crc64::crc64(0, &data) != u64::from_le_bytes(crc) {
+        let mut crc = 0u64;
+        let skeleton = read_part(r, &mut crc, MAX_SKELETON, "the structure")?;
+        let count = read_len(r, &mut crc, MAX_BLOBS, "the list of blobs")?;
+        let mut blobs = Vec::with_capacity(count.min(1 << 16));
+        for _ in 0..count {
+            blobs.push(Arc::new(read_part(r, &mut crc, MAX_BLOB, "a blob")?));
+        }
+        let mut c = [0u8; 8];
+        r.read_exact(&mut c)?;
+        if crc != u64::from_le_bytes(c) {
             return Err(GpuPersistError::Side("CRC mismatch".into()));
         }
-        bitcode::deserialize(&data).map_err(|e| GpuPersistError::Side(e.to_string()))
+        Self::join(&skeleton, blobs).map(Some)
     }
+}
+
+fn read_len(
+    r: &mut impl Read,
+    crc: &mut u64,
+    max: u64,
+    what: &str,
+) -> Result<usize, GpuPersistError> {
+    let mut b = [0u8; 8];
+    r.read_exact(&mut b)?;
+    *crc = crc64::crc64(*crc, &b);
+    let n = u64::from_le_bytes(b);
+    if n > max {
+        return Err(GpuPersistError::Side(format!("{what} too long ({n})")));
+    }
+    usize::try_from(n).map_err(|_| GpuPersistError::Side(format!("{what} too long")))
+}
+
+fn read_part(
+    r: &mut impl Read,
+    crc: &mut u64,
+    max: u64,
+    what: &str,
+) -> Result<Vec<u8>, GpuPersistError> {
+    let n = read_len(r, crc, max, what)?;
+    let mut b = vec![0u8; n];
+    r.read_exact(&mut b)?;
+    *crc = crc64::crc64(*crc, &b);
+    Ok(b)
+}
+
+fn zstd_error(what: &str, code: usize) -> String {
+    format!("zstd {what}: {}", zstd_safe::get_error_name(code))
 }
 
 #[derive(Debug)]
@@ -251,6 +429,27 @@ impl Persist<'_> for Gpu {
 
     fn save(&self) -> Self::State {
         let side_id = random_id();
+        // A checkpoint and the stop of a move export nothing: a rollback to them lacks all that
+        // the GPU wrote (see the module).
+        let (scanout_saved, scanout_missing) = match self.save_kind {
+            SaveKind::Snapshot => (
+                self.scanout_saved
+                    .iter()
+                    .map(|(h, b)| (h.clone(), Arc::new(b.clone())))
+                    .collect(),
+                self.saved_missing.clone(),
+            ),
+            SaveKind::Checkpoint | SaveKind::Move => {
+                // as at a snapshot whose renderer cannot export: nothing shown, nothing to keep
+                let (shown, rest) = self.written_shown_first();
+                let missing = if shown.is_empty() {
+                    Vec::new()
+                } else {
+                    [shown, rest].concat()
+                };
+                (Vec::new(), missing)
+            }
+        };
         let mut resources: Vec<ResourceState> = self
             .resources
             .iter()
@@ -300,8 +499,8 @@ impl Persist<'_> for Gpu {
                 .iter()
                 .map(|c| c.link.lock().q.unacked_messages())
                 .collect(),
-            scanout_saved: self.scanout_saved.clone(),
-            scanout_missing: self.saved_missing.clone(),
+            scanout_saved,
+            scanout_missing,
         };
         // The wanted renderers are those before the snapshot closed the connections.
         let wanted: Vec<bool> = match &self.saved_wanted {
@@ -347,14 +546,19 @@ impl Persist<'_> for Gpu {
                 || self.redraw_after_resume
                 || self.redraw_at.is_some(),
             side: Some(Arc::new(side)),
+            side_lost: false,
         }
     }
 
     fn restore(args: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
-        let side = state.side.as_ref().ok_or(GpuPersistError::NoSide)?;
-        if side.side_id != state.side_id {
-            return Err(GpuPersistError::OtherSide);
-        }
+        let side = match (&state.side, state.side_lost) {
+            (Some(side), _) if side.side_id != state.side_id => {
+                return Err(GpuPersistError::OtherSide);
+            }
+            (Some(side), _) => side,
+            (None, true) => return restore_lost(args, state),
+            (None, false) => return Err(GpuPersistError::NoSide),
+        };
         let cfg: GpuConfig = serde_json::from_str(&state.config)?;
         let mut gpu = Gpu::new(cfg, args.filter)?;
         if state.conns.len() != gpu.conns.len()
@@ -405,7 +609,11 @@ impl Persist<'_> for Gpu {
         gpu.redraw_pending = state.redraw_pending;
 
         gpu.journal = side.journal.clone();
-        gpu.scanout_saved = side.scanout_saved.clone();
+        gpu.scanout_saved = side
+            .scanout_saved
+            .iter()
+            .map(|(h, b)| (h.clone(), b.to_vec()))
+            .collect();
         gpu.saved_missing = side.scanout_missing.clone();
         gpu.resources = side
             .resources
@@ -486,7 +694,63 @@ impl Persist<'_> for Gpu {
     }
 }
 
-fn restore_conn(c: &mut Conn, s: &GpuConnState, unacked: &[(u64, Vec<u8>)], now: i64) {
+/// The device of a state whose large state is lost (the side file [`SIDE_LOST`]): what the guest
+/// sees of it (the virtio state, the config space, the renderer's information), its session and
+/// its ids, and nothing of what the renderer held; each renderer starts empty.
+fn restore_lost(args: GpuConstructorArgs, state: &GpuState) -> Result<Gpu, GpuPersistError> {
+    let cfg: GpuConfig = serde_json::from_str(&state.config)?;
+    let mut gpu = Gpu::new(cfg, args.filter)?;
+    if state.conns.len() != gpu.conns.len()
+        || state.active >= gpu.conns.len()
+        || state.ctx_name.len() != gpu.ctx_name.len()
+        || state.caps.len() > gpu.caps.len()
+    {
+        return Err(GpuPersistError::Invalid(
+            "its renderers or tables do not match",
+        ));
+    }
+    if state.virtio_state.avail_features != gpu.avail_features {
+        return Err(GpuPersistError::Invalid("its features"));
+    }
+    gpu.queues = state.virtio_state.build_queues_checked(
+        &args.mem,
+        VirtioDeviceType::Gpu,
+        GPU_NUM_QUEUES,
+        FIRECRACKER_MAX_QUEUE_SIZE,
+    )?;
+    gpu.acked_features = state.virtio_state.acked_features;
+    gpu.config = state.config_space;
+    gpu.session = state.session;
+    let now = now_us();
+    for (c, s) in gpu.conns.iter_mut().zip(&state.conns) {
+        restore_conn(c, s, &[], now);
+        // it holds nothing of this guest that the device could build again
+        c.peer_session = 0;
+    }
+    gpu.active = state.active;
+    gpu.seq = state.seq;
+    gpu.info_seen = state.info_seen;
+    gpu.user_info = state.user_info;
+    gpu.n_switch = state.n_switch;
+    for (slot, (id, ver, data)) in gpu.caps.iter_mut().zip(&state.caps) {
+        *slot = Some(super::Capset {
+            id: *id,
+            ver: *ver,
+            data: data.clone(),
+        });
+    }
+    gpu.dinfo = state.dinfo.clone();
+    gpu.edid = state.edid.clone();
+    gpu.ctx_name = state.ctx_name.clone();
+    gpu.redraw_pending = true;
+    gpu.log_error_line(&format!(
+        "spacebox remote gpu: restored WITHOUT its large state (the side file says it is lost): session {:#x}; the renderer starts empty, and what the guest's GPU stack held before is gone",
+        gpu.session
+    ));
+    Ok(gpu)
+}
+
+fn restore_conn(c: &mut Conn, s: &GpuConnState, unacked: &[(u64, Blob)], now: i64) {
     c.peer_session = s.peer_session;
     c.rx_id = s.rx_id;
     c.rx_id_acked = s.rx_id;

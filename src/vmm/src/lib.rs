@@ -292,6 +292,17 @@ pub(crate) fn mem_size_mib(guest_memory: &GuestMemoryMmap) -> u64 {
     guest_memory.iter().map(|region| region.len()).sum::<u64>() >> 20
 }
 
+/// What a saved state is for: it decides how each device is readied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SaveFor {
+    /// A snapshot (`prepare_save`).
+    Snapshot,
+    /// A snapshot of the state only, the stop of a move (`prepare_move`).
+    Move,
+    /// A checkpoint of a running guest (`prepare_checkpoint`).
+    Checkpoint,
+}
+
 /// Error type for [`Vmm::dump_cpu_config()`]
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum DumpCpuConfigError {
@@ -699,7 +710,13 @@ impl Vmm {
 
     /// Saves the state of a paused Microvm.
     pub fn save_state(&mut self, vm_info: &VmInfo) -> Result<MicrovmState, MicrovmStateError> {
-        self.save_state_with(vm_info, false)
+        self.save_state_with(vm_info, SaveFor::Snapshot)
+    }
+
+    /// Saves the state of a paused Microvm for a snapshot of the state only (the stop of a
+    /// move): as [`Vmm::save_state`], but each device is readied by `prepare_move`.
+    pub fn save_move_state(&mut self, vm_info: &VmInfo) -> Result<MicrovmState, MicrovmStateError> {
+        self.save_state_with(vm_info, SaveFor::Move)
     }
 
     /// Saves the state of a Microvm whose vCPUs are paused, for a checkpoint: as
@@ -711,15 +728,16 @@ impl Vmm {
         &mut self,
         vm_info: &VmInfo,
     ) -> Result<MicrovmState, MicrovmStateError> {
-        self.save_state_with(vm_info, true)
+        self.save_state_with(vm_info, SaveFor::Checkpoint)
     }
 
     fn save_state_with(
         &mut self,
         vm_info: &VmInfo,
-        checkpoint: bool,
+        save_for: SaveFor,
     ) -> Result<MicrovmState, MicrovmStateError> {
         self.check_unsnapshottable_devices()?;
+        let checkpoint = save_for == SaveFor::Checkpoint;
 
         // A snapshot needs a paused guest; a checkpoint is also taken in its own stop of a
         // running guest, whose vCPUs are paused and whose devices are readied by
@@ -735,10 +753,10 @@ impl Vmm {
         // might modify the VirtIO transport and send an interrupt to the guest. If we save KVM
         // state before we save device state, that interrupt will never be delivered to the guest
         // upon resuming from the snapshot.
-        let device_states = if checkpoint {
-            self.device_manager.save_checkpoint()
-        } else {
-            self.device_manager.save()
+        let device_states = match save_for {
+            SaveFor::Checkpoint => self.device_manager.save_checkpoint(),
+            SaveFor::Move => self.device_manager.save_move(),
+            SaveFor::Snapshot => self.device_manager.save(),
         };
         let kvm_vm = self
             .vm

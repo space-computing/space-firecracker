@@ -278,6 +278,15 @@ pub trait VirtioDevice: AsAny + MutEventSubscriber + Send {
         self.prepare_save()
     }
 
+    /// Prepare the device for a snapshot of the state only: the stop of a move, whose memory
+    /// goes by the page server and whose guest goes on at the destination (or here again, if
+    /// the move fails). As `prepare_save` unless the device has work of a snapshot that a move
+    /// does not need (the GPU device waits for its renderer and exports what the GPU drew for a
+    /// snapshot only).
+    fn prepare_move(&mut self) {
+        self.prepare_save()
+    }
+
     /// Ends the work in flight when the guest stops (a pause request, the end of a lease, a
     /// disk error): after it the device writes nothing into guest memory until it is kicked.
     fn quiesce(&mut self) {}

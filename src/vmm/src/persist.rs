@@ -178,9 +178,13 @@ pub fn create_snapshot(
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
 ) -> Result<(), CreateSnapshotError> {
-    let mut microvm_state = vmm
-        .save_state(vm_info)
-        .map_err(CreateSnapshotError::MicrovmState)?;
+    // A snapshot of the state only is the stop of a move (its memory goes by the page server).
+    let mut microvm_state = if params.mem_file_path.is_none() {
+        vmm.save_move_state(vm_info)
+    } else {
+        vmm.save_state(vm_info)
+    }
+    .map_err(CreateSnapshotError::MicrovmState)?;
 
     snapshot_state_to_file(
         &microvm_state,
@@ -558,13 +562,24 @@ fn snapshot_state_from_file(
     let snapshot: Snapshot<MicrovmState> = Snapshot::load(&mut snapshot_reader)?;
     let mut state = snapshot.data;
     if let Some(gpu) = state.device_states.virtio_state.gpu_mut() {
-        // A snapshot with the GPU device is complete only with its side file.
+        // A snapshot with the GPU device is complete only with its side file, or with one that
+        // says that its large state is lost (the device is then restored without it).
         let path = side_path(snapshot_path);
         let side = File::open(&path)
             .map_err(GpuPersistError::Create)
             .and_then(|f| GpuSideState::read_from(&mut io::BufReader::new(f)))
             .map_err(|e| SnapshotStateFromFileError::GpuSide(path.display().to_string(), e))?;
-        gpu.side = Some(Arc::new(side));
+        match side {
+            Some(side) => gpu.side = Some(Arc::new(side)),
+            None => {
+                warn!(
+                    "The GPU device's side file ({}) says that its large state is lost: the \
+                     device is restored without it",
+                    path.display()
+                );
+                gpu.side_lost = true;
+            }
+        }
     }
     Ok(state)
 }

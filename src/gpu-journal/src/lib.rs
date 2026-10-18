@@ -33,6 +33,7 @@
 mod formats;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -235,6 +236,12 @@ pub enum Msg<'a> {
     Cursor(&'a [u8]),
 }
 
+/// Bytes that the journal keeps and never changes once kept (the bytes of an upload). They are
+/// shared, so that a copy of the journal for a snapshot or a checkpoint copies no bytes, and a
+/// stream of checkpoints can tell bytes that it sent before by their allocation
+/// ([`Journal::blobs`]).
+pub type Blob = Arc<Vec<u8>>;
+
 /// An upload into a resource, as the renderer took it: the bytes of `bx` at `level` with the
 /// guest's strides, from the first byte of the box on.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,7 +250,7 @@ struct Upload {
     stride: u32,
     layer_stride: u32,
     bx: [u32; 6],
-    data: Vec<u8>,
+    data: Blob,
 }
 
 fn covers(a: &[u32; 6], b: &[u32; 6]) -> bool {
@@ -340,7 +347,7 @@ impl Res {
                 stride: 0,
                 layer_stride: 0,
                 bx: [0, 0, 0, w, h, layers],
-                data: whole,
+                data: Arc::new(whole),
             });
         }
         self.upload_bytes = self.uploads.iter().map(|e| e.data.len() as u64).sum();
@@ -777,7 +784,7 @@ impl Journal {
                 stride,
                 layer_stride: layer,
                 bx,
-                data,
+                data: Arc::new(data),
             });
             self.upload_bytes = self.upload_bytes.saturating_add_signed(d);
         }
@@ -1302,7 +1309,7 @@ impl Journal {
         }
         for u in &r.uploads {
             let h = xfer(id, 0, u.level, u.stride, u.layer_stride, 0, u.bx);
-            out(Msg::Import(h, &u.data));
+            out(Msg::Import(h, &u.data[..]));
         }
     }
 
@@ -1460,6 +1467,45 @@ impl Journal {
     /// The fence id field of a request (for tools).
     pub fn fence_id(req: &[u8]) -> u64 {
         u64_at(req, 8)
+    }
+
+    /// The bytes of every upload, in a fixed order (the resources by id, the uploads of each in
+    /// order). With [`Journal::without_blobs`] and [`Journal::put_blobs`] the journal goes into
+    /// a snapshot in two parts, its structure and these bytes, so that a stream of checkpoints
+    /// sends the bytes of an upload once.
+    pub fn blobs(&self) -> Vec<Blob> {
+        self.resources
+            .values()
+            .flat_map(|r| r.uploads.iter().map(|u| u.data.clone()))
+            .collect()
+    }
+
+    /// A copy of the journal whose uploads hold no bytes (the structure of [`Journal::blobs`]).
+    pub fn without_blobs(&self) -> Journal {
+        let mut j = self.clone();
+        let empty = Blob::default();
+        for r in j.resources.values_mut() {
+            for u in &mut r.uploads {
+                u.data = empty.clone();
+            }
+        }
+        j
+    }
+
+    /// Put back into a copy of [`Journal::without_blobs`] the bytes of [`Journal::blobs`], in
+    /// the same order. Fails when there are fewer of them than uploads.
+    pub fn put_blobs(&mut self, blobs: &mut dyn Iterator<Item = Blob>) -> Result<(), &'static str> {
+        for r in self.resources.values_mut() {
+            for u in &mut r.uploads {
+                u.data = blobs.next().ok_or("fewer bytes than uploads")?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The number of uploads (the length of [`Journal::blobs`]).
+    pub fn blob_count(&self) -> usize {
+        self.resources.values().map(|r| r.uploads.len()).sum()
     }
 }
 

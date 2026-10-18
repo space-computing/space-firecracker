@@ -27,7 +27,8 @@ use std::time::{Duration, Instant};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::lease::{Lease, host_us, monotonic_ms};
-use super::stream::{self, PAGE, RegionDesc};
+use super::stream::{self, GpuKnown, PAGE, RegionDesc};
+use crate::devices::virtio::gpu::GpuSideState;
 use crate::logger::info;
 use crate::seccomp::BpfProgram;
 
@@ -262,6 +263,8 @@ pub enum Job {
         pages: Vec<u8>,
         /// The state.
         state: Vec<u8>,
+        /// The GPU device's large state, if the guest has the device.
+        gpu: Option<Arc<GpuSideState>>,
     },
     /// The limit of an answer changes.
     LostMs(u32),
@@ -458,6 +461,8 @@ struct Stream {
     lost_ms: u32,
     leased: bool,
     broken: bool,
+    /// What the receiving place has of the GPU's state on this connection.
+    gpu: GpuKnown,
 }
 
 fn run(jobs: &Receiver<Job>, shared: &Shared, lease: &Lease) {
@@ -491,9 +496,10 @@ fn run(jobs: &Receiver<Job>, shared: &Shared, lease: &Lease) {
                 held,
                 pages,
                 state,
+                gpu,
             } => {
                 if let Some(s) = stream.as_mut().filter(|s| !s.broken) {
-                    next = send_frame(s, epoch, held, pages, &state, shared, jobs, lease);
+                    next = send_frame(s, epoch, held, pages, &state, gpu, shared, jobs, lease);
                 }
             }
             Job::LostMs(ms) => {
@@ -577,6 +583,7 @@ fn start(
         lost_ms,
         leased,
         broken: false,
+        gpu: GpuKnown::default(),
     };
     match kind {
         StartKind::New { regions, ranges } => match full_copy(&s, &regions, &ranges, shared) {
@@ -774,16 +781,42 @@ fn send_frame(
     held: bool,
     pages: Vec<u8>,
     state: &[u8],
+    gpu: Option<Arc<GpuSideState>>,
     shared: &Shared,
     jobs: &Receiver<Job>,
     lease: &Lease,
 ) -> Option<Job> {
     let generation = s.generation;
-    let head = stream::frame_head(epoch, held, pages.len() as u64, state.len() as u64);
+    // The GPU's part: its structure and the blobs that the place does not have yet.
+    let gpu = match gpu.map(|side| side.split()) {
+        None => Vec::new(),
+        Some(Ok(parts)) => stream::gpu_section(parts, &mut s.gpu),
+        Some(Err(err)) => {
+            s.broken = true;
+            shared.tell(
+                generation,
+                Event::Lost {
+                    epoch,
+                    why: format!("the GPU device's state could not be copied: {err}"),
+                    broken: true,
+                },
+            );
+            return None;
+        }
+    };
+    let gpu_len: usize = gpu.iter().map(|p| p.bytes().len()).sum();
+    let head = stream::frame_head(
+        epoch,
+        held,
+        pages.len() as u64,
+        state.len() as u64,
+        gpu_len as u64,
+    );
     let fd = s.sock.as_raw_fd();
     let ok = send_all(fd, &head)
         && send_all(fd, &pages)
         && send_all(fd, state)
+        && gpu.iter().all(|p| send_all(fd, p.bytes()))
         && send_all(fd, stream::FRAME_END);
     {
         let mut spare = shared.spare.lock().expect("Poisoned lock");

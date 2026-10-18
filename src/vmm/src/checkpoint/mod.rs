@@ -68,6 +68,7 @@ use self::sender::{
 use self::signal::Signal;
 use self::stream::{ID_LEN, PAGE, RegionDesc};
 use crate::Vmm;
+use crate::devices::virtio::gpu::GpuSideState;
 use crate::logger::{error, info, warn};
 use crate::persist::{MicrovmState, VmInfo};
 use crate::seccomp::BpfProgram;
@@ -1612,9 +1613,13 @@ impl Vmm {
         };
         let mut broken: Option<String> = hook_gone.then(|| "the hook gives no answer".into());
         let mut state_bytes = Vec::new();
+        let mut gpu = None;
         if broken.is_none() {
             match self.save_verified(was_running) {
-                Ok(bytes) => state_bytes = bytes,
+                Ok((bytes, side)) => {
+                    state_bytes = bytes;
+                    gpu = side;
+                }
                 Err(why) => broken = Some(why),
             }
         }
@@ -1731,13 +1736,19 @@ impl Vmm {
                 held: leased,
                 pages,
                 state: state_bytes,
+                gpu,
             });
         }
     }
 
     /// The state of this stop as the bytes of a state file, with its checks: tried again with a
-    /// new save when a check fails, three times.
-    fn save_verified(&mut self, running: bool) -> Result<Vec<u8>, String> {
+    /// new save when a check fails, three times. With it, the GPU device's large state (its side
+    /// file, which the frame carries apart), if the guest has the device.
+    #[allow(clippy::type_complexity)]
+    fn save_verified(
+        &mut self,
+        running: bool,
+    ) -> Result<(Vec<u8>, Option<Arc<GpuSideState>>), String> {
         let vm_info = VmInfo::from(&*self);
         let mut tries = 0;
         loop {
@@ -1792,7 +1803,12 @@ impl Vmm {
                     Snapshot::new(&state)
                         .save(&mut bytes)
                         .map_err(|e| format!("the state could not be copied: {e}"))?;
-                    return Ok(bytes);
+                    let gpu = state
+                        .device_states
+                        .virtio_state
+                        .gpu_mut()
+                        .and_then(|g| g.side.take());
+                    return Ok((bytes, gpu));
                 }
                 Err(why) if tries >= SAVE_TRIES => {
                     return Err(format!(
