@@ -79,6 +79,10 @@ pub struct Vsock<B> {
 
     /// Gates RX delivery while a TRANSPORT_RESET is awaiting guest ack.
     pub(crate) pending_event_ack: bool,
+    /// Restored from the state of an active device with no reset event in it (a checkpoint keeps
+    /// the guest's connections): the restored backend has none of them, so the first kick
+    /// publishes a TRANSPORT_RESET, and the guest closes them and connects again.
+    pub(crate) reset_on_kick: bool,
 }
 
 impl<B> Vsock<B>
@@ -109,6 +113,7 @@ where
             rx_packet: VsockPacketRx::new()?,
             tx_packet: VsockPacketTx::default(),
             pending_event_ack: false,
+            reset_on_kick: false,
         })
     }
 
@@ -425,6 +430,18 @@ where
 
     fn kick(&mut self) {
         if self.is_activated() {
+            // A device restored from a checkpoint: the guest's connections have nothing behind
+            // them on this side (a takeover continues the guest of another host).
+            if std::mem::take(&mut self.reset_on_kick) {
+                info!(
+                    "[{:?}:{}] the restored state kept the guest's connections: transport reset",
+                    self.device_type(),
+                    self.id()
+                );
+                self.send_transport_reset_event().unwrap_or_else(|err| {
+                    error!("Failed to send reset transport event: {:?}", err);
+                });
+            }
             // Vsock has a complicated protocol that isn't resilient to any packet loss,
             // so for Vsock we don't support connection persistence through snapshot. Any
             // in-flight packets or events are simply lost and Vsock is restored 'empty'.
