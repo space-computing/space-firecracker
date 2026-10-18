@@ -117,6 +117,15 @@ const BACKLOG_RETRY: Duration = Duration::from_millis(1);
 /// With a CPU renderer: how long the user's renderer may be gone or silent before the CPU
 /// renderer takes over.
 const TAKEOVER_US: i64 = 10_000_000;
+/// With no CPU renderer: how long a renderer that was paired and is lost is waited for (the
+/// guest's commands wait for it, and it resumes) before the device serves the guest alone and
+/// the renderer starts empty when it comes back: longer than the cut of 60 s that the screen
+/// track's D1 (c) resumes (the agent's choice, 2026-10-19).
+const LOST_WAIT_US: i64 = 120_000_000;
+/// How long a device that no renderer has paired with since it was made waits for its first
+/// one before it serves the guest alone (the user's renderer is opened before the guest starts;
+/// a guest whose user's device is not attached must still run and shut down).
+const FIRST_WAIT_US: i64 = 5_000_000;
 /// Before a snapshot: how long the device waits for its renderer to answer and acknowledge
 /// everything.
 const SAVE_WAIT_US: i64 = 2_000_000;
@@ -518,6 +527,16 @@ pub struct Gpu {
     /// Which renderers were wanted before the snapshot closed the connections: wanted again
     /// when the VM resumes (`kick`).
     saved_wanted: Option<Vec<bool>>,
+    /// When the device was made (or restored): the start of [`FIRST_WAIT_US`].
+    made_at: i64,
+    /// The device serves the guest alone (`alone`): said once in the log each time it begins.
+    alone_said: bool,
+    /// A renderer has paired with this device (or with the device of the state it was restored
+    /// from): no first wait any more.
+    paired_once: bool,
+    /// Restored: at the resume every key and button that the guest holds is released (the
+    /// releases sent after the state was taken went to the VM of before).
+    pub(crate) release_at_kick: bool,
 }
 
 fn random_session() -> u64 {
@@ -658,6 +677,10 @@ impl Gpu {
             saving: false,
             save_kind: SaveKind::Snapshot,
             saved_wanted: None,
+            made_at: now_us(),
+            alone_said: false,
+            paired_once: false,
+            release_at_kick: false,
             cfg,
         };
         // One scanout; the two virgl capsets, which the sink answers for.
@@ -1619,7 +1642,8 @@ impl Gpu {
         let Some(mem) = self.mem() else {
             return Ok(());
         };
-        if !self.active_up() || self.saving {
+        let alone = self.alone();
+        if !(self.active_up() || alone) || self.saving {
             return Ok(()); // resumed by the sink's HELLO, or when a switch is done
         }
         if self.switch.is_none()
@@ -1631,7 +1655,7 @@ impl Gpu {
             self.saved_missing = Vec::new();
         }
         loop {
-            if self.conns[self.active].link.backlog() > self.tx_limit {
+            if !alone && self.conns[self.active].link.backlog() > self.tx_limit {
                 // Let the network drain before taking more work from the guest.
                 self.retry_timer.arm(BACKLOG_RETRY, None);
                 break;
@@ -1668,7 +1692,56 @@ impl Gpu {
             }
             self.source_one(&mem, cmd, req);
         }
+        if alone {
+            self.serve_alone();
+        }
         Ok(())
+    }
+
+    /// No renderer runs the guest's commands now and none is waited for: the renderer that runs
+    /// the guest is not paired, and it would start empty when it comes (no renderer has paired
+    /// since the device was made, for [`FIRST_WAIT_US`]; or it detached; or, with no CPU
+    /// renderer to switch to, it was lost for [`LOST_WAIT_US`], and is let go here). The
+    /// device then serves the guest alone ([`Self::serve_alone`]): a guest whose user's device
+    /// is not attached runs, shuts down and reboots, where its commands waited for ever and the
+    /// guest's shutdown stopped at its console (fc-switch, 2026-10-19).
+    fn alone(&mut self) -> bool {
+        if self.switch.is_some() || self.saving {
+            return false;
+        }
+        let a = self.active;
+        if self.conns[a].up() {
+            return false;
+        }
+        let now = now_us();
+        if self.conns[a].peer_session != 0
+            && self.conns.len() <= CPU
+            && now - self.conns[a].lost_at > LOST_WAIT_US
+        {
+            // it starts empty when it comes back, and gets the state from the journal
+            self.conns[a].peer_session = 0;
+            self.log_info(&format!(
+                "spacebox remote gpu: {} lost for {} s, and no CPU renderer: let go",
+                CONN_NAMES[a],
+                LOST_WAIT_US / 1_000_000
+            ));
+        }
+        self.conns[a].peer_session == 0 && (self.paired_once || now - self.made_at > FIRST_WAIT_US)
+    }
+
+    /// Serve the guest with no renderer: what waits for a renderer is answered here (as when a
+    /// renderer is lost: fences done, reads from guest memory, query results 0), and what was
+    /// queued for it is dropped, since the renderer that comes next starts empty and is built
+    /// from the journal, which has every command. Nothing is drawn meanwhile.
+    fn serve_alone(&mut self) {
+        if !self.alone_said {
+            self.alone_said = true;
+            self.log_info(
+                "spacebox remote gpu: no renderer: the device answers the guest's commands itself until one is paired",
+            );
+        }
+        self.drop_pending();
+        self.conns[self.active].link.forget();
     }
 
     /// The cursor queue: each element is answered at once; the cursor goes to the sink.
@@ -1944,6 +2017,26 @@ impl Gpu {
         if self.redraw_pending {
             // a redraw that waited for the renderer (`redraw`)
             self.redraw();
+        }
+        self.paired_once = true;
+        if ci == self.active {
+            // what the renderer sent of the keys while it was not paired was lost: no key or
+            // button stays held in the guest
+            self.release_inputs();
+        }
+    }
+
+    /// Release every key and button that the guest holds (a release that the renderer sent
+    /// while no device was paired, or that went to the VM of before a restore, never came).
+    fn release_inputs(&mut self) {
+        if let Some((kbd, tab)) = &self.inputs {
+            let n = kbd.lock().expect("Poisoned lock").release_held()
+                + tab.lock().expect("Poisoned lock").release_held();
+            if n > 0 {
+                self.log_info(&format!(
+                    "spacebox remote gpu: {n} keys or buttons that the guest held released"
+                ));
+            }
         }
     }
 
@@ -2782,6 +2875,14 @@ impl Gpu {
             self.redraw();
         }
         self.check_takeover();
+        // the wait for a first or a lost renderer may have ended with commands waiting
+        if self.conns[self.active].hello_done {
+            self.alone_said = false;
+        } else if self.alone()
+            && let Err(err) = self.process_ctrl_queue()
+        {
+            error!("gpu: control queue: {err}");
+        }
         self.notify_used();
     }
 
@@ -2926,6 +3027,9 @@ impl Gpu {
     /// The VM resumes (after a snapshot, or a restore): connect to the renderers again.
     fn resume_kick(&mut self) {
         let now = now_us();
+        if std::mem::take(&mut self.release_at_kick) {
+            self.release_inputs();
+        }
         self.resumed_at = Some(now);
         if std::mem::take(&mut self.redraw_after_resume) {
             self.redraw_at = Some(now + ROLLBACK_REDRAW_US);

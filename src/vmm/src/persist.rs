@@ -165,12 +165,13 @@ pub enum CreateSnapshotError {
     GpuSide(GpuPersistError),
 }
 
-/// Snapshot version. Majors 13 to 15 are the fork's: the state of a block device holds the
+/// Snapshot version. Majors 13 to 16 are the fork's: the state of a block device holds the
 /// requests that a disk error kept (13), for each of its queues, with the number of its queues
 /// and the poll window of their worker threads (14); the screen's devices, whose state bitcode of
 /// an earlier version cannot carry, beside those (15: the merge of the host track and the screen
-/// track, each of which had made its own major).
-pub const SNAPSHOT_VERSION: Version = Version::new(15, 0, 0);
+/// track, each of which had made its own major); the keys and buttons that an input device's
+/// guest holds (16).
+pub const SNAPSHOT_VERSION: Version = Version::new(16, 0, 0);
 
 /// Creates a Microvm snapshot.
 pub fn create_snapshot(
