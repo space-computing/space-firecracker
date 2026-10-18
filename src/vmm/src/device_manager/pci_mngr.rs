@@ -10,13 +10,14 @@ use serde::{Deserialize, Serialize};
 
 use super::persist::MmdsState;
 use crate::EventManager;
-use crate::device_manager::DevicePersistError;
+use crate::device_manager::{DevicePersistError, restore_screen};
 use crate::devices::pci::PciSegment;
 use crate::devices::virtio::balloon::Balloon;
 use crate::devices::virtio::balloon::persist::{BalloonConstructorArgs, BalloonState};
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::block::persist::{BlockConstructorArgs, BlockState};
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceId, VirtioDeviceType};
+use crate::devices::virtio::gpu::{Gpu, GpuState, Input, InputState, Sound, SoundState};
 use crate::devices::virtio::mem::VirtioMem;
 use crate::devices::virtio::mem::persist::{VirtioMemConstructorArgs, VirtioMemState};
 use crate::devices::virtio::net::Net;
@@ -325,6 +326,12 @@ pub struct PciDevicesState {
     pub pmem_devices: Vec<VirtioDeviceState<PmemState>>,
     /// Memory device state.
     pub memory_device: Option<VirtioDeviceState<VirtioMemState>>,
+    /// GPU device state (its large part is in the side file beside the snapshot).
+    pub gpu_device: Option<VirtioDeviceState<GpuState>>,
+    /// The input devices beside the GPU.
+    pub input_devices: Vec<VirtioDeviceState<InputState>>,
+    /// The sound device beside the GPU.
+    pub sound_device: Option<VirtioDeviceState<SoundState>>,
 }
 
 pub struct PciDevicesConstructorArgs<'a> {
@@ -334,6 +341,8 @@ pub struct PciDevicesConstructorArgs<'a> {
     pub instance_id: &'a str,
     pub event_manager: &'a mut EventManager,
     pub blk_worker_filter: Option<Arc<BpfProgram>>,
+    /// The `vmm` seccomp filter, for the GPU device's threads.
+    pub vmm_filter: Arc<BpfProgram>,
 }
 
 impl<'a> Debug for PciDevicesConstructorArgs<'a> {
@@ -481,6 +490,33 @@ impl PciDevices {
                         device_id: mem_dev.id().to_string(),
                         sbdf,
                         device_state,
+                        transport_state,
+                    })
+                }
+                VirtioDeviceType::Gpu => {
+                    let gpu = locked_virtio_dev.as_any().downcast_ref::<Gpu>().unwrap();
+                    state.gpu_device = Some(VirtioDeviceState {
+                        device_id: gpu.id().to_string(),
+                        sbdf,
+                        device_state: gpu.save(),
+                        transport_state,
+                    })
+                }
+                VirtioDeviceType::Input => {
+                    let input = locked_virtio_dev.as_any().downcast_ref::<Input>().unwrap();
+                    state.input_devices.push(VirtioDeviceState {
+                        device_id: input.id().to_string(),
+                        sbdf,
+                        device_state: input.save(),
+                        transport_state,
+                    })
+                }
+                VirtioDeviceType::Sound => {
+                    let sound = locked_virtio_dev.as_any().downcast_ref::<Sound>().unwrap();
+                    state.sound_device = Some(VirtioDeviceState {
+                        device_id: sound.id().to_string(),
+                        sbdf,
+                        device_state: sound.save(),
                         transport_state,
                     })
                 }
@@ -691,6 +727,47 @@ impl<'a> Persist<'a> for PciDevices {
             )?
         }
 
+        if let Some(gpu_state) = &state.gpu_device {
+            let inputs: Vec<&InputState> = state
+                .input_devices
+                .iter()
+                .map(|s| &s.device_state)
+                .collect();
+            let (gpu, inputs, sound) = restore_screen(
+                mem,
+                &constructor_args.vmm_filter,
+                constructor_args.vm_resources,
+                &gpu_state.device_state,
+                &inputs,
+                state.sound_device.as_ref().map(|s| &s.device_state),
+            )?;
+            pci_devices.restore_pci_device(
+                constructor_args.vm,
+                gpu,
+                &gpu_state.device_id,
+                &gpu_state.transport_state,
+                constructor_args.event_manager,
+            )?;
+            for (dev, s) in inputs.into_iter().zip(&state.input_devices) {
+                pci_devices.restore_pci_device(
+                    constructor_args.vm,
+                    dev,
+                    &s.device_id,
+                    &s.transport_state,
+                    constructor_args.event_manager,
+                )?;
+            }
+            if let (Some(dev), Some(s)) = (sound, &state.sound_device) {
+                pci_devices.restore_pci_device(
+                    constructor_args.vm,
+                    dev,
+                    &s.device_id,
+                    &s.transport_state,
+                    constructor_args.event_manager,
+                )?;
+            }
+        }
+
         // After PCI devices are restored, we must set up the GSI routes (one KVM_SET_GSI_ROUTING call for all vectors),
         // and enable all unmasked vectors (one kvm_irqfd call per vector).
         // Ordering: routing must be set before IRQFDs to avoid kernel panics on
@@ -850,6 +927,7 @@ mod tests {
             instance_id: "microvm-id",
             event_manager: &mut event_manager,
             blk_worker_filter: None,
+            vmm_filter: Arc::new(Vec::new()),
         };
         let _restored_dev_manager = PciDevices::restore(restore_args, pci_state).unwrap();
 

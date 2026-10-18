@@ -625,6 +625,35 @@ paths:
           schema:
             $ref: "#/definitions/Error"
 
+  /gpu:
+    put:
+      summary: Creates a GPU device. Pre-boot only.
+      description:
+        Enables a virtio-gpu device (virgl) whose commands are rendered outside Firecracker,
+        by the renderer listening on a unix socket (the sink of the Spacebox QEMU fork's remote
+        GPU). The device connects when the microVM starts and again after a lost connection.
+        A snapshot of a microVM with this device has a second file beside the snapshot file,
+        `<snapshot_path>.gpu` (the device's renderer state), which loading the snapshot needs.
+      operationId: putGpuDevice
+      parameters:
+        - name: body
+          in: body
+          description: GPU device properties
+          required: true
+          schema:
+            $ref: "#/definitions/GpuDevice"
+      responses:
+        204:
+          description: GPU device created
+        400:
+          description: GPU device cannot be created due to bad input
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/Error"
+
   /serial:
     put:
       summary: Configures the serial console
@@ -1564,6 +1593,8 @@ definitions:
         $ref: "#/definitions/Vsock"
       entropy:
         $ref: "#/definitions/EntropyDevice"
+      gpu:
+        $ref: "#/definitions/GpuDevice"
 
   InstanceActionInfo:
     type: object
@@ -2059,6 +2090,76 @@ definitions:
     properties:
       rate_limiter:
         $ref: "#/definitions/RateLimiter"
+
+  GpuDevice:
+    type: object
+    description:
+      Defines a GPU device whose commands are rendered by a renderer outside Firecracker.
+    required:
+      - socket_path
+    properties:
+      socket_path:
+        type: string
+        description: Path of the renderer's unix socket.
+      stats_path:
+        type: string
+        description:
+          A file to which the device appends its statistics every 5 seconds and its messages
+          about the connection.
+      fence_window:
+        type: integer
+        minimum: 0
+        description:
+          Fenced commands answered before the renderer has run them (default 8, 0 = every
+          command waits for the renderer).
+      fence_age_ms:
+        type: integer
+        minimum: 0
+        description:
+          Beyond the window, fenced commands are answered early while the oldest unanswered
+          one was sent less than two round trips and this many milliseconds ago (default 20).
+      tx_limit_mib:
+        type: integer
+        minimum: 1
+        description:
+          The device stops taking the guest's commands while more than this many MiB wait to
+          be written to the renderer (default 8).
+      zstd_level:
+        type: integer
+        minimum: 0
+        maximum: 19
+        description:
+          The zstd level of the connection, used when the renderer offers compression too
+          (default 1, 0 = not offered).
+      debug_wait:
+        type: boolean
+        description: Log the commands that wait for the renderer into the statistics file.
+      dump_path:
+        type: string
+        description: A file that gets a copy of every message written to the renderer.
+      input:
+        type: boolean
+        description:
+          Two virtio-input devices, a keyboard and a tablet (absolute axes, buttons, wheels),
+          fed by the renderer's input (default false).
+      sound:
+        type: boolean
+        description:
+          A virtio-snd device with one playback stream (48 kHz, 2 channels, 16 bit), played at
+          playback speed and sent to the renderer (default false).
+      agent_socket_path:
+        type: string
+        description:
+          A unix socket on which the device takes the connection of the guest agent and carries
+          the renderer's scroll channel to it; with the vsock device this is
+          `<vsock uds_path>_<port>` of the agent's port. The device creates it.
+      cpu_socket_path:
+        type: string
+        description:
+          The unix socket of a renderer on the server's CPU. With it, the device switches to that
+          renderer when the renderer of socket_path detaches or has been gone or silent for 10 s,
+          and back when that renderer connects again; the guest keeps running, and the device
+          builds the renderer's state again from what it keeps.
 
   SerialDevice:
     type: object

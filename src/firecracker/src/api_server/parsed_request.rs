@@ -17,6 +17,7 @@ use super::request::boot_source::parse_put_boot_source;
 use super::request::cpu_configuration::parse_put_cpu_config;
 use super::request::drive::{parse_patch_drive, parse_put_drive};
 use super::request::entropy::parse_put_entropy;
+use super::request::gpu::parse_put_gpu;
 use super::request::instance_info::parse_get_instance_info;
 use super::request::logger::parse_put_logger;
 use super::request::machine_configuration::{
@@ -114,6 +115,7 @@ impl TryFrom<&Request> for ParsedRequest {
             (Method::Put, "snapshot", Some(body)) => parse_put_snapshot(body, path_tokens.next()),
             (Method::Put, "vsock", Some(body)) => parse_put_vsock(body),
             (Method::Put, "entropy", Some(body)) => parse_put_entropy(body),
+            (Method::Put, "gpu", Some(body)) => parse_put_gpu(body),
             (Method::Put, "hotplug", Some(body)) if path_tokens.next() == Some("memory") => {
                 parse_put_memory_hotplug(body)
             }
@@ -861,6 +863,19 @@ pub mod tests {
                     \"refill_time\": 0 } } }";
         sender
             .write_all(http_request("PUT", "/entropy", Some(body)).as_bytes())
+            .unwrap();
+        connection.try_read().unwrap();
+        let req = connection.pop_parsed_request().unwrap();
+        ParsedRequest::try_from(&req).unwrap();
+    }
+
+    #[test]
+    fn test_try_from_put_gpu() {
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        let mut connection = HttpConnection::new(receiver);
+        let body = "{ \"socket_path\": \"/run/gpu.sock\", \"stats_path\": \"/run/gpu.stats\" }";
+        sender
+            .write_all(http_request("PUT", "/gpu", Some(body)).as_bytes())
             .unwrap();
         connection.try_read().unwrap();
         let req = connection.pop_parsed_request().unwrap();

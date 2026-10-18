@@ -514,6 +514,19 @@
                 "comment": "Rust std uses it to write to unix socket"
             },
             {
+                "syscall": "shutdown",
+                "comment": "The GPU device ends its connection to the renderer, which wakes its reader and writer threads",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 2,
+                        "comment": "libc::SHUT_RDWR"
+                    }
+                ]
+            },
+            {
                 "syscall": "tkill",
                 "comment": "tkill is used by libc::abort during a panic to raise SIGABRT",
                 "args": [

@@ -37,6 +37,7 @@ use crate::vmm_config::checkpoint::{
 };
 use crate::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig, DriveError};
 use crate::vmm_config::entropy::{EntropyDeviceConfig, EntropyDeviceError};
+use crate::vmm_config::gpu::{GpuConfig, GpuConfigError};
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{MachineConfig, MachineConfigError, MachineConfigUpdate};
 use crate::vmm_config::memory_hotplug::{
@@ -126,6 +127,9 @@ pub enum VmmAction {
     /// Set the entropy device using `EntropyDeviceConfig` as input. This action can only be called
     /// before the microVM has booted.
     SetEntropyDevice(EntropyDeviceConfig),
+    /// Set the GPU device using `GpuConfig` as input. This action can only be called before the
+    /// microVM has booted.
+    SetGpuDevice(GpuConfig),
     /// Get the memory hotplug device configuration and status.
     GetMemoryHotplugStatus,
     /// Set the memory hotplug device using `MemoryHotplugConfig` as input. This action can only be
@@ -195,6 +199,8 @@ pub enum VmmActionError {
     DriveConfig(#[from] DriveError),
     /// Entropy config error: {0}
     EntropyConfig(#[from] EntropyDeviceError),
+    /// GPU config error: {0}
+    GpuConfig(#[from] GpuConfigError),
     /// Pmem config error: {0}
     PmemConfig(#[from] PmemConfigError),
     /// Memory hotplug config error: {0}
@@ -534,6 +540,7 @@ impl<'a> PrebootApiController<'a> {
             StartMicroVm => self.start_microvm(),
             UpdateMachineConfiguration(config) => self.update_machine_config(config),
             SetEntropyDevice(config) => self.set_entropy_device(config),
+            SetGpuDevice(config) => self.set_gpu_device(config),
             SetMemoryHotplugDevice(config) => self.set_memory_hotplug_device(config),
             // Operations not allowed pre-boot.
             CreateSnapshot(_)
@@ -657,6 +664,12 @@ impl<'a> PrebootApiController<'a> {
     fn set_entropy_device(&mut self, cfg: EntropyDeviceConfig) -> Result<VmmData, VmmActionError> {
         self.boot_path = true;
         self.vm_resources.build_entropy_device(cfg)?;
+        Ok(VmmData::Empty)
+    }
+
+    fn set_gpu_device(&mut self, cfg: GpuConfig) -> Result<VmmData, VmmActionError> {
+        self.boot_path = true;
+        self.vm_resources.set_gpu_device(cfg)?;
         Ok(VmmData::Empty)
     }
 
@@ -953,6 +966,7 @@ impl RuntimeApiController {
             | SetVsockDevice(_)
             | SetMmdsConfiguration(_)
             | SetEntropyDevice(_)
+            | SetGpuDevice(_)
             | SetMemoryHotplugDevice(_)
             | StartMicroVm
             | UpdateMachineConfiguration(_) => Err(VmmActionError::OperationNotSupportedPostBoot),
@@ -1216,6 +1230,28 @@ mod tests {
         let seccomp_filters = BpfThreadMap::new();
         let mut preboot = default_preboot(&mut vm_resources, &mut evmgr, &seccomp_filters);
         preboot.handle_preboot_request(request)
+    }
+
+    #[test]
+    fn test_preboot_set_gpu_device() {
+        let mut vm_resources = VmResources::default();
+        let mut evmgr = EventManager::new().unwrap();
+        let seccomp_filters = BpfThreadMap::new();
+        let mut preboot = default_preboot(&mut vm_resources, &mut evmgr, &seccomp_filters);
+        let cfg = GpuConfig {
+            socket_path: "/gpu.sock".into(),
+            ..Default::default()
+        };
+        preboot
+            .handle_preboot_request(VmmAction::SetGpuDevice(cfg.clone()))
+            .unwrap();
+        preboot
+            .handle_preboot_request(VmmAction::SetGpuDevice(GpuConfig::default()))
+            .unwrap_err();
+        match preboot.handle_preboot_request(VmmAction::GetFullVmConfig) {
+            Ok(VmmData::FullVmConfig(c)) => assert_eq!(c.gpu, Some(cfg)),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -1585,6 +1621,10 @@ mod tests {
         check_unsupported(runtime_request(VmmAction::SetEntropyDevice(
             EntropyDeviceConfig::default(),
         )));
+        check_unsupported(runtime_request(VmmAction::SetGpuDevice(GpuConfig {
+            socket_path: "/gpu.sock".into(),
+            ..Default::default()
+        })));
         check_unsupported(runtime_request(VmmAction::SetMemoryHotplugDevice(
             MemoryHotplugConfig::default(),
         )));

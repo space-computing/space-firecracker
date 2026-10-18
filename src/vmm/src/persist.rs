@@ -26,6 +26,7 @@ use crate::cpu_config::x86_64::cpuid::CpuidTrait;
 #[cfg(target_arch = "x86_64")]
 use crate::cpu_config::x86_64::cpuid::common::get_vendor_id_from_host;
 use crate::device_manager::{DevicePersistError, DevicesState};
+use crate::devices::virtio::gpu::{GpuPersistError, GpuSideState, side_path};
 // Re-exported so external crates inspecting a `MicrovmState` snapshot can match on the
 // serialised virtio transport variant.
 pub use crate::device_manager::VirtioDevicesState;
@@ -160,12 +161,16 @@ pub enum CreateSnapshotError {
     SerializeMicrovmState(#[from] crate::snapshot::SnapshotError),
     /// Cannot perform {0} on the snapshot backing file: {1}
     SnapshotBackingFile(&'static str, io::Error),
+    /// Cannot write the GPU device's side file: {0}
+    GpuSide(GpuPersistError),
 }
 
-/// Snapshot version. Majors 13 and 14 are the fork's: the state of a block device holds the
+/// Snapshot version. Majors 13 to 15 are the fork's: the state of a block device holds the
 /// requests that a disk error kept (13), for each of its queues, with the number of its queues
-/// and the poll window of their worker threads (14).
-pub const SNAPSHOT_VERSION: Version = Version::new(14, 0, 0);
+/// and the poll window of their worker threads (14); the screen's devices, whose state bitcode of
+/// an earlier version cannot carry, beside those (15: the merge of the host track and the screen
+/// track, each of which had made its own major).
+pub const SNAPSHOT_VERSION: Version = Version::new(15, 0, 0);
 
 /// Creates a Microvm snapshot.
 pub fn create_snapshot(
@@ -173,7 +178,7 @@ pub fn create_snapshot(
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
 ) -> Result<(), CreateSnapshotError> {
-    let microvm_state = vmm
+    let mut microvm_state = vmm
         .save_state(vm_info)
         .map_err(CreateSnapshotError::MicrovmState)?;
 
@@ -182,6 +187,14 @@ pub fn create_snapshot(
         &params.snapshot_path,
         params.sync_snapshot_files,
     )?;
+    if let Some(side) = microvm_state
+        .device_states
+        .virtio_state
+        .gpu_mut()
+        .and_then(|g| g.side.take())
+    {
+        gpu_side_to_file(&side, &params.snapshot_path, params.sync_snapshot_files)?;
+    }
 
     // A snapshot of the state only: no memory is written and no dirty bitmap is read or reset.
     let Some(mem_file_path) = &params.mem_file_path else {
@@ -205,6 +218,32 @@ pub fn create_snapshot(
     vmm.device_manager
         .mark_virtio_queue_memory_dirty(kvm_vm.guest_memory());
 
+    Ok(())
+}
+
+/// The GPU device's large state, in the file beside the snapshot.
+fn gpu_side_to_file(
+    side: &GpuSideState,
+    snapshot_path: &Path,
+    sync_snapshot_files: bool,
+) -> Result<(), CreateSnapshotError> {
+    use self::CreateSnapshotError::*;
+    let path = side_path(snapshot_path);
+    let mut f = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .map_err(|err| GpuSide(GpuPersistError::Create(err)))?;
+    let mut w = io::BufWriter::new(&mut f);
+    side.write_to(&mut w).map_err(GpuSide)?;
+    w.flush()
+        .map_err(|err| GpuSide(GpuPersistError::Create(err)))?;
+    drop(w);
+    if sync_snapshot_files {
+        f.sync_all()
+            .map_err(|err| GpuSide(GpuPersistError::Create(err)))?;
+    }
     Ok(())
 }
 
@@ -508,15 +547,26 @@ pub enum SnapshotStateFromFileError {
     UnknownNetworkDevice,
     /// Unknown Vsock Device.
     UnknownVsockDevice,
+    /// The GPU device's side file ({0}): {1}
+    GpuSide(String, GpuPersistError),
 }
 
 fn snapshot_state_from_file(
     snapshot_path: &Path,
 ) -> Result<MicrovmState, SnapshotStateFromFileError> {
     let mut snapshot_reader = File::open(snapshot_path)?;
-    let snapshot = Snapshot::load(&mut snapshot_reader)?;
-
-    Ok(snapshot.data)
+    let snapshot: Snapshot<MicrovmState> = Snapshot::load(&mut snapshot_reader)?;
+    let mut state = snapshot.data;
+    if let Some(gpu) = state.device_states.virtio_state.gpu_mut() {
+        // A snapshot with the GPU device is complete only with its side file.
+        let path = side_path(snapshot_path);
+        let side = File::open(&path)
+            .map_err(GpuPersistError::Create)
+            .and_then(|f| GpuSideState::read_from(&mut io::BufReader::new(f)))
+            .map_err(|e| SnapshotStateFromFileError::GpuSide(path.display().to_string(), e))?;
+        gpu.side = Some(Arc::new(side));
+    }
+    Ok(state)
 }
 
 /// Error type for [`guest_memory_from_file`].

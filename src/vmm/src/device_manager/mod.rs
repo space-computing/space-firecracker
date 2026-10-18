@@ -40,6 +40,11 @@ use crate::devices::virtio::balloon::BalloonError;
 use crate::devices::virtio::block::BlockError;
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceId, VirtioDeviceType};
+use crate::devices::virtio::gpu::{
+    Gpu, GpuAudioOut, GpuConstructorArgs, GpuPersistError, GpuState, Input, InputConstructorArgs,
+    InputKind, InputPersistError, InputState, Sound, SoundConstructorArgs, SoundPersistError,
+    SoundState,
+};
 use crate::devices::virtio::mem::persist::VirtioMemPersistError;
 use crate::devices::virtio::net::Net;
 use crate::devices::virtio::net::persist::NetPersistError;
@@ -684,6 +689,16 @@ pub enum VirtioDevicesState {
     Pci(pci_mngr::PciDevicesState),
 }
 
+impl VirtioDevicesState {
+    /// The GPU device's state, if the VM has one.
+    pub fn gpu_mut(&mut self) -> Option<&mut GpuState> {
+        match self {
+            VirtioDevicesState::Mmio(s) => s.gpu_device.as_mut().map(|d| &mut d.device_state),
+            VirtioDevicesState::Pci(s) => s.gpu_device.as_mut().map(|d| &mut d.device_state),
+        }
+    }
+}
+
 impl Default for VirtioDevicesState {
     fn default() -> Self {
         // Mirror `VirtioDevices::default()`, which uses the MMIO transport.
@@ -702,6 +717,65 @@ pub struct DevicesState {
     pub acpi_state: persist::ACPIDeviceManagerState,
     /// Serial device state
     pub serial_state: Option<persist::SerialState>,
+}
+
+/// The screen's devices restored from a snapshot: the GPU, then the input devices that take
+/// its renderer's input, then the sound device that plays through its connection.
+#[allow(clippy::type_complexity)]
+pub(crate) fn restore_screen(
+    mem: &GuestMemoryMmap,
+    filter: &Arc<BpfProgram>,
+    vm_resources: &mut VmResources,
+    gpu: &GpuState,
+    inputs: &[&InputState],
+    sound: Option<&SoundState>,
+) -> Result<
+    (
+        Arc<Mutex<Gpu>>,
+        Vec<Arc<Mutex<Input>>>,
+        Option<Arc<Mutex<Sound>>>,
+    ),
+    DevicePersistError,
+> {
+    let mut dev = Gpu::restore(
+        GpuConstructorArgs {
+            mem: mem.clone(),
+            filter: filter.clone(),
+        },
+        gpu,
+    )?;
+    let mut kbd = None;
+    let mut tab = None;
+    let mut restored = Vec::new();
+    for s in inputs {
+        let i = Arc::new(Mutex::new(Input::restore(
+            InputConstructorArgs { mem: mem.clone() },
+            s,
+        )?));
+        match i.lock().expect("Poisoned lock").kind() {
+            InputKind::Keyboard => kbd = Some(i.clone()),
+            InputKind::Tablet => tab = Some(i.clone()),
+        }
+        restored.push(i);
+    }
+    if let (Some(k), Some(t)) = (kbd, tab) {
+        dev.set_inputs(k, t);
+    }
+    vm_resources.gpu = Some(dev.cfg.clone());
+    let dev = Arc::new(Mutex::new(dev));
+    let sound = sound
+        .map(|s| {
+            Sound::restore(
+                SoundConstructorArgs {
+                    mem: mem.clone(),
+                    out: Box::new(GpuAudioOut(dev.clone())),
+                },
+                s,
+            )
+            .map(|s| Arc::new(Mutex::new(s)))
+        })
+        .transpose()?;
+    Ok((dev, restored, sound))
 }
 
 /// Errors for (de)serialization of the devices.
@@ -736,6 +810,12 @@ pub enum DevicePersistError {
     Pmem(#[from] PmemPersistError),
     /// virtio-mem: {0}
     VirtioMem(#[from] VirtioMemPersistError),
+    /// GPU: {0}
+    Gpu(#[from] GpuPersistError),
+    /// Input: {0}
+    Input(#[from] InputPersistError),
+    /// Sound: {0}
+    Sound(#[from] SoundPersistError),
     /// Could not activate device: {0}
     DeviceActivation(#[from] ActivateError),
     /// Resource allocator error: {0}
@@ -765,6 +845,8 @@ pub struct DeviceRestoreArgs<'a> {
     pub vm_resources: &'a mut VmResources,
     pub instance_id: &'a str,
     pub blk_worker_filter: Option<Arc<BpfProgram>>,
+    /// The `vmm` seccomp filter, for devices whose threads start at the restore (the GPU).
+    pub vmm_filter: Arc<BpfProgram>,
 }
 
 impl std::fmt::Debug for DeviceRestoreArgs<'_> {
@@ -838,6 +920,7 @@ impl<'a> Persist<'a> for DeviceManager {
                     instance_id: constructor_args.instance_id,
                     event_manager: constructor_args.event_manager,
                     blk_worker_filter: constructor_args.blk_worker_filter.clone(),
+                    vmm_filter: constructor_args.vmm_filter.clone(),
                 };
                 let pci_devices = PciDevices::restore(pci_ctor_args, pci_state)
                     .map_err(DeviceManagerPersistError::PciRestore)?;
@@ -851,6 +934,7 @@ impl<'a> Persist<'a> for DeviceManager {
                     vm_resources: constructor_args.vm_resources,
                     instance_id: constructor_args.instance_id,
                     blk_worker_filter: constructor_args.blk_worker_filter.clone(),
+                    vmm_filter: constructor_args.vmm_filter.clone(),
                 };
                 let mmio_virtio_devices = MMIOVirtioDevices::restore(mmio_ctor_args, mmio_state)
                     .map_err(DeviceManagerPersistError::MmioRestore)?;

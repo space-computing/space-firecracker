@@ -1,0 +1,21 @@
+[package]
+name = "gpu-journal"
+version = "0.1.0"
+authors = ["The Spacebox Authors"]
+edition = "2024"
+license = "Apache-2.0"
+description = "What the remote GPU device keeps of its renderer's state, to build it again in another renderer"
+
+[lib]
+bench = false
+
+[[bin]]
+name = "gpu-replay"
+path = "src/bin/gpu-replay.rs"
+bench = false
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+
+[lints]
+workspace = true
