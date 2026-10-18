@@ -1941,6 +1941,10 @@ impl Gpu {
         if let Err(err) = self.process_ctrl_queue() {
             error!("gpu: control queue: {err}");
         }
+        if self.redraw_pending {
+            // a redraw that waited for the renderer (`redraw`)
+            self.redraw();
+        }
     }
 
     /// Renderer `ci` holds nothing of this guest.
@@ -2472,10 +2476,15 @@ impl Gpu {
     }
 
     /// Ask the guest agent to make every program draw again; if it is not connected (after a
-    /// restore it connects again), as soon as it is.
+    /// restore it connects again), as soon as it is, and only while the renderer that runs the
+    /// guest is there: the agent changes the monitor's scale and back, and the compositor that
+    /// applies a scale waits for its GPU work, so with no renderer it did not answer the agent
+    /// in time and the scale stayed changed (a takeover, fix-gpu, 2026-10-18). A redraw that
+    /// waits for the renderer is asked for when the renderer is paired again (`hello`).
     pub(crate) fn redraw(&mut self) {
+        let renderer = self.active_up();
         match self.agent.as_mut() {
-            Some(ag) if ag.is_connected() => {
+            Some(ag) if ag.is_connected() && renderer => {
                 ag.send(b"REDRAW\n");
                 self.redraw_pending = false;
                 self.log_info("spacebox remote gpu: asked the guest agent to redraw");

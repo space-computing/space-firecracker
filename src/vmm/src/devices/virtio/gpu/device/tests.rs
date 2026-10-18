@@ -2112,6 +2112,40 @@ fn the_side_files_record_of_missing_content_round_trips() {
 }
 
 #[test]
+fn a_redraw_waits_until_the_renderer_is_paired() {
+    let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+    let path = dir.as_path().join("gpu.sock");
+    let agent_path = dir.as_path().join("vsock.sock_5000");
+    let listener = UnixListener::bind(&path).unwrap();
+    let mem = single_region_mem(0x200000);
+    let mut c = cfg(path.to_str().unwrap());
+    c.agent_socket_path = Some(agent_path.to_str().unwrap().into());
+    let mut r = rig_with(&mem, c);
+    let mut guest = UnixStream::connect(&agent_path).unwrap();
+    r.gpu.agent.as_mut().unwrap().accept().unwrap();
+    r.gpu.agent_connected();
+    guest
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    // no renderer: the compositor could not answer the agent's change of scale; it waits
+    r.gpu.redraw();
+    assert!(r.gpu.redraw_pending);
+    let mut got = [0u8; 7];
+    guest.read_exact(&mut got).unwrap_err();
+    // the renderer is paired: the redraw is asked for then
+    r.gpu.process_retry();
+    let mut sink = sink_on(&listener);
+    sink.hello(0xabc, r.gpu.session, 0, false);
+    pump(&mut r.gpu, |g| g.conns[USER].hello_done);
+    guest
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    guest.read_exact(&mut got).unwrap();
+    assert_eq!(&got, b"REDRAW\n");
+    assert!(!r.gpu.redraw_pending);
+}
+
+#[test]
 fn a_rollback_to_an_incomplete_snapshot_logs_the_lack_and_redraws_2_s_after_the_resume() {
     let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
     let path = dir.as_path().join("gpu.sock");
