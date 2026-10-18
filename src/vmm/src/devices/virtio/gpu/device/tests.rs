@@ -10,6 +10,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::time::Instant;
 
 use super::*;
+use crate::devices::virtio::gpu::input::{BTN_LEFT, EV_KEY, event as input_event};
 use crate::devices::virtio::gpu::keymap::QCODE_TO_LINUX;
 use crate::devices::virtio::gpu::protocol::EXPECT_LEN;
 use crate::devices::virtio::gpu::protocol::{Hdr, ZPacker, ZUnpacker};
@@ -2109,6 +2110,172 @@ fn the_side_files_record_of_missing_content_round_trips() {
     st.side.as_ref().unwrap().write_to(&mut bytes).unwrap();
     bytes[..8].copy_from_slice(b"SPGPU001");
     GpuSideState::read_from(&mut bytes.as_slice()).unwrap_err();
+}
+
+/// Put command `req` on the guest's control queue at slot `i` (the request and a writable
+/// answer); returns the address of the answer.
+fn guest_put(r: &Rig<'_>, i: u16, req: &[u8]) -> u64 {
+    use crate::devices::virtio::queue::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
+    let req_at = 0x60000 + u64::from(i) * 0x2000;
+    let resp_at = req_at + 0x1000;
+    r.mem.write_slice(req, GuestAddress(req_at)).unwrap();
+    r.mem
+        .write_slice(&[0xee; 64], GuestAddress(resp_at))
+        .unwrap();
+    r.ctrl.dtable[usize::from(2 * i)].set(
+        req_at,
+        u32::try_from(req.len()).unwrap(),
+        VIRTQ_DESC_F_NEXT,
+        2 * i + 1,
+    );
+    r.ctrl.dtable[usize::from(2 * i + 1)].set(resp_at, 0x1000, VIRTQ_DESC_F_WRITE, 0);
+    r.ctrl.avail.ring[usize::from(i)].set(2 * i);
+    r.ctrl.avail.idx.set(i + 1);
+    resp_at
+}
+
+fn answered(r: &Rig<'_>, at: u64) -> Option<u32> {
+    let mut b = [0u8; 24];
+    r.mem.read_slice(&mut b, GuestAddress(at)).unwrap();
+    (b != [0xee; 24]).then(|| resp_type(&b))
+}
+
+#[test]
+fn a_guest_whose_renderer_never_came_is_served_by_the_device_after_the_first_wait() {
+    let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+    let path = dir.as_path().join("gpu.sock");
+    let mem = single_region_mem(0x200000);
+    let mut r = rig_with(&mem, cfg(path.to_str().unwrap()));
+    // No renderer yet, within the first wait: a fenced command waits in the guest's queue.
+    let a1 = guest_put(&r, 0, &submit(Some(7), 1, &[]));
+    r.gpu.process_ctrl_queue().unwrap();
+    assert_eq!(answered(&r, a1), None);
+    assert!(!r.gpu.alone());
+    // The first wait is over: the device takes the command and answers it, keeps it in its
+    // journal (the context), and queues nothing for a renderer.
+    r.gpu.made_at -= FIRST_WAIT_US + 1;
+    let a2 = guest_put(&r, 1, &ctx_create(3));
+    r.gpu.process_ack_timer();
+    assert_eq!(answered(&r, a1), Some(RESP_OK_NODATA));
+    assert_eq!(answered(&r, a2), Some(RESP_OK_NODATA));
+    assert_eq!(r.used(), 2);
+    assert!(r.gpu.pending.is_empty());
+    assert_eq!(r.gpu.journal.stats().contexts, 1);
+    assert_eq!(r.gpu.conns[USER].link.lock().q.unacked, 0);
+    assert!(r.gpu.alone_said);
+    // A renderer that comes then starts empty and gets the state from the journal.
+    let listener = UnixListener::bind(&path).unwrap();
+    r.gpu.process_retry();
+    let mut sink = sink_on(&listener);
+    sink.hello(0xabc, r.gpu.session, 0, false);
+    pump(&mut r.gpu, |g| g.conns[USER].hello_done);
+    let (m, _) = sink.next();
+    assert_eq!((m.typ, m.arg0), (SP_STATE_RESET, 0));
+    sink.say(1, SP_STATE_KEPT, &[], &[], 0);
+    pump(&mut r.gpu, |g| g.switch.is_none());
+    assert_eq!(sink.take(1), [(SP_CTRL, CMD_CTX_CREATE)]);
+    assert!(!r.gpu.alone());
+}
+
+#[test]
+fn a_lost_renderer_is_waited_for_and_then_let_go_when_there_is_no_cpu_renderer() {
+    let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+    let path = dir.as_path().join("gpu.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let mem = single_region_mem(0x200000);
+    let mut r = rig_with(&mem, cfg(path.to_str().unwrap()));
+    let (sink, _) = paired_with_a_drawn_texture(&mut r, &listener);
+    drop(sink);
+    pump(&mut r.gpu, |g| !g.conns[USER].link.is_connected());
+    // lost: the guest's commands wait for it (it may come back and resume)
+    let a1 = guest_put(&r, 0, &submit(Some(9), 1, &[]));
+    r.gpu.process_ack_timer();
+    assert_eq!(answered(&r, a1), None);
+    assert_ne!(r.gpu.conns[USER].peer_session, 0);
+    // lost for longer than the wait: let go, and the device serves the guest
+    r.gpu.conns[USER].lost_at -= LOST_WAIT_US + 1;
+    r.gpu.process_ack_timer();
+    assert_eq!(r.gpu.conns[USER].peer_session, 0);
+    assert_eq!(answered(&r, a1), Some(RESP_OK_NODATA));
+}
+
+#[test]
+fn a_new_pairing_and_a_restore_release_the_keys_that_the_guest_holds() {
+    let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+    let path = dir.as_path().join("gpu.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let mem = single_region_mem(0x200000);
+    let mut r = rig_with(&mem, cfg(path.to_str().unwrap()));
+    let kbd = input_dev(&mem, 0x180000, InputKind::Keyboard);
+    let tab = input_dev(&mem, 0x190000, InputKind::Tablet);
+    r.gpu.set_inputs(kbd.clone(), tab.clone());
+    // a key and a button held, a key pressed and released
+    kbd.lock()
+        .unwrap()
+        .queue_events_of_report(&[input_event(EV_KEY, 30, 1)]);
+    kbd.lock()
+        .unwrap()
+        .queue_events_of_report(&[input_event(EV_KEY, 31, 1)]);
+    kbd.lock()
+        .unwrap()
+        .queue_events_of_report(&[input_event(EV_KEY, 31, 0)]);
+    kbd.lock().unwrap().sync();
+    tab.lock()
+        .unwrap()
+        .queue_events_of_report(&[input_event(EV_KEY, BTN_LEFT, 1)]);
+    tab.lock().unwrap().sync();
+    assert_eq!(kbd.lock().unwrap().held(), [30]);
+    assert_eq!(tab.lock().unwrap().held(), [BTN_LEFT]);
+    let (k0, t0) = (
+        kbd.lock().unwrap().pending_len(),
+        tab.lock().unwrap().pending_len(),
+    );
+    // a renderer pairs: both are released, in a report each
+    r.gpu.process_retry();
+    let mut sink = sink_on(&listener);
+    sink.hello(0xabc, r.gpu.session, 0, false);
+    pump(&mut r.gpu, |g| g.conns[USER].hello_done);
+    assert!(kbd.lock().unwrap().held().is_empty());
+    assert!(tab.lock().unwrap().held().is_empty());
+    assert_eq!(kbd.lock().unwrap().pending_len(), k0 + 2);
+    assert_eq!(tab.lock().unwrap().pending_len(), t0 + 2);
+    // nothing held: a pairing adds nothing
+    drop(sink);
+    pump(&mut r.gpu, |g| !g.conns[USER].link.is_connected());
+    r.gpu.process_retry();
+    let mut sink = sink_on(&listener);
+    sink.hello(
+        0xabc,
+        r.gpu.session,
+        r.gpu.conns[USER].link.lock().q.tx_id,
+        false,
+    );
+    pump(&mut r.gpu, |g| g.conns[USER].hello_done);
+    assert_eq!(kbd.lock().unwrap().pending_len(), k0 + 2);
+    // the held keys go with the input device's state; a restored device releases at the resume
+    kbd.lock()
+        .unwrap()
+        .queue_events_of_report(&[input_event(EV_KEY, 48, 1)]);
+    kbd.lock().unwrap().sync();
+    let st = kbd.lock().unwrap().save();
+    assert_eq!(st.held, [48]);
+    let gst = through_a_snapshot(&r.gpu);
+    drop(sink);
+    let mut g = restored(&mem, &gst);
+    assert!(g.release_at_kick);
+    // (the restore of an input device keeps what it holds: input.rs, test_persistence)
+    let k2 = input_dev(&mem, 0x1a0000, InputKind::Keyboard);
+    {
+        let mut k = k2.lock().unwrap();
+        k.queue_events_of_report(&[input_event(EV_KEY, 48, 1)]);
+        k.sync();
+    }
+    g.set_inputs(k2.clone(), input_dev(&mem, 0x1b0000, InputKind::Tablet));
+    let before = k2.lock().unwrap().pending_len();
+    g.kick();
+    assert!(!g.release_at_kick);
+    assert!(k2.lock().unwrap().held().is_empty());
+    assert_eq!(k2.lock().unwrap().pending_len(), before + 2);
 }
 
 #[test]

@@ -609,6 +609,8 @@ impl Persist<'_> for Gpu {
         gpu.edid = state.edid.clone();
         gpu.ctx_name = state.ctx_name.clone();
         gpu.redraw_pending = state.redraw_pending;
+        gpu.release_at_kick = true;
+        gpu.paired_once = state.conns.iter().any(|c| c.peer_session != 0);
 
         gpu.journal = side.journal.clone();
         gpu.scanout_saved = side
@@ -745,6 +747,9 @@ fn restore_lost(args: GpuConstructorArgs, state: &GpuState) -> Result<Gpu, GpuPe
     gpu.edid = state.edid.clone();
     gpu.ctx_name = state.ctx_name.clone();
     gpu.redraw_pending = true;
+    gpu.release_at_kick = true;
+    // no state to build a renderer with: the device serves the guest alone until one pairs
+    gpu.paired_once = true;
     gpu.log_error_line(&format!(
         "spacebox remote gpu: restored WITHOUT its large state (the side file says it is lost): session {:#x}; the renderer starts empty, and what the guest's GPU stack held before is gone",
         gpu.session

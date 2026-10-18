@@ -12,7 +12,7 @@
 //! few buffers in the guest's event queue waits for them (QEMU drops it), up to
 //! [`MAX_PENDING`] events.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -110,6 +110,18 @@ pub(crate) fn event(typ: u16, code: u16, value: i32) -> Event {
     e[2..4].copy_from_slice(&code.to_le_bytes());
     e[4..8].copy_from_slice(&value.to_le_bytes());
     e
+}
+
+/// An event as (type, code, value).
+fn key_of(e: &Event) -> Option<(u16, u16, i32)> {
+    let typ = u16::from_le_bytes([e[0], e[1]]);
+    (typ == EV_KEY).then(|| {
+        (
+            typ,
+            u16::from_le_bytes([e[2], e[3]]),
+            i32::from_le_bytes([e[4], e[5], e[6], e[7]]),
+        )
+    })
 }
 
 /// The events that one input of the sink becomes: (device, events); an empty list for what
@@ -245,6 +257,9 @@ pub struct Input {
     pending: VecDeque<Event>,
     /// The report being built, until the next sync.
     report: Vec<Event>,
+    /// The keys and buttons (`EV_KEY` codes) that the guest holds by the events given to it:
+    /// pressed, not released yet.
+    held: BTreeSet<u16>,
     pub(crate) counters: InputCounters,
 }
 
@@ -265,6 +280,7 @@ impl Input {
             config: [0; CONFIG_LEN],
             pending: VecDeque::new(),
             report: Vec::new(),
+            held: BTreeSet::new(),
             counters: InputCounters::default(),
         })
     }
@@ -277,8 +293,34 @@ impl Input {
     /// up is not kept: old input would only confuse.
     pub(crate) fn queue_events_of_report(&mut self, events: &[Event]) {
         if self.is_activated() {
+            for e in events {
+                if let Some((EV_KEY, code, value)) = key_of(e) {
+                    if value == 0 {
+                        self.held.remove(&code);
+                    } else {
+                        self.held.insert(code);
+                    }
+                }
+            }
             self.report.extend_from_slice(events);
         }
+    }
+
+    /// Release every key and button that the guest holds, in one report. Returns how many.
+    pub(crate) fn release_held(&mut self) -> usize {
+        let held = std::mem::take(&mut self.held);
+        if held.is_empty() || !self.is_activated() {
+            return 0;
+        }
+        let events: Vec<Event> = held.iter().map(|&c| event(EV_KEY, c, 0)).collect();
+        self.queue_events_of_report(&events);
+        self.sync();
+        held.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn held(&self) -> Vec<u16> {
+        self.held.iter().copied().collect()
     }
 
     /// End the report being built (a sync) and give what waits to the guest. A report with no
@@ -583,6 +625,8 @@ pub struct InputState {
     pub config: Vec<u8>,
     pub pending: Vec<Event>,
     pub report: Vec<Event>,
+    /// The keys and buttons that the guest holds.
+    pub held: Vec<u16>,
 }
 
 #[derive(Debug)]
@@ -612,6 +656,7 @@ impl Persist<'_> for Input {
             config: self.config.to_vec(),
             pending: self.pending.iter().copied().collect(),
             report: self.report.clone(),
+            held: self.held.iter().copied().collect(),
         }
     }
 
@@ -637,6 +682,7 @@ impl Persist<'_> for Input {
         dev.config.copy_from_slice(&state.config);
         dev.pending = state.pending.iter().copied().collect();
         dev.report.clone_from(&state.report);
+        dev.held = state.held.iter().copied().collect();
         Ok(dev)
     }
 }
@@ -680,6 +726,9 @@ mod tests {
         d.sync();
         d.queue_events_of_report(&[event(3, 1, 200)]);
         assert_eq!(d.pending.len(), 2);
+        // a button held: it goes with the state
+        d.queue_events_of_report(&[event(EV_KEY, BTN_LEFT, 1)]);
+        assert_eq!(d.held(), [BTN_LEFT]);
         let s = d.save();
         let s: InputState = bitcode::deserialize(&bitcode::serialize(&s).unwrap()).unwrap();
         let r = Input::restore(InputConstructorArgs { mem }, &s).unwrap();
@@ -687,6 +736,7 @@ mod tests {
         assert_eq!(r.config, d.config);
         assert_eq!(r.pending, d.pending);
         assert_eq!(r.report, d.report);
+        assert_eq!(r.held(), [BTN_LEFT]);
         assert_eq!(r.acked_features(), d.acked_features());
         assert!(!r.is_activated());
     }
