@@ -2977,3 +2977,146 @@ fn the_snapshot_keeps_the_spec_and_a_pairing_without_its_yes_starts_again() {
     assert!(!g.conns[USER].spec_ok);
     let _ = sink.next_any();
 }
+
+#[test]
+fn a_renderer_that_pairs_after_a_long_loss_gets_its_reset_with_a_new_id() {
+    // G4's F4: the user's renderer lost for longer than the wait, with no in-guest renderer, and
+    // a renderer that refused the spec meanwhile; then one that can do it. The device let the new
+    // pairing go while it waited for the yes, served the guest alone onto its open link (the
+    // renderer dropped those messages but counted their ids), forgot the queue, and sent the
+    // reset with an id that the renderer had had: the switch waited for ever.
+    let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+    let path = dir.as_path().join("gpu.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let mem = single_region_mem(0x200000);
+    let mut r = rig_with(&mem, cfg(path.to_str().unwrap()));
+    let (sink, _) = paired_with_a_drawn_texture(&mut r, &listener);
+    drop(sink);
+    pump(&mut r.gpu, |g| !g.conns[USER].link.is_connected());
+    r.gpu.conns[USER].lost_at -= LOST_WAIT_US + 1;
+    r.gpu.process_ack_timer();
+    assert_eq!(r.gpu.conns[USER].peer_session, 0);
+    // a renderer that cannot do the spec
+    r.gpu.process_retry();
+    let mut sink = sink_on(&listener);
+    sink.hello_only(0xbad, 0, 0, false);
+    pump(&mut r.gpu, |g| g.conns[USER].hello_done);
+    assert_eq!(sink.next_any().0.typ, SP_SPEC);
+    sink.spec_reply(false, " capset 1 max_tbo_size[0]: 1 here, profile 2 (ge);");
+    pump(&mut r.gpu, |g| !g.conns[USER].link.is_connected());
+    // one that can: the guest's command comes while it answers the spec
+    r.gpu.conns[USER].refused_at -= SPEC_RETRY_US + 1;
+    r.gpu.process_retry();
+    let mut sink = sink_on(&listener);
+    sink.hello_only(0xdef, 0, 0, false);
+    pump(&mut r.gpu, |g| g.conns[USER].hello_done);
+    assert_eq!(sink.next_any().0.typ, SP_SPEC);
+    let a0 = guest_put(&r, 0, &submit(Some(5), 1, &[]));
+    r.gpu.process_ack_timer();
+    r.gpu.process_ctrl_queue().unwrap();
+    // the pairing under way is not let go, and nothing is queued for it
+    assert_eq!(r.gpu.conns[USER].peer_session, 0xdef);
+    assert_eq!(r.gpu.conns[USER].link.lock().q.tx_id, 0);
+    sink.spec_reply(true, "");
+    pump(&mut r.gpu, |g| {
+        g.switch.as_ref().is_some_and(|s| s.phase == Phase::Reset)
+    });
+    // the reset is the first message after the spec, with the pairing's first id
+    let (m, _) = sink.next();
+    assert_eq!((m.typ, m.id, m.arg0), (SP_STATE_RESET, 1, 0));
+    sink.say(1, SP_STATE_KEPT, &[], &[], 0);
+    pump(&mut r.gpu, |g| g.switch.is_none());
+    // the state from the journal, then the guest's command, every id one more than the last
+    let mut ids = vec![m.id];
+    let mut types = Vec::new();
+    loop {
+        let (h, a) = sink.next();
+        if h.id != 0 {
+            ids.push(h.id);
+        }
+        types.push((h.typ, u32_at(&a, 0)));
+        if (h.typ, u32_at(&a, 0)) == (SP_CTRL, CMD_SUBMIT_3D) && h.seq != 0 {
+            break;
+        }
+    }
+    assert!(ids.windows(2).all(|w| w[1] == w[0] + 1), "{ids:?}");
+    assert!(types.contains(&(SP_CTRL, CMD_CTX_CREATE)));
+    assert_eq!(answered(&r, a0), Some(RESP_OK_NODATA));
+}
+
+#[test]
+fn a_users_renderer_back_during_a_takeover_that_waits_gets_nothing_before_its_yes() {
+    let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+    let mem = single_region_mem(0x200000);
+    let (mut r, user, _cp, ul) = with_user_and_guest_socket(&mem, dir.as_path());
+    drop(user);
+    pump2(&mut r.gpu, |g| !g.conns[USER].link.is_connected());
+    r.gpu.conns[USER].lost_at -= TAKEOVER_US + 1;
+    r.gpu.process_ack_timer();
+    assert!(r.gpu.switch.is_some());
+    // the user's renderer starts again; while it answers the spec the guest is served alone
+    r.gpu.process_retry();
+    let mut user = sink_on(&ul);
+    user.hello_only(0x333, 0, 0, false);
+    pump2(&mut r.gpu, |g| g.conns[USER].hello_done);
+    assert_eq!(user.next_any().0.typ, SP_SPEC);
+    // a command taken, and time for the link's writer to send what was queued, before the run of
+    // the control queue ends (where the device forgets what it queued for a renderer not there)
+    r.give(submit(None, 1, &[]));
+    std::thread::sleep(Duration::from_millis(20));
+    let a0 = guest_put(&r, 0, &submit(Some(5), 1, &[]));
+    r.gpu.process_ack_timer();
+    assert_eq!(answered(&r, a0), Some(RESP_OK_NODATA));
+    assert_eq!(r.gpu.conns[USER].link.lock().q.tx_id, 0);
+    user.spec_reply(true, "");
+    pump2(&mut r.gpu, |g| {
+        g.switch
+            .as_ref()
+            .is_some_and(|s| s.to == USER && s.phase == Phase::Reset)
+    });
+    let (m, _) = user.next();
+    assert_eq!((m.typ, m.id), (SP_STATE_RESET, 1));
+    user.say(1, SP_STATE_KEPT, &[], &[], 0);
+    pump2(&mut r.gpu, |g| g.switch.is_none());
+    assert_eq!(r.gpu.active, USER);
+    assert_eq!(
+        user.take(2),
+        [(SP_CTRL, CMD_CTX_CREATE), (SP_CTRL, CMD_SUBMIT_3D)]
+    );
+}
+
+#[test]
+fn the_commands_answered_with_no_renderer_are_logged_at_most_once_a_second() {
+    let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+    let log = dir.as_path().join("stats.log");
+    let mem = single_region_mem(0x200000);
+    let mut c = cfg(dir.as_path().join("gpu.sock").to_str().unwrap());
+    c.stats_path = Some(log.to_str().unwrap().into());
+    let mut r = rig_with(&mem, c);
+    r.gpu.made_at -= FIRST_WAIT_US + 1;
+    let lines = || {
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .filter(|l| l.contains("were answered here"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    // the first one at once; three more within the second: no line, counted
+    for i in 0..4 {
+        guest_put(&r, i, &submit(Some(u64::from(i) + 1), 1, &[]));
+        r.gpu.process_ack_timer();
+    }
+    assert_eq!(
+        lines(),
+        ["spacebox remote gpu: 1 commands of the lost renderer were answered here"]
+    );
+    // a second later, the count of those
+    r.gpu.answered_lost_said -= 1_000_000;
+    r.gpu.process_ack_timer();
+    assert_eq!(
+        lines()[1],
+        "spacebox remote gpu: 3 commands of the lost renderer were answered here"
+    );
+    assert_eq!(lines().len(), 2);
+}

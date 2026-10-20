@@ -559,6 +559,10 @@ pub struct Gpu {
     made_at: i64,
     /// The device serves the guest alone (`alone`): said once in the log each time it begins.
     alone_said: bool,
+    /// Commands of a lost renderer answered here since the last line about them, and when that
+    /// line was written ([`Self::say_answered_lost`]).
+    answered_lost: u64,
+    answered_lost_said: i64,
     /// A renderer has paired with this device (or with the device of the state it was restored
     /// from): no first wait any more.
     paired_once: bool,
@@ -723,6 +727,8 @@ impl Gpu {
             saved_wanted: None,
             made_at: now_us(),
             alone_said: false,
+            answered_lost: 0,
+            answered_lost_said: 0,
             paired_once: false,
             release_at_kick: false,
             cfg,
@@ -807,6 +813,14 @@ impl Gpu {
         let hint = self.tx_hint.take();
         let c = &mut self.conns[ci];
         if !reliable && !c.link.is_connected() {
+            return;
+        }
+        if reliable && c.hello_done && !c.spec_ok {
+            // A new pairing before the renderer's yes to the spec: the renderer drops what comes
+            // before its answer, so a reliable message would be written, dropped, and its id
+            // given again after the queue is forgotten; the renderer then took the next message
+            // with that id as one it had (a switch that waited for ever, G4's F4). What the
+            // guest does meanwhile is in the journal, which the renderer gets after its yes.
             return;
         }
         let h = Hdr {
@@ -1810,8 +1824,11 @@ impl Gpu {
         } else {
             None
         };
+        // (a renderer whose new pairing waits for its answer to the spec is not the lost one:
+        // its session is the new renderer's)
         if let Some(wait) = wait
             && self.conns[a].peer_session != 0
+            && !self.conns[a].hello_done
             && now - self.conns[a].lost_at > wait
         {
             // it starts empty when it comes back, and gets the state from the journal
@@ -1854,7 +1871,12 @@ impl Gpu {
             );
         }
         self.drop_pending();
-        self.conns[self.active].link.forget();
+        // what was queued for a renderer that is not there; not the queue of a pairing under
+        // way (its spec may not be written yet)
+        let a = self.active;
+        if !self.conns[a].hello_done {
+            self.conns[a].link.forget();
+        }
     }
 
     /// The cursor queue: each element is answered at once; the cursor goes to the sink.
@@ -2852,11 +2874,23 @@ impl Gpu {
             }
         }
         self.unpark(&mem, 0, -1);
-        if n != 0 {
-            self.log_info(&format!(
-                "spacebox remote gpu: {n} commands of the lost renderer were answered here"
-            ));
+        self.answered_lost += n as u64;
+        self.say_answered_lost();
+    }
+
+    /// The line about the commands of a lost renderer answered here, at most once a second with
+    /// their count since the last line (with no renderer every run of the control queue answers
+    /// some: about 900 lines in the first 10 s of a boot with no screen, G3's F2).
+    fn say_answered_lost(&mut self) {
+        let now = now_us();
+        if self.answered_lost == 0 || now - self.answered_lost_said < 1_000_000 {
+            return;
         }
+        let n = std::mem::take(&mut self.answered_lost);
+        self.answered_lost_said = now;
+        self.log_info(&format!(
+            "spacebox remote gpu: {n} commands of the lost renderer were answered here"
+        ));
     }
 
     /// Renderer `ci` ends on purpose: with an in-guest renderer that is connected (or whose
@@ -3117,6 +3151,7 @@ impl Gpu {
             self.redraw();
         }
         self.check_takeover();
+        self.say_answered_lost();
         // the wait for a first or a lost renderer may have ended with commands waiting
         if self.conns[self.active].up() {
             self.alone_said = false;
