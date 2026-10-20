@@ -31,6 +31,7 @@ use crate::device_manager::{
     AttachDeviceError, DeviceManager, DeviceManagerCreateError, DeviceManagerPersistError,
     DeviceRestoreArgs,
 };
+use crate::devices::screen::ScreenLoop;
 use crate::devices::virtio::balloon::Balloon;
 use crate::devices::virtio::block::BlockError;
 use crate::devices::virtio::block::device::Block;
@@ -54,7 +55,6 @@ use crate::persist::{MicrovmState, MicrovmStateError};
 use crate::resources::VmResources;
 use crate::seccomp::BpfThreadMap;
 use crate::snapshot::Persist;
-use crate::devices::screen::ScreenLoop;
 use crate::space::Filler;
 use crate::utils::{u32_mib_to_bytes, u64_to_usize};
 use crate::vmm_config::boot_source::{
@@ -320,7 +320,9 @@ pub fn build_microvm_for_boot(
     // made here too. Beside it, the input and sound devices whose input and output go through
     // the same renderer.
     if let Some(cfg) = &vm_resources.gpu {
-        let screen_em = screen_em.as_mut().expect("a screen's event loop with a GPU device");
+        let screen_em = screen_em
+            .as_mut()
+            .expect("a screen's event loop with a GPU device");
         let filter = seccomp_filters
             .get("vmm")
             .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("vmm".to_string()))?
@@ -634,9 +636,8 @@ pub fn build_microvm_from_snapshot(
     let kvm_vm = Arc::new(vm);
     let vm = Vm::Kvm(kvm_vm.clone());
 
-    let mut screen_em =
-        screen_event_manager(microvm_state.device_states.virtio_state.has_gpu())
-            .map_err(BuildMicrovmFromSnapshotError::ScreenThread)?;
+    let mut screen_em = screen_event_manager(microvm_state.device_states.virtio_state.has_gpu())
+        .map_err(BuildMicrovmFromSnapshotError::ScreenThread)?;
 
     // Restore devices states.
     // Restoring VMGenID injects an interrupt in the guest to notify it about the new generation

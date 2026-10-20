@@ -273,7 +273,11 @@ mod tests {
         assert!(wait_for(|| l.is_paused()));
         evt.write(1).unwrap();
         thread::sleep(Duration::from_millis(50));
-        assert_eq!(n.load(Ordering::SeqCst), 0, "an event ran before the resume");
+        assert_eq!(
+            n.load(Ordering::SeqCst),
+            0,
+            "an event ran before the resume"
+        );
         l.resume();
         assert!(wait_for(|| n.load(Ordering::SeqCst) == 1));
         assert!(!l.is_paused());
