@@ -14,6 +14,7 @@ mod keymap;
 mod link;
 mod protocol;
 pub mod sound;
+mod spec;
 
 pub use self::device::{
     GPU_DEV_ID, Gpu, GpuConstructorArgs, GpuPersistError, GpuSideState, GpuState, SIDE_LOST,

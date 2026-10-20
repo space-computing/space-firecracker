@@ -19,6 +19,12 @@ pub struct GpuConfig {
     /// The unix socket of the renderer. The device connects to it, and again every 250 ms
     /// while it is not there or after the connection was lost.
     pub socket_path: String,
+    /// The GPU spec: what the guest is shown of the GPU (its capsets), in the format of the
+    /// capset profile of the spacebox repository (`screen/spec/`). The device answers the
+    /// guest's capset queries from it from the start, with no renderer, and every renderer
+    /// checks at its pairing that it can do all of it. Read when the device is made; a snapshot
+    /// keeps it.
+    pub spec_path: String,
     /// A file to which the device appends its statistics every 5 seconds and its messages
     /// about the connection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -100,6 +106,9 @@ impl GpuConfig {
         if self.socket_path.is_empty() {
             return Err(GpuConfigError::SocketPath);
         }
+        if self.spec_path.is_empty() {
+            return Err(GpuConfigError::SpecPath);
+        }
         if self.tx_limit_mib == Some(0) {
             return Err(GpuConfigError::TxLimit);
         }
@@ -123,6 +132,8 @@ impl GpuConfig {
 pub enum GpuConfigError {
     /// The socket path of the renderer is empty.
     SocketPath,
+    /// The path of the GPU spec is empty.
+    SpecPath,
     /// The transmit limit must be at least 1 MiB.
     TxLimit,
     /// The zstd level {0} is not between 0 and 19.
@@ -139,7 +150,9 @@ mod tests {
 
     #[test]
     fn test_defaults_and_validation() {
-        let c: GpuConfig = serde_json::from_str(r#"{"socket_path": "/run/gpu.sock"}"#).unwrap();
+        let c: GpuConfig =
+            serde_json::from_str(r#"{"socket_path": "/run/gpu.sock", "spec_path": "/g.spec"}"#)
+                .unwrap();
         c.validate().unwrap();
         assert_eq!(c.fence_window(), 8);
         assert_eq!(c.fence_age_us(), 20_000);
@@ -148,13 +161,13 @@ mod tests {
         // Only the given fields are listed back.
         assert_eq!(
             serde_json::to_string(&c).unwrap(),
-            r#"{"socket_path":"/run/gpu.sock"}"#
+            r#"{"socket_path":"/run/gpu.sock","spec_path":"/g.spec"}"#
         );
 
         assert!(!c.input() && !c.sound() && c.agent_socket_path.is_none());
 
         let c: GpuConfig = serde_json::from_str(
-            r#"{"socket_path": "/s", "stats_path": "/t", "fence_window": 0, "fence_age_ms": 5,
+            r#"{"socket_path": "/s", "spec_path": "/g.spec", "stats_path": "/t", "fence_window": 0, "fence_age_ms": 5,
                 "tx_limit_mib": 2, "zstd_level": 0, "debug_wait": true, "dump_path": "/d",
                 "input": true, "sound": true, "agent_socket_path": "/v.sock_5000",
                 "cpu_socket_path": "/c.sock"}"#,
@@ -167,29 +180,41 @@ mod tests {
         assert_eq!(c.agent_socket_path.as_deref(), Some("/v.sock_5000"));
         assert_eq!(c.cpu_socket_path.as_deref(), Some("/c.sock"));
 
-        serde_json::from_str::<GpuConfig>(r#"{"socket_path": "/s", "other": 1}"#).unwrap_err();
+        serde_json::from_str::<GpuConfig>(
+            r#"{"socket_path": "/s", "spec_path": "/g", "other": 1}"#,
+        )
+        .unwrap_err();
         serde_json::from_str::<GpuConfig>(r#"{}"#).unwrap_err();
+        // the spec is required
+        serde_json::from_str::<GpuConfig>(r#"{"socket_path": "/s"}"#).unwrap_err();
         let bad = |j: &str| serde_json::from_str::<GpuConfig>(j).unwrap().validate();
         assert_eq!(
-            bad(r#"{"socket_path": ""}"#),
+            bad(r#"{"socket_path": "", "spec_path": "/g"}"#),
             Err(GpuConfigError::SocketPath)
         );
         assert_eq!(
-            bad(r#"{"socket_path": "/s", "tx_limit_mib": 0}"#),
+            bad(r#"{"socket_path": "/s", "spec_path": ""}"#),
+            Err(GpuConfigError::SpecPath)
+        );
+        assert_eq!(
+            bad(r#"{"socket_path": "/s", "spec_path": "/g", "tx_limit_mib": 0}"#),
             Err(GpuConfigError::TxLimit)
         );
         assert_eq!(
-            bad(r#"{"socket_path": "/s", "zstd_level": 20}"#),
+            bad(r#"{"socket_path": "/s", "spec_path": "/g", "zstd_level": 20}"#),
             Err(GpuConfigError::ZstdLevel(20))
         );
         assert_eq!(
-            bad(r#"{"socket_path": "/s", "agent_socket_path": ""}"#),
+            bad(r#"{"socket_path": "/s", "spec_path": "/g", "agent_socket_path": ""}"#),
             Err(GpuConfigError::AgentSocketPath)
         );
         assert_eq!(
-            bad(r#"{"socket_path": "/s", "cpu_socket_path": ""}"#),
+            bad(r#"{"socket_path": "/s", "spec_path": "/g", "cpu_socket_path": ""}"#),
             Err(GpuConfigError::CpuSocketPath)
         );
-        serde_json::from_str::<GpuConfig>(r#"{"socket_path": "/s", "input": 1}"#).unwrap_err();
+        serde_json::from_str::<GpuConfig>(
+            r#"{"socket_path": "/s", "spec_path": "/g", "input": 1}"#,
+        )
+        .unwrap_err();
     }
 }

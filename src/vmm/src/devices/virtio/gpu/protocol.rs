@@ -62,6 +62,14 @@ pub(crate) const SP_EXPORT_DONE: u32 = 24;
 pub(crate) const SP_DETACH: u32 = 25;
 /// To the sink: the source has what it needs from it; the sink ends.
 pub(crate) const SP_BYE: u32 = 26;
+/// To the sink, the first message of a new pairing when the source's `SP_HELLO` has
+/// `SP_F_SPEC`; not resent (a pairing that is lost before the answer starts again). a: the GPU
+/// spec, the file as it is ([`super::spec`]). The sink checks that its renderer can do it and
+/// answers with `SP_SPEC_REPLY` before it takes anything else; it sends no capsets.
+pub(crate) const SP_SPEC: u32 = 27;
+/// To the source, not resent. arg0: 1 = the renderer can do the spec, 0 = it cannot (the source
+/// closes the connection); a: text, what the renderer cannot do.
+pub(crate) const SP_SPEC_REPLY: u32 = 28;
 /// First message on every connection. arg0 own session, arg1 the peer session it was paired
 /// with (0 = none), arg2 highest id received from that peer.
 pub(crate) const SP_HELLO: u32 = 20;
@@ -81,6 +89,9 @@ pub(crate) const SP_F_SCROLL: u64 = 4;
 /// source and takes `arg2` as the last id it gave out), and the source then resets it to
 /// `seq` with `SP_STATE_RESET`.
 pub(crate) const SP_F_RESTORED: u64 = 8;
+/// In the source's `SP_HELLO`: the source holds the guest's GPU spec and sends it (`SP_SPEC`)
+/// at a new pairing; the sink sends no capsets.
+pub(crate) const SP_F_SPEC: u64 = 16;
 
 /// Size of the header on the wire (packed).
 pub(crate) const HDR_LEN: usize = 80;

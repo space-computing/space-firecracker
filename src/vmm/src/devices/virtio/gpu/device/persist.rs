@@ -5,7 +5,8 @@
 //!
 //! The snapshot's state file holds what the guest sees of the device (the virtio state, the
 //! config space), its configuration, its session with each renderer (the session ids, the ids
-//! of the two streams) and what the renderer told it (capsets, display, EDID). What the device
+//! of the two streams), the GPU spec that the guest was shown, and what the renderer told it
+//! (display, EDID). What the device
 //! keeps of the renderer's state is larger than the 10 MB that Firecracker reads of a state
 //! file (the journal's kept uploads are tens of MB): the journal, the resources with their
 //! backing, the commands not answered yet and the messages no renderer has acknowledged go
@@ -68,9 +69,10 @@ use std::sync::Arc;
 use gpu_journal::{Blob, Journal};
 use serde::{Deserialize, Serialize};
 
-use super::{Cmd, Conn, Gpu, Parked, Pending, Resource, SaveKind, now_us};
+use super::{CAPSET_IDS, Cmd, Conn, Gpu, Parked, Pending, Resource, SaveKind, now_us};
 use crate::devices::virtio::device::VirtioDeviceType;
 use crate::devices::virtio::gpu::GPU_NUM_QUEUES;
+use crate::devices::virtio::gpu::spec::Spec;
 use crate::devices::virtio::persist::{PersistError as VirtioStateError, VirtioDeviceState};
 use crate::devices::virtio::queue::FIRECRACKER_MAX_QUEUE_SIZE;
 use crate::seccomp::BpfProgram;
@@ -128,8 +130,9 @@ pub struct GpuState {
     pub info_seen: bool,
     pub user_info: bool,
     pub n_switch: u64,
-    /// The renderer's capsets: (id, version, data).
-    pub caps: Vec<(u32, u32, Vec<u8>)>,
+    /// The GPU spec, the file as it was read when the device was made: the guest keeps what it
+    /// was shown at its boot, whatever the spec file of the restoring host holds.
+    pub spec: Vec<u8>,
     pub dinfo: Option<Vec<u8>>,
     pub edid: Option<Vec<u8>>,
     pub ctx_name: Vec<String>,
@@ -520,7 +523,8 @@ impl Persist<'_> for Gpu {
                 .iter()
                 .zip(wanted)
                 .map(|(c, wanted)| GpuConnState {
-                    peer_session: c.peer_session,
+                    // a pairing whose renderer had not answered the spec starts again
+                    peer_session: if c.spec_ok { c.peer_session } else { 0 },
                     rx_id: c.rx_id,
                     tx_id: c.link.lock().q.tx_id,
                     detaching: c.detaching,
@@ -533,12 +537,7 @@ impl Persist<'_> for Gpu {
             info_seen: self.info_seen,
             user_info: self.user_info,
             n_switch: self.n_switch,
-            caps: self
-                .caps
-                .iter()
-                .flatten()
-                .map(|c| (c.id, c.ver, c.data.clone()))
-                .collect(),
+            spec: self.spec.text().to_vec(),
             dinfo: self.dinfo.clone(),
             edid: self.edid.clone(),
             ctx_name: self.ctx_name.clone(),
@@ -562,12 +561,13 @@ impl Persist<'_> for Gpu {
             (None, false) => return Err(GpuPersistError::NoSide),
         };
         let cfg: GpuConfig = serde_json::from_str(&state.config)?;
-        let mut gpu = Gpu::new(cfg, args.filter)?;
+        let spec = Spec::parse(state.spec.clone(), &CAPSET_IDS)
+            .map_err(|_| GpuPersistError::Invalid("its spec"))?;
+        let mut gpu = Gpu::with_spec(cfg, spec, args.filter)?;
         if state.conns.len() != gpu.conns.len()
             || side.unacked.len() != gpu.conns.len()
             || state.active >= gpu.conns.len()
             || state.ctx_name.len() != gpu.ctx_name.len()
-            || state.caps.len() > gpu.caps.len()
         {
             return Err(GpuPersistError::Invalid(
                 "its renderers or tables do not match",
@@ -598,13 +598,6 @@ impl Persist<'_> for Gpu {
         gpu.info_seen = state.info_seen;
         gpu.user_info = state.user_info;
         gpu.n_switch = state.n_switch;
-        for (slot, (id, ver, data)) in gpu.caps.iter_mut().zip(&state.caps) {
-            *slot = Some(super::Capset {
-                id: *id,
-                ver: *ver,
-                data: data.clone(),
-            });
-        }
         gpu.dinfo = state.dinfo.clone();
         gpu.edid = state.edid.clone();
         gpu.ctx_name = state.ctx_name.clone();
@@ -703,11 +696,12 @@ impl Persist<'_> for Gpu {
 /// its ids, and nothing of what the renderer held; each renderer starts empty.
 fn restore_lost(args: GpuConstructorArgs, state: &GpuState) -> Result<Gpu, GpuPersistError> {
     let cfg: GpuConfig = serde_json::from_str(&state.config)?;
-    let mut gpu = Gpu::new(cfg, args.filter)?;
+    let spec = Spec::parse(state.spec.clone(), &CAPSET_IDS)
+        .map_err(|_| GpuPersistError::Invalid("its spec"))?;
+    let mut gpu = Gpu::with_spec(cfg, spec, args.filter)?;
     if state.conns.len() != gpu.conns.len()
         || state.active >= gpu.conns.len()
         || state.ctx_name.len() != gpu.ctx_name.len()
-        || state.caps.len() > gpu.caps.len()
     {
         return Err(GpuPersistError::Invalid(
             "its renderers or tables do not match",
@@ -736,13 +730,6 @@ fn restore_lost(args: GpuConstructorArgs, state: &GpuState) -> Result<Gpu, GpuPe
     gpu.info_seen = state.info_seen;
     gpu.user_info = state.user_info;
     gpu.n_switch = state.n_switch;
-    for (slot, (id, ver, data)) in gpu.caps.iter_mut().zip(&state.caps) {
-        *slot = Some(super::Capset {
-            id: *id,
-            ver: *ver,
-            data: data.clone(),
-        });
-    }
     gpu.dinfo = state.dinfo.clone();
     gpu.edid = state.edid.clone();
     gpu.ctx_name = state.ctx_name.clone();
@@ -765,5 +752,7 @@ fn restore_conn(c: &mut Conn, s: &GpuConnState, unacked: &[(u64, Blob)], now: i6
     c.wanted = s.wanted;
     c.lost_at = now;
     c.restored = true;
+    // every pairing of a snapshot had its renderer's yes to the spec
+    c.spec_ok = s.peer_session != 0;
     c.link.lock().q.restore(s.tx_id, unacked, now);
 }

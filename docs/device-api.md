@@ -107,6 +107,7 @@ specification:
 |                           | vsock_id            |    O     |       O        |      O       |        O         |     O      |    **R**     |     O      |      O      |     O      |     O      |
 | `EntropyDevice`           | rate_limiter        |    O     |       O        |      O       |        O         |     O      |      O       |   **R**    |      O      |     O      |     O      |
 | `GpuDevice`               | socket_path         |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |     O      |   **R**    |
+|                           | spec_path           |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |     O      |   **R**    |
 |                           | stats_path          |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |     O      |   **R**    |
 |                           | fence_window        |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |     O      |   **R**    |
 |                           | fence_age_ms        |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |     O      |   **R**    |

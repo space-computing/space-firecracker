@@ -873,7 +873,7 @@ pub mod tests {
     fn test_try_from_put_gpu() {
         let (mut sender, receiver) = UnixStream::pair().unwrap();
         let mut connection = HttpConnection::new(receiver);
-        let body = "{ \"socket_path\": \"/run/gpu.sock\", \"stats_path\": \"/run/gpu.stats\" }";
+        let body = "{ \"socket_path\": \"/run/gpu.sock\", \"spec_path\": \"/run/gpu.spec\", \"stats_path\": \"/run/gpu.stats\" }";
         sender
             .write_all(http_request("PUT", "/gpu", Some(body)).as_bytes())
             .unwrap();

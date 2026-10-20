@@ -631,7 +631,8 @@ paths:
       description:
         Enables a virtio-gpu device (virgl) whose commands are rendered outside Firecracker,
         by the renderer listening on a unix socket (the sink of the Spacebox QEMU fork's remote
-        GPU). The device connects when the microVM starts and again after a lost connection.
+        GPU). The guest is shown the capsets of the GPU spec of spec_path. The device connects
+        when the microVM starts and again after a lost connection.
         A snapshot of a microVM with this device has a second file beside the snapshot file,
         `<snapshot_path>.gpu` (the device's renderer state), which loading the snapshot needs.
       operationId: putGpuDevice
@@ -2097,10 +2098,19 @@ definitions:
       Defines a GPU device whose commands are rendered by a renderer outside Firecracker.
     required:
       - socket_path
+      - spec_path
     properties:
       socket_path:
         type: string
         description: Path of the renderer's unix socket.
+      spec_path:
+        type: string
+        description:
+          Path of the GPU spec, the capsets that the guest is shown (the capset profile format
+          of the Spacebox repository, screen/spec/). The device answers the guest's capset
+          queries from it from the start, with no renderer; every renderer checks at its
+          pairing that it can do all of it, and one that cannot is not paired. Read when the
+          device is made; a snapshot keeps it.
       stats_path:
         type: string
         description:
