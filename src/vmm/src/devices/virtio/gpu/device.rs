@@ -54,9 +54,9 @@ use super::link::{DelayStat, Link, RxEvent, now_us};
 use super::protocol::{
     Filter, HDR_LEN, Hdr, SP_ACK, SP_AUDIO, SP_BYE, SP_CTRL, SP_CURSOR, SP_DETACH, SP_DISPLAY,
     SP_EXPECT, SP_EXPORT, SP_EXPORT_DATA, SP_EXPORT_DONE, SP_F_RESTORED, SP_F_SCROLL, SP_F_SPEC,
-    SP_F_VIDEO, SP_F_ZSTD, SP_HELLO, SP_IMPORT, SP_INFO, SP_INPUT, SP_MEMWRITE, SP_RESET, SP_RESP,
-    SP_SCROLL, SP_SPEC, SP_SPEC_REPLY, SP_STATE_KEPT, SP_STATE_RESET, SP_WMARK, push_expect,
-    u32_at, u64_at,
+    SP_F_VIDEO, SP_F_ZSTD, SP_GPU, SP_GPU_STATE, SP_HELLO, SP_IMPORT, SP_INFO, SP_INPUT,
+    SP_MEMWRITE, SP_PICTURE, SP_RESET, SP_RESP, SP_SCROLL, SP_SPEC, SP_SPEC_REPLY, SP_STATE_KEPT,
+    SP_STATE_RESET, SP_STREAM, SP_WMARK, push_expect, u32_at, u64_at,
 };
 use super::spec::Spec;
 use super::{CTRL_QUEUE, CURSOR_QUEUE, GPU_NUM_QUEUES};
@@ -98,6 +98,7 @@ const CMD_TRANSFER_FROM_HOST_3D: u32 = 0x0206;
 const CMD_SUBMIT_3D: u32 = 0x0207;
 const CMD_RESOURCE_MAP_BLOB: u32 = 0x0208;
 const CMD_RESOURCE_UNMAP_BLOB: u32 = 0x0209;
+const CMD_UPDATE_CURSOR: u32 = 0x0300;
 const RESP_OK_NODATA: u32 = 0x1100;
 const RESP_OK_CAPSET_INFO: u32 = 0x1102;
 const RESP_OK_CAPSET: u32 = 0x1103;
@@ -153,6 +154,11 @@ const SPEC_RETRY_US: i64 = 5_000_000;
 /// After a rollback the redraw (K6) comes this long after the VM resumes, so that the first
 /// picture is the snapshot's (the user's choice of 2026-10-17).
 const ROLLBACK_REDRAW_US: i64 = 2_000_000;
+/// A picture of the in-guest renderer for the user's renderer is dropped while more than this
+/// waits to be sent on the user's link (a newer one comes).
+const PICTURE_BACKLOG: usize = 1 << 20;
+/// The guest's cursor (`struct virtio_gpu_update_cursor` names a resource of 64 x 64, 32 bit).
+const CURSOR_BYTES: u64 = 64 * 64 * 4;
 /// A piece of a renderer's export, as an `SP_IMPORT` (the header, the bytes).
 type Piece = (Vec<u8>, Vec<u8>);
 
@@ -415,6 +421,12 @@ pub(crate) struct Counters {
     n_wmark: u64,
     wmark_ids: u64,
     wmark_skipped: u64,
+    /// The in-guest renderer's pictures passed to the user's renderer, their bytes, those dropped
+    /// for the user's link's backlog, and those that came with no stream asked (in the interval).
+    pub(crate) n_picture: u64,
+    picture_bytes: u64,
+    pub(crate) pictures_dropped: u64,
+    pub(crate) pictures_late: u64,
 }
 
 /// The sound device's samples sent on this connection (since the start).
@@ -569,6 +581,20 @@ pub struct Gpu {
     /// Restored: at the resume every key and button that the guest holds is released (the
     /// releases sent after the state was taken went to the VM of before).
     pub(crate) release_at_kick: bool,
+
+    /// The user's toggle is off (`SP_GPU`): the in-guest renderer runs the guest, and the user's
+    /// link stays up for input, sound, the cursor and the pictures. Cleared when that link is lost:
+    /// a user's renderer that comes back starts with it on.
+    pub(crate) gpu_off: bool,
+    /// The user turned it on; the switch back waits for the switch under way.
+    gpu_on_pending: bool,
+    /// The in-guest renderer was asked for pictures (`SP_STREAM`) on its current pairing.
+    pub(crate) stream_on: bool,
+    /// What the user's renderer was last told of its toggle (`SP_GPU_STATE`) on this pairing: on,
+    /// or off; and that it used its toggle and has not been told what it made. A renderer that has
+    /// not used it is told nothing.
+    pub(crate) gpu_state_said: Option<bool>,
+    gpu_state_owed: bool,
 }
 
 fn random_session() -> u64 {
@@ -731,6 +757,11 @@ impl Gpu {
             answered_lost_said: 0,
             paired_once: false,
             release_at_kick: false,
+            gpu_off: false,
+            gpu_on_pending: false,
+            stream_on: false,
+            gpu_state_said: None,
+            gpu_state_owed: false,
             cfg,
         };
         // One scanout; the two virgl capsets, of the spec.
@@ -895,13 +926,20 @@ impl Gpu {
         if samples.is_empty() {
             return;
         }
-        if !self.conns[self.active].up() {
+        // the user's device plays it whichever renderer runs the guest (the toggle off)
+        let ci = if self.conns[USER].up() {
+            USER
+        } else {
+            self.active
+        };
+        if !self.conns[ci].up() {
             s.not_sent += samples.len() as u64;
             return;
         }
         s.messages += 1;
         s.bytes += samples.len() as u64;
-        self.send_full(
+        self.send_on(
+            ci,
             false,
             SP_AUDIO,
             0,
@@ -1904,6 +1942,13 @@ impl Gpu {
                 if self.switch.is_none() {
                     self.send(SP_CURSOR, 0, &req, &[], 0, 0, 0);
                 }
+                if self.gpu_off && self.active != USER && self.conns[USER].up() {
+                    // the user's renderer shows the cursor over the in-guest renderer's pictures;
+                    // it does not hold the guest's resources now, so a new image comes with its
+                    // pixels
+                    let px = self.cursor_pixels(&mem, &req);
+                    self.send_on(USER, true, SP_CURSOR, 0, &req, &px, 0, 0, 0);
+                }
             } else {
                 warn!("gpu: cursor size incorrect {} vs {CURSOR_LEN}", req.len());
             }
@@ -1914,6 +1959,25 @@ impl Gpu {
             self.answer(&mem, CURSOR_QUEUE, &cmd, &[]);
         }
         Ok(())
+    }
+
+    /// The pixels of the cursor that `req` (`struct virtio_gpu_update_cursor`) sets, from its
+    /// resource's backing in guest memory; none for a move, or a resource that is not a cursor's.
+    fn cursor_pixels(&self, mem: &GuestMemoryMmap, req: &[u8]) -> Vec<u8> {
+        let res = u32_at(req, 40);
+        if u32_at(req, 0) != CMD_UPDATE_CURSOR
+            || !self.resources.get(&res).is_some_and(|r| {
+                r.width == 64 && r.height == 64 && r.backing_size() >= CURSOR_BYTES
+            })
+        {
+            return Vec::new();
+        }
+        let px = self.read_backing(mem, res, 0, CURSOR_BYTES);
+        if px.len() as u64 == CURSOR_BYTES {
+            px
+        } else {
+            Vec::new()
+        }
     }
 
     /// Advance the used rings that got elements and interrupt the guest.
@@ -2067,8 +2131,105 @@ impl Gpu {
             SP_STATE_KEPT => self.switch_kept(ci, a),
             SP_EXPORT_DATA | SP_EXPORT_DONE => self.export_reply(ci, h, a, b),
             SP_DETACH => self.detach(ci),
+            SP_GPU if ci == USER => self.user_toggle(h.arg0 != 0),
+            SP_PICTURE if ci == GUEST => self.picture(h, a),
             _ => {}
         }
+    }
+
+    // ---- the user's toggle ---------------------------------------------------------------
+
+    /// The user's toggle (`SP_GPU`): off is the planned switch to the in-guest renderer with the
+    /// user's link kept up (input, sound, the cursor and the in-guest renderer's pictures go on
+    /// it); on is the planned switch back to the user's renderer (the journal and the in-guest
+    /// renderer's export, as a new attach). The sink says its toggle again when its pairing
+    /// resumes.
+    fn user_toggle(&mut self, on: bool) {
+        let changed = on == self.gpu_off || (on && self.active != USER);
+        self.gpu_off = !on;
+        self.gpu_on_pending = on;
+        self.gpu_state_owed = true;
+        if changed {
+            self.log_info(&format!(
+                "spacebox remote gpu: the user turned the GPU acceleration {}",
+                if on { "on" } else { "off" }
+            ));
+        }
+        self.toggle_settle();
+    }
+
+    /// After a change of the toggle, of a switch or of a link: the switch that the toggle asks for
+    /// is made once no other switch is under way (off: to the in-guest renderer, if one can take
+    /// the guest; on: back to the user's renderer); the in-guest renderer sends pictures while it
+    /// runs the guest with the toggle off and the user's link up; the user's renderer is told
+    /// what is in effect.
+    fn toggle_settle(&mut self) {
+        let user_up = self.conns[USER].up();
+        if self.switch.is_none() && user_up {
+            if self.gpu_on_pending && self.active == GUEST {
+                let from = self.conns[GUEST].up().then_some(GUEST);
+                self.start_switch(from, USER, "the user turned the GPU acceleration on");
+            } else if self.gpu_off && self.active == USER {
+                if self.has_fallback() && self.conns[GUEST].link.reachable() {
+                    self.start_switch(
+                        Some(USER),
+                        GUEST,
+                        "the user turned the GPU acceleration off",
+                    );
+                } else {
+                    self.gpu_off = false;
+                    self.log_info(
+                        "spacebox remote gpu: no in-guest renderer can take the guest now: the GPU acceleration stays on",
+                    );
+                    self.gpu_state_said = Some(true);
+                    self.gpu_state_owed = false;
+                    self.send_on(USER, true, SP_GPU_STATE, 0, &[], &[], 1, 1, 0);
+                }
+            }
+        }
+        if self.active == USER && self.switch.is_none() {
+            self.gpu_on_pending = false;
+        }
+        if self.conns.len() > GUEST && self.conns[GUEST].up() {
+            let want = self.gpu_off && user_up && self.active == GUEST && self.switch.is_none();
+            if want != self.stream_on {
+                self.stream_on = want;
+                self.send_on(GUEST, true, SP_STREAM, 0, &[], &[], u64::from(want), 0, 0);
+                self.log_info(&format!(
+                    "spacebox remote gpu: the in-guest renderer's pictures {}",
+                    if want {
+                        "asked for: the user's renderer shows them"
+                    } else {
+                        "stopped"
+                    }
+                ));
+            }
+        }
+        if user_up && self.switch.is_none() {
+            let on = self.active == USER;
+            let changed = self.gpu_state_said.is_some_and(|s| s != on);
+            if (self.gpu_state_owed || changed) && (on || self.gpu_off) {
+                self.gpu_state_said = Some(on);
+                self.gpu_state_owed = false;
+                self.send_on(USER, true, SP_GPU_STATE, 0, &[], &[], u64::from(on), 0, 0);
+            }
+        }
+    }
+
+    /// A picture of the in-guest renderer (`SP_PICTURE`): passed to the user's renderer while
+    /// the stream is on; dropped while more than [`PICTURE_BACKLOG`] waits on the user's link.
+    fn picture(&mut self, h: &Hdr, a: &[u8]) {
+        if !self.stream_on || !self.conns[USER].up() {
+            self.counters.pictures_late += 1;
+            return;
+        }
+        if self.conns[USER].link.backlog() > PICTURE_BACKLOG {
+            self.counters.pictures_dropped += 1;
+            return;
+        }
+        self.counters.n_picture += 1;
+        self.counters.picture_bytes += a.len() as u64;
+        self.send_on(USER, false, SP_PICTURE, 0, a, &[], h.arg0, h.arg1, h.arg2);
     }
 
     /// `sp_rx_delay`.
@@ -2104,6 +2265,11 @@ impl Gpu {
         c.hello_done = true;
         let restored = std::mem::take(&mut c.restored);
         let tx_id = c.link.lock().q.tx_id;
+        if ci == GUEST {
+            // every connection of the in-guest renderer starts with no pictures
+            self.stream_on = false;
+        }
+        let c = &mut self.conns[ci];
         if resume && restored && h.arg2 > tx_id {
             // The renderer ran on after the snapshot (a rollback). It goes back with this
             // device's stream to the snapshot's last id (SP_F_RESTORED), and keeps what did
@@ -2138,6 +2304,10 @@ impl Gpu {
             c.marked.clear();
             c.spec_ok = false;
             c.link.start(z_on, 0);
+            if ci == USER {
+                self.gpu_state_said = None;
+                self.gpu_state_owed = false;
+            }
             // the renderer runs nothing of this device before it said that it can do the spec
             let spec = self.spec.text().to_vec();
             self.send_on(ci, false, SP_SPEC, 0, &spec, &[], 0, 0, 0);
@@ -2242,6 +2412,7 @@ impl Gpu {
             // button stays held in the guest
             self.release_inputs();
         }
+        self.toggle_settle();
     }
 
     /// Release every key and button that the guest holds (a release that the renderer sent
@@ -2741,19 +2912,24 @@ impl Gpu {
         let Some(sw) = self.switch.take() else {
             return;
         };
+        // (before the old renderer's link closes: what that does sees the new renderer active)
+        self.active = sw.to;
         if let Some(f) = sw.from
             && f != sw.to
         {
             if self.conns[f].detaching {
                 self.send_on(f, true, SP_BYE, 0, &[], &[], 0, 0, 0);
+                self.conns[f].peer_session = 0;
+            } else if f == USER && self.gpu_off {
+                // the toggle: the user's link stays up for input, sound, the cursor and the
+                // pictures; its renderer is reset and built again when the toggle is on
             } else {
                 // the in-guest renderer waits for the next time, when it starts empty
                 self.conns[f].wanted = f == USER;
                 self.disconnected(f);
+                self.conns[f].peer_session = 0;
             }
-            self.conns[f].peer_session = 0;
         }
-        self.active = sw.to;
         if let Some(c) = self.journal.cursor_cmd().map(<[u8]>::to_vec) {
             self.send(SP_CURSOR, 0, &c, &[], 0, 0, 0);
         }
@@ -2801,6 +2977,7 @@ impl Gpu {
             // what only the GPU wrote is gone: every program draws again (K6)
             self.redraw();
         }
+        self.toggle_settle();
         if let Err(err) = self.process_ctrl_queue() {
             error!("gpu: control queue: {err}");
         }
@@ -2898,6 +3075,11 @@ impl Gpu {
     /// ends at once and the guest is served alone until the in-guest renderer takes over.
     fn detach(&mut self, ci: usize) {
         self.conns[ci].detaching = true;
+        if ci == USER {
+            // it ends: the toggle ends with it
+            self.gpu_off = false;
+            self.gpu_on_pending = false;
+        }
         self.log_info(&format!("spacebox remote gpu: {} detaches", CONN_NAMES[ci]));
         if ci == self.active
             && self.switch.is_none()
@@ -2989,22 +3171,36 @@ impl Gpu {
         if wanted {
             self.retry_timer.arm(RECONNECT, None);
         }
-        let Some(sw) = self.switch.as_mut() else {
-            return;
-        };
-        if sw.to == ci {
-            // it starts again from the beginning when it is back
-            sw.phase = Phase::Connect;
-            self.conns[ci].peer_session = 0;
-        } else if sw.from == Some(ci) {
-            // a planned switch whose old renderer went: what only the GPU wrote is lost
-            sw.from = None;
-            sw.scanout = None;
-            self.drop_pending();
-            if self.conns[self.switch.as_ref().unwrap().to].up() {
-                self.switch_reset();
+        if ci == GUEST {
+            self.stream_on = false;
+        }
+        if ci == USER && was_up && (self.gpu_off || self.gpu_on_pending) {
+            // a sudden loss with the toggle off: the in-guest renderer runs the guest on, with no
+            // pictures; the user's renderer that comes back is a new pairing, which starts with
+            // the toggle on
+            self.gpu_off = false;
+            self.gpu_on_pending = false;
+            self.conns[USER].peer_session = 0;
+            self.log_info(
+                "spacebox remote gpu: the user's renderer is lost while the GPU acceleration is off: the in-guest renderer runs the guest on, with no pictures",
+            );
+        }
+        if let Some(sw) = self.switch.as_mut() {
+            if sw.to == ci {
+                // it starts again from the beginning when it is back
+                sw.phase = Phase::Connect;
+                self.conns[ci].peer_session = 0;
+            } else if sw.from == Some(ci) {
+                // a planned switch whose old renderer went: what only the GPU wrote is lost
+                sw.from = None;
+                sw.scanout = None;
+                self.drop_pending();
+                if self.conns[self.switch.as_ref().unwrap().to].up() {
+                    self.switch_reset();
+                }
             }
         }
+        self.toggle_settle();
     }
 
     /// Handle what renderer `ci`'s reader thread passed on.
@@ -3505,6 +3701,15 @@ impl Gpu {
             up(USER),
             up(GUEST)
         ));
+        lines.push(format!(
+            "[SPACEBOX-REMOTE] source toggle: gpu={} stream={} pictures={} picture_bytes={} dropped={} late={}",
+            if self.gpu_off { "off" } else { "on" },
+            u32::from(self.stream_on),
+            self.counters.n_picture,
+            self.counters.picture_bytes,
+            self.counters.pictures_dropped,
+            self.counters.pictures_late
+        ));
         let j = self.journal.stats();
         lines.push(format!(
             "[SPACEBOX-REMOTE] source journal: resources={} contexts={} upload_bytes={} gpu_written={} gpu_written_bytes={} log_entries={} log_bytes={} wmarks={} wmark_ids={} wmark_skipped={}",
@@ -3565,6 +3770,10 @@ impl Gpu {
         c.n_back = 0;
         c.back_bytes = 0;
         c.tx_bytes = 0;
+        c.n_picture = 0;
+        c.picture_bytes = 0;
+        c.pictures_dropped = 0;
+        c.pictures_late = 0;
         for l in lines {
             self.report(&l);
         }

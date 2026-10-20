@@ -70,6 +70,20 @@ pub(crate) const SP_SPEC: u32 = 27;
 /// To the source, not resent. arg0: 1 = the renderer can do the spec, 0 = it cannot (the source
 /// closes the connection); a: text, what the renderer cannot do.
 pub(crate) const SP_SPEC_REPLY: u32 = 28;
+/// To the source, from the user's renderer: the user's toggle. arg0: 1 = the local GPU renders
+/// (on), 0 = the renderer inside the guest renders and the sink shows its pictures (off).
+pub(crate) const SP_GPU: u32 = 29;
+/// To the in-guest renderer. arg0: 1 = send pictures of the scanout (`SP_PICTURE`), 0 = stop.
+/// A new pairing starts with none.
+pub(crate) const SP_STREAM: u32 = 30;
+/// Either direction, not resent: from the in-guest renderer to the source, and from the source
+/// to the user's renderer. a: a JPEG of the scanout; arg0, arg1: the scanout's width and height
+/// (the JPEG may be smaller); arg2: the renderer's count of its pictures.
+pub(crate) const SP_PICTURE: u32 = 31;
+/// To the user's renderer: what its toggle has made. arg0: 1 = on (the user's renderer runs the
+/// guest), 0 = off (the in-guest renderer runs it and its pictures come); arg1: 1 = the source
+/// could not turn it off (no in-guest renderer that can take the guest now).
+pub(crate) const SP_GPU_STATE: u32 = 32;
 /// First message on every connection. arg0 own session, arg1 the peer session it was paired
 /// with (0 = none), arg2 highest id received from that peer.
 pub(crate) const SP_HELLO: u32 = 20;

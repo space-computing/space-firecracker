@@ -3120,3 +3120,169 @@ fn the_commands_answered_with_no_renderer_are_logged_at_most_once_a_second() {
     );
     assert_eq!(lines().len(), 2);
 }
+
+/// The next message from `sink` of type `typ`; the ones before it are returned too.
+fn until(sink: &mut Sink, typ: u32) -> (Hdr, Vec<u8>, Vec<(u32, u32)>) {
+    let mut before = Vec::new();
+    loop {
+        let (h, a) = sink.next();
+        if h.typ == typ {
+            return (h, a, before);
+        }
+        before.push((h.typ, u32_at(&a, 0)));
+    }
+}
+
+/// `struct virtio_gpu_update_cursor` of resource `res` (0x0300) or a move (0x0301).
+fn cursor_req(typ: u32, res: u32) -> Vec<u8> {
+    let mut r = hdr(typ, None, 0);
+    for x in [0, 10, 20, 0, res, 1, 1, 0] {
+        put32(&mut r, x);
+    }
+    r
+}
+
+/// The user's renderer runs the guest; the in-guest renderer has connected. The user turns the
+/// GPU off: the planned switch to the in-guest renderer, the user's link kept; returns the
+/// in-guest renderer's sink, which has been asked for pictures.
+fn toggled_off(r: &mut Rig<'_>, user: &mut Sink, cp: &std::path::Path, id: u64) -> Sink {
+    let gs = guest_connects(cp, &mut r.gpu);
+    r.gpu.process_retry();
+    user.say(id, SP_GPU, &[], &[], 0);
+    pump2(&mut r.gpu, |g| g.switch.is_some());
+    assert_eq!(r.gpu.switch.as_ref().unwrap().from, Some(USER));
+    r.gpu.process_retry();
+    let mut g = sink_from(gs);
+    g.hello(0x222, 0, 0, false);
+    pump2(&mut r.gpu, |g| {
+        g.switch.as_ref().is_some_and(|s| s.phase == Phase::Reset)
+    });
+    assert_eq!(g.take(1), [(SP_STATE_RESET, 0)]);
+    g.say(1, SP_STATE_KEPT, &[], &[], 0);
+    pump2(&mut r.gpu, |g| g.switch.is_none());
+    assert_eq!(r.gpu.active, GUEST);
+    // the in-guest renderer is built from the journal, then asked for pictures
+    let (h, _, rebuilt) = until(&mut g, SP_STREAM);
+    assert!(rebuilt.contains(&(SP_CTRL, CMD_CTX_CREATE)));
+    assert_eq!(h.arg0, 1);
+    assert!(r.gpu.stream_on);
+    g
+}
+
+#[test]
+fn the_users_toggle_switches_to_the_in_guest_renderer_and_back_with_the_users_link_kept() {
+    let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+    let mem = single_region_mem(0x200000);
+    let (mut r, mut user, cp, _ul) = with_user_and_guest_socket(&mem, dir.as_path());
+    // a cursor's resource: 64 x 64 of 4 bytes, its pixels in guest memory
+    r.resource(9, 2, 1, 0, 64, 64, BACKING_AT);
+    mem.write_slice(&[0x5a; 16384], GuestAddress(BACKING_AT))
+        .unwrap();
+    assert_eq!(
+        user.take(2),
+        [
+            (SP_CTRL, CMD_RESOURCE_CREATE_3D),
+            (SP_CTRL, CMD_RESOURCE_ATTACH_BACKING)
+        ]
+    );
+    let mut g = toggled_off(&mut r, &mut user, &cp, 1);
+    // the user's link stays up, and its renderer is told that the toggle is off
+    assert!(r.gpu.conns[USER].up() && r.gpu.gpu_off);
+    let (h, _, _) = until(&mut user, SP_GPU_STATE);
+    assert_eq!((h.arg0, h.arg1), (0, 0));
+    // the guest's commands go to the in-guest renderer
+    r.give(hdr(CMD_RESOURCE_FLUSH, None, 0));
+    assert_eq!(g.take(1), [(SP_CTRL, CMD_RESOURCE_FLUSH)]);
+    // its pictures go to the user's renderer as they are
+    let jpg = [0xff, 0xd8, 0x11, 0x22, 0xff, 0xd9];
+    g.say_args(0, SP_PICTURE, &jpg, &[], [2560, 1600, 7]);
+    pump2(&mut r.gpu, |g| g.counters.n_picture == 1);
+    let (h, a) = user.next();
+    assert_eq!((h.typ, h.id, a.as_slice()), (SP_PICTURE, 0, &jpg[..]));
+    assert_eq!((h.arg0, h.arg1, h.arg2), (2560, 1600, 7));
+    // the sound goes to the user's renderer, and a new cursor with its pixels
+    r.gpu.send_audio(48000, 2, &[1; 64], 0);
+    assert_eq!(user.next().0.typ, SP_AUDIO);
+    let px = r.gpu.cursor_pixels(&mem, &cursor_req(CMD_UPDATE_CURSOR, 9));
+    assert_eq!(px, vec![0x5a; 16384]);
+    assert!(r.gpu.cursor_pixels(&mem, &cursor_req(0x0301, 9)).is_empty());
+    assert!(
+        r.gpu
+            .cursor_pixels(&mem, &cursor_req(CMD_UPDATE_CURSOR, 1))
+            .is_empty()
+    );
+
+    // On: the pictures stop, and the planned switch back makes the user's renderer a new attach
+    user.say(2, SP_GPU, &[], &[], 1);
+    pump2(&mut r.gpu, |g| {
+        g.switch
+            .as_ref()
+            .is_some_and(|s| s.to == USER && s.phase == Phase::Reset)
+    });
+    assert_eq!(r.gpu.switch.as_ref().unwrap().from, Some(GUEST));
+    let (h, _, _) = until(&mut g, SP_STREAM);
+    assert_eq!(h.arg0, 0);
+    let (h, _, _) = until(&mut user, SP_STATE_RESET);
+    assert_eq!(h.arg0, 0);
+    user.say(3, SP_STATE_KEPT, &[], &[], 0);
+    pump2(&mut r.gpu, |g| g.switch.is_none());
+    assert_eq!(r.gpu.active, USER);
+    assert!(!r.gpu.gpu_off);
+    assert!(!r.gpu.conns[GUEST].link.is_connected());
+    let (h, _, rebuilt) = until(&mut user, SP_GPU_STATE);
+    assert_eq!(h.arg0, 1);
+    assert!(rebuilt.contains(&(SP_CTRL, CMD_CTX_CREATE)));
+    // a picture that comes after the stream stopped is not passed on
+    let late = export_hdr(0, SP_PICTURE, &jpg, &[], [2560, 1600, 8]);
+    r.gpu.picture(&late, &jpg);
+    assert_eq!(
+        (r.gpu.counters.n_picture, r.gpu.counters.pictures_late),
+        (1, 1)
+    );
+    drop(g);
+}
+
+#[test]
+fn a_sudden_loss_with_the_toggle_off_stops_the_pictures_and_the_renderer_back_starts_on() {
+    let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+    let mem = single_region_mem(0x200000);
+    let (mut r, mut user, cp, ul) = with_user_and_guest_socket(&mem, dir.as_path());
+    let mut g = toggled_off(&mut r, &mut user, &cp, 1);
+    drop(user);
+    pump2(&mut r.gpu, |g| !g.conns[USER].link.is_connected());
+    // the in-guest renderer runs the guest on, with no pictures
+    assert_eq!(r.gpu.active, GUEST);
+    assert!(!r.gpu.gpu_off && !r.gpu.stream_on);
+    let (h, _, _) = until(&mut g, SP_STREAM);
+    assert_eq!(h.arg0, 0);
+    assert_eq!(r.gpu.conns[USER].peer_session, 0);
+    // the user's renderer that comes back is a new pairing: the planned switch to it
+    r.gpu.process_retry();
+    let mut user = sink_on(&ul);
+    user.hello(0x333, 0, 0, false);
+    pump2(&mut r.gpu, |g| {
+        g.switch
+            .as_ref()
+            .is_some_and(|s| s.to == USER && s.phase == Phase::Reset)
+    });
+    assert_eq!(r.gpu.switch.as_ref().unwrap().from, Some(GUEST));
+    assert_eq!(user.take(1), [(SP_STATE_RESET, 0)]);
+    user.say(1, SP_STATE_KEPT, &[], &[], 0);
+    pump2(&mut r.gpu, |g| g.switch.is_none());
+    assert_eq!(r.gpu.active, USER);
+    // a renderer that has not used its toggle is told nothing of it
+    assert_eq!(r.gpu.gpu_state_said, None);
+}
+
+#[test]
+fn the_toggle_off_with_no_in_guest_renderer_there_stays_on() {
+    let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+    let mem = single_region_mem(0x200000);
+    let (mut r, mut user, _cp, _ul) = with_user_and_guest_socket(&mem, dir.as_path());
+    user.say(1, SP_GPU, &[], &[], 0);
+    pump2(&mut r.gpu, |g| g.gpu_state_said.is_some());
+    assert!(r.gpu.switch.is_none() && !r.gpu.gpu_off);
+    assert_eq!(r.gpu.active, USER);
+    let (h, _) = user.next();
+    assert_eq!((h.typ, h.arg0, h.arg1), (SP_GPU_STATE, 1, 1));
+}
