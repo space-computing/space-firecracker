@@ -148,6 +148,21 @@ pub struct MMIODevManagerConstructorArgs<'a> {
     pub blk_worker_filter: Option<Arc<BpfProgram>>,
     /// The `vmm` seccomp filter, for the GPU device's threads.
     pub vmm_filter: Arc<BpfProgram>,
+    /// The event loop of the screen's thread, for a state with a GPU device: the screen's devices
+    /// (the GPU, its input and sound devices, and vsock) are restored into it.
+    pub screen_event_manager: Option<&'a mut EventManager>,
+}
+
+/// The event loop that a screen's device is restored into: the screen's own, or the VMM
+/// thread's in a VM with no screen.
+pub(crate) fn screen_em<'b>(
+    screen: &'b mut Option<&mut EventManager>,
+    vmm: &'b mut EventManager,
+) -> &'b mut EventManager {
+    match screen {
+        Some(em) => em,
+        None => vmm,
+    }
 }
 
 pub struct MMIOPlatformDevicesConstructorArgs<'a> {
@@ -445,7 +460,7 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
     }
 
     fn restore(
-        constructor_args: Self::ConstructorArgs,
+        mut constructor_args: Self::ConstructorArgs,
         state: &Self::State,
     ) -> Result<Self, Self::Error> {
         let mut dev_manager = MMIOVirtioDevices::new();
@@ -610,7 +625,10 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
                 &vsock_state.device_id,
                 &vsock_state.transport_state,
                 &vsock_state.device_info,
-                constructor_args.event_manager,
+                screen_em(
+                    &mut constructor_args.screen_event_manager,
+                    constructor_args.event_manager,
+                ),
             )?;
         }
 
@@ -685,7 +703,10 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
                 &gpu_state.device_id,
                 &gpu_state.transport_state,
                 &gpu_state.device_info,
-                constructor_args.event_manager,
+                screen_em(
+                    &mut constructor_args.screen_event_manager,
+                    constructor_args.event_manager,
+                ),
             )?;
             for (dev, s) in inputs.into_iter().zip(&state.input_devices) {
                 restore_helper(
@@ -695,7 +716,10 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
                     &s.device_id,
                     &s.transport_state,
                     &s.device_info,
-                    constructor_args.event_manager,
+                    screen_em(
+                        &mut constructor_args.screen_event_manager,
+                        constructor_args.event_manager,
+                    ),
                 )?;
             }
             if let (Some(dev), Some(s)) = (sound, &state.sound_device) {
@@ -706,7 +730,10 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
                     &s.device_id,
                     &s.transport_state,
                     &s.device_info,
-                    constructor_args.event_manager,
+                    screen_em(
+                        &mut constructor_args.screen_event_manager,
+                        constructor_args.event_manager,
+                    ),
                 )?;
             }
         }
@@ -906,6 +933,7 @@ mod tests {
             instance_id: "microvm-id",
             blk_worker_filter: None,
             vmm_filter: Arc::new(Vec::new()),
+            screen_event_manager: None,
         };
         let _restored_dev_manager = MMIOVirtioDevices::restore(restore_args, mmio_state).unwrap();
 

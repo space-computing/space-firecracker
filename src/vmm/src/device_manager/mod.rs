@@ -35,6 +35,7 @@ use crate::devices::legacy::RTCDevice;
 use crate::devices::legacy::SerialDevice;
 use crate::devices::legacy::serial::{SerialOut, SerialOutInner};
 use crate::devices::pseudo::BootTimer;
+use crate::devices::screen::ScreenLoop;
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::balloon::BalloonError;
 use crate::devices::virtio::block::BlockError;
@@ -135,6 +136,9 @@ pub struct DeviceManager {
     pub virtio_devices: VirtioDevices,
     /// Seccomp filter installed on block worker threads
     pub blk_worker_filter: Option<Arc<BpfProgram>>,
+    /// The thread of the screen's devices (`fc_screen`), in a VM with a GPU device: paused at
+    /// every stop of the guest, before any device is quiesced or saved, and resumed at its end.
+    pub screen: Option<ScreenLoop>,
 }
 
 impl DeviceManager {
@@ -264,6 +268,7 @@ impl DeviceManager {
             acpi_devices: ACPIDeviceManager::default(),
             virtio_devices: Self::create_virtio_devices(pci_enabled, vm)?,
             blk_worker_filter,
+            screen: None,
         })
     }
 
@@ -392,21 +397,35 @@ impl DeviceManager {
         Ok(())
     }
 
-    /// Artificially kick VirtIO devices as if they had external events.
+    /// Artificially kick VirtIO devices as if they had external events. It is the resume of a
+    /// stopped guest: the screen's thread runs again after its devices were kicked.
     pub fn kick_virtio_devices(&self) {
         info!("Artificially kick devices");
         self.for_each_virtio_device_mut(|_, device| device.kick());
+        if let Some(screen) = &self.screen {
+            screen.resume();
+        }
     }
 
-    /// Ends the work in flight of every VirtIO device at a stop of the guest.
+    /// Ends the work in flight of every VirtIO device at a stop of the guest. The screen's
+    /// thread is paused first, before any device is locked (its devices lock each other), and
+    /// stays paused until the guest resumes: through the save of the devices and of KVM, the
+    /// copy of the memory and the reset of the dirty tracking.
     pub fn quiesce_virtio_devices(&self) {
+        if let Some(screen) = &self.screen {
+            screen.pause();
+        }
         self.for_each_virtio_device_mut(|_, device| device.quiesce());
     }
 
     /// The end of the stop of a checkpoint of a running guest: each device takes again the
-    /// work that the stop held (the worker threads of a drive take their queues).
+    /// work that the stop held (the worker threads of a drive take their queues, the screen's
+    /// thread its events).
     pub fn resume_virtio_devices_after_checkpoint(&self) {
         self.for_each_virtio_device_mut(|_, device| device.resume_after_checkpoint());
+        if let Some(screen) = &self.screen {
+            screen.resume();
+        }
     }
 
     /// Lets the held frames of each network device go out, up to the mark `upto`.
@@ -710,6 +729,14 @@ pub enum VirtioDevicesState {
 }
 
 impl VirtioDevicesState {
+    /// Whether the VM has a GPU device (and so a screen's thread).
+    pub fn has_gpu(&self) -> bool {
+        match self {
+            VirtioDevicesState::Mmio(s) => s.gpu_device.is_some(),
+            VirtioDevicesState::Pci(s) => s.gpu_device.is_some(),
+        }
+    }
+
     /// The GPU device's state, if the VM has one.
     pub fn gpu_mut(&mut self) -> Option<&mut GpuState> {
         match self {
@@ -867,6 +894,8 @@ pub struct DeviceRestoreArgs<'a> {
     pub blk_worker_filter: Option<Arc<BpfProgram>>,
     /// The `vmm` seccomp filter, for devices whose threads start at the restore (the GPU).
     pub vmm_filter: Arc<BpfProgram>,
+    /// The event loop of the screen's thread, for a state with a GPU device.
+    pub screen_event_manager: Option<&'a mut EventManager>,
 }
 
 impl std::fmt::Debug for DeviceRestoreArgs<'_> {
@@ -941,6 +970,7 @@ impl<'a> Persist<'a> for DeviceManager {
                     event_manager: constructor_args.event_manager,
                     blk_worker_filter: constructor_args.blk_worker_filter.clone(),
                     vmm_filter: constructor_args.vmm_filter.clone(),
+                    screen_event_manager: constructor_args.screen_event_manager,
                 };
                 let pci_devices = PciDevices::restore(pci_ctor_args, pci_state)
                     .map_err(DeviceManagerPersistError::PciRestore)?;
@@ -955,6 +985,7 @@ impl<'a> Persist<'a> for DeviceManager {
                     instance_id: constructor_args.instance_id,
                     blk_worker_filter: constructor_args.blk_worker_filter.clone(),
                     vmm_filter: constructor_args.vmm_filter.clone(),
+                    screen_event_manager: constructor_args.screen_event_manager,
                 };
                 let mmio_virtio_devices = MMIOVirtioDevices::restore(mmio_ctor_args, mmio_state)
                     .map_err(DeviceManagerPersistError::MmioRestore)?;
@@ -969,6 +1000,7 @@ impl<'a> Persist<'a> for DeviceManager {
             acpi_devices,
             virtio_devices,
             blk_worker_filter: constructor_args.blk_worker_filter,
+            screen: None,
         })
     }
 }
@@ -1019,6 +1051,7 @@ pub(crate) mod tests {
             acpi_devices,
             virtio_devices,
             blk_worker_filter: None,
+            screen: None,
         }
     }
 

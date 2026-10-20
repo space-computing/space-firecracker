@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::persist::MmdsState;
 use crate::EventManager;
+use crate::device_manager::persist::screen_em;
 use crate::device_manager::{DevicePersistError, restore_screen};
 use crate::devices::pci::PciSegment;
 use crate::devices::virtio::balloon::Balloon;
@@ -343,6 +344,9 @@ pub struct PciDevicesConstructorArgs<'a> {
     pub blk_worker_filter: Option<Arc<BpfProgram>>,
     /// The `vmm` seccomp filter, for the GPU device's threads.
     pub vmm_filter: Arc<BpfProgram>,
+    /// The event loop of the screen's thread, for a state with a GPU device (see
+    /// [`super::persist::screen_em`]).
+    pub screen_event_manager: Option<&'a mut EventManager>,
 }
 
 impl<'a> Debug for PciDevicesConstructorArgs<'a> {
@@ -537,7 +541,7 @@ impl<'a> Persist<'a> for PciDevices {
     }
 
     fn restore(
-        constructor_args: Self::ConstructorArgs,
+        mut constructor_args: Self::ConstructorArgs,
         state: &Self::State,
     ) -> Result<Self, Self::Error> {
         let mem = constructor_args.mem;
@@ -657,7 +661,10 @@ impl<'a> Persist<'a> for PciDevices {
                 device,
                 &vsock_state.device_id,
                 &vsock_state.transport_state,
-                constructor_args.event_manager,
+                screen_em(
+                    &mut constructor_args.screen_event_manager,
+                    constructor_args.event_manager,
+                ),
             )?
         }
 
@@ -746,7 +753,10 @@ impl<'a> Persist<'a> for PciDevices {
                 gpu,
                 &gpu_state.device_id,
                 &gpu_state.transport_state,
-                constructor_args.event_manager,
+                screen_em(
+                    &mut constructor_args.screen_event_manager,
+                    constructor_args.event_manager,
+                ),
             )?;
             for (dev, s) in inputs.into_iter().zip(&state.input_devices) {
                 pci_devices.restore_pci_device(
@@ -754,7 +764,10 @@ impl<'a> Persist<'a> for PciDevices {
                     dev,
                     &s.device_id,
                     &s.transport_state,
-                    constructor_args.event_manager,
+                    screen_em(
+                        &mut constructor_args.screen_event_manager,
+                        constructor_args.event_manager,
+                    ),
                 )?;
             }
             if let (Some(dev), Some(s)) = (sound, &state.sound_device) {
@@ -763,7 +776,10 @@ impl<'a> Persist<'a> for PciDevices {
                     dev,
                     &s.device_id,
                     &s.transport_state,
-                    constructor_args.event_manager,
+                    screen_em(
+                        &mut constructor_args.screen_event_manager,
+                        constructor_args.event_manager,
+                    ),
                 )?;
             }
         }
@@ -928,6 +944,7 @@ mod tests {
             event_manager: &mut event_manager,
             blk_worker_filter: None,
             vmm_filter: Arc::new(Vec::new()),
+            screen_event_manager: None,
         };
         let _restored_dev_manager = PciDevices::restore(restore_args, pci_state).unwrap();
 

@@ -54,6 +54,7 @@ use crate::persist::{MicrovmState, MicrovmStateError};
 use crate::resources::VmResources;
 use crate::seccomp::BpfThreadMap;
 use crate::snapshot::Persist;
+use crate::devices::screen::ScreenLoop;
 use crate::space::Filler;
 use crate::utils::{u32_mib_to_bytes, u64_to_usize};
 use crate::vmm_config::boot_source::{
@@ -142,6 +143,19 @@ pub enum StartMicrovmError {
     FillThread(io::Error),
     /// Cannot start the threads of the checkpoint loop: {0}
     CheckpointThreads(io::Error),
+    /// Cannot start the screen's thread: {0}
+    ScreenThread(io::Error),
+}
+
+/// The event loop of the screen's thread (`fc_screen`), for a VM with a GPU device: the screen's
+/// devices (the GPU, its input and sound devices, and vsock) run there, not on the VMM thread.
+fn screen_event_manager(gpu: bool) -> Result<Option<EventManager>, io::Error> {
+    if !gpu {
+        return Ok(None);
+    }
+    EventManager::new()
+        .map(Some)
+        .map_err(|err| io::Error::other(format!("its event loop: {err:?}")))
 }
 
 /// It's convenient to automatically convert `linux_loader::cmdline::Error`s
@@ -276,13 +290,18 @@ pub fn build_microvm_for_boot(
         event_manager,
     )?;
 
+    let mut screen_em = screen_event_manager(vm_resources.gpu.is_some())
+        .map_err(StartMicrovmError::ScreenThread)?;
+
     if let Some(unix_vsock) = vm_resources.vsock.get() {
+        // In a VM with a screen, vsock carries the screen's links (the guest agent, the
+        // renderer inside the guest): it runs on the screen's thread.
         attach_unixsock_vsock_device(
             &mut device_manager,
             &vm,
             &mut boot_cmdline,
             unix_vsock,
-            event_manager,
+            screen_em.as_mut().unwrap_or(event_manager),
         )?;
     }
 
@@ -301,6 +320,7 @@ pub fn build_microvm_for_boot(
     // made here too. Beside it, the input and sound devices whose input and output go through
     // the same renderer.
     if let Some(cfg) = &vm_resources.gpu {
+        let screen_em = screen_em.as_mut().expect("a screen's event loop with a GPU device");
         let filter = seccomp_filters
             .get("vmm")
             .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("vmm".to_string()))?
@@ -324,7 +344,7 @@ pub fn build_microvm_for_boot(
             GPU_DEV_ID.to_string(),
             gpu.clone(),
             &mut boot_cmdline,
-            event_manager,
+            screen_em,
             false,
         )?;
         if let Some((kbd, tab)) = inputs {
@@ -334,7 +354,7 @@ pub fn build_microvm_for_boot(
                     id.to_string(),
                     dev,
                     &mut boot_cmdline,
-                    event_manager,
+                    screen_em,
                     false,
                 )?;
             }
@@ -347,7 +367,7 @@ pub fn build_microvm_for_boot(
                 SOUND_DEV_ID.to_string(),
                 Arc::new(Mutex::new(sound)),
                 &mut boot_cmdline,
-                event_manager,
+                screen_em,
                 false,
             )?;
         }
@@ -410,6 +430,15 @@ pub fn build_microvm_for_boot(
             .clone(),
     )
     .map_err(StartMicrovmError::CheckpointThreads)?;
+
+    if let Some(em) = screen_em {
+        let filter = seccomp_filters
+            .get("vmm")
+            .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("vmm".to_string()))?
+            .clone();
+        device_manager.screen =
+            Some(ScreenLoop::spawn(em, filter).map_err(StartMicrovmError::ScreenThread)?);
+    }
 
     let vmm = Vmm {
         checkpoint,
@@ -525,6 +554,8 @@ pub enum BuildMicrovmFromSnapshotError {
     MissingCheckpointSeccompFilter,
     /// Cannot start the threads of the checkpoint loop: {0}
     CheckpointThreads(io::Error),
+    /// Cannot start the screen's thread: {0}
+    ScreenThread(io::Error),
 }
 
 /// Builds and starts a microVM based on the provided MicrovmState.
@@ -603,6 +634,10 @@ pub fn build_microvm_from_snapshot(
     let kvm_vm = Arc::new(vm);
     let vm = Vm::Kvm(kvm_vm.clone());
 
+    let mut screen_em =
+        screen_event_manager(microvm_state.device_states.virtio_state.has_gpu())
+            .map_err(BuildMicrovmFromSnapshotError::ScreenThread)?;
+
     // Restore devices states.
     // Restoring VMGenID injects an interrupt in the guest to notify it about the new generation
     // ID. As a result, we need to restore DeviceManager after restoring the KVM state, otherwise
@@ -619,10 +654,20 @@ pub fn build_microvm_from_snapshot(
             .get("vmm")
             .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("vmm".to_string()))?
             .clone(),
+        screen_event_manager: screen_em.as_mut(),
     };
     #[allow(unused_mut)]
     let mut device_manager =
         DeviceManager::restore(device_ctor_args, &microvm_state.device_states)?;
+    if let Some(em) = screen_em {
+        let filter = seccomp_filters
+            .get("vmm")
+            .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("vmm".to_string()))?
+            .clone();
+        device_manager.screen = Some(
+            ScreenLoop::spawn(em, filter).map_err(BuildMicrovmFromSnapshotError::ScreenThread)?,
+        );
+    }
 
     let filler = Filler::spawn(
         seccomp_filters
