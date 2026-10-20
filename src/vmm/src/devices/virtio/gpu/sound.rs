@@ -561,6 +561,10 @@ impl VirtioDevice for Sound {
         self.queues.get(index).map(|queue| &queue.config)
     }
 
+    fn queue_positions(&self) -> Vec<(u16, u16)> {
+        crate::devices::virtio::device::positions_of(&self.queues)
+    }
+
     fn queue_config_mut(&mut self, index: usize) -> Option<&mut QueueConfig> {
         self.queues.get_mut(index).map(|queue| &mut queue.config)
     }

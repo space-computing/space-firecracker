@@ -32,7 +32,7 @@ use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::EventManager;
-use crate::logger::{error, warn};
+use crate::logger::{error, info, warn};
 use crate::seccomp::BpfProgram;
 
 /// The name of the thread (the host places it by name).
@@ -88,10 +88,26 @@ struct Moved(EventManager);
 // descriptor. Only the type `dyn MutEventSubscriber` lacks the bound.
 unsafe impl Send for Moved {}
 
+/// The screen's devices' places in their queues (by device) when a checkpoint's state was saved.
+type Positions = Vec<Vec<(u16, u16)>>;
+
+/// The check that no device of the screen moved a queue from the save of a checkpoint's state to the
+/// resume: the device state of a checkpoint and the memory copied after it are of one moment.
+#[derive(Debug, Default)]
+struct Witness {
+    mark: Option<(Instant, Positions)>,
+    checked: u64,
+    moved: u64,
+}
+
+/// A summary of the checks is logged after this many.
+const WITNESS_SUMMARY: u64 = 60;
+
 /// The handle of the screen's thread, kept by the device manager.
 #[derive(Debug)]
 pub struct ScreenLoop {
     ctl: Arc<Ctl>,
+    witness: Mutex<Witness>,
 }
 
 impl ScreenLoop {
@@ -123,7 +139,10 @@ impl ScreenLoop {
                 run(moved.0, &thread_ctl);
             })?;
         match ok_rx.recv() {
-            Ok(Ok(())) => Ok(ScreenLoop { ctl }),
+            Ok(Ok(())) => Ok(ScreenLoop {
+                ctl,
+                witness: Mutex::new(Witness::default()),
+            }),
             Ok(Err(e)) => Err(std::io::Error::other(format!(
                 "{SCREEN_THREAD_NAME}: seccomp filter: {e}"
             ))),
@@ -176,6 +195,54 @@ impl ScreenLoop {
     /// Whether the thread is paused now (for tests and checks).
     pub fn is_paused(&self) -> bool {
         self.ctl.st.lock().expect("Poisoned lock").paused
+    }
+
+    /// The screen's devices' places in their queues when a checkpoint's state was saved (the
+    /// thread is paused). The first mark of a stop counts.
+    pub fn mark(&self, positions: Positions) {
+        let mut w = self.witness.lock().expect("Poisoned lock");
+        if w.mark.is_none() {
+            w.mark = Some((Instant::now(), positions));
+        }
+    }
+
+    /// At the resume, before any device runs again: the places must be those of the mark. A move is
+    /// logged as an error; a summary every [`WITNESS_SUMMARY`] checks. Returns whether they were
+    /// the same (true with no mark).
+    pub fn check(&self, positions: Positions) -> bool {
+        let mut w = self.witness.lock().expect("Poisoned lock");
+        let Some((t0, before)) = w.mark.take() else {
+            return true;
+        };
+        w.checked += 1;
+        let same = before == positions;
+        if !same {
+            w.moved += 1;
+            error!(
+                "{SCREEN_THREAD_NAME}: a queue of the screen's devices moved between the save of a checkpoint and its resume: {before:?} -> {positions:?}"
+            );
+        }
+        if w.checked.is_multiple_of(WITNESS_SUMMARY) {
+            info!(
+                "{SCREEN_THREAD_NAME}: {} checkpoint stops checked, a queue of the screen moved in {}; the last from its save to its resume {} us",
+                w.checked,
+                w.moved,
+                t0.elapsed().as_micros()
+            );
+        }
+        same
+    }
+
+    /// A save of a snapshot or of a move's state: the device threads of the VMM may work the queues
+    /// in it (the GPU device drains its renderer), so a mark of a checkpoint before it is dropped.
+    pub fn unmark(&self) {
+        self.witness.lock().expect("Poisoned lock").mark = None;
+    }
+
+    /// (checked, moved) so far.
+    pub fn witnessed(&self) -> (u64, u64) {
+        let w = self.witness.lock().expect("Poisoned lock");
+        (w.checked, w.moved)
     }
 }
 
@@ -333,6 +400,21 @@ mod tests {
         assert!(l.is_paused());
         l.resume();
         assert!(wait_for(|| n.load(Ordering::SeqCst) == 2));
+    }
+
+    #[test]
+    fn the_witness_counts_a_queue_that_moved_from_the_save_to_the_resume() {
+        let l = ScreenLoop::spawn(EventManager::new().unwrap(), Arc::new(vec![])).unwrap();
+        // no mark (a stop that saved no checkpoint): nothing checked
+        assert!(l.check(vec![vec![(1, 1)]]));
+        assert_eq!(l.witnessed(), (0, 0));
+        l.mark(vec![vec![(3, 2)], vec![(7, 7), (0, 0)]]);
+        // a second save in the same stop keeps the first mark
+        l.mark(vec![vec![(9, 9)]]);
+        assert!(l.check(vec![vec![(3, 2)], vec![(7, 7), (0, 0)]]));
+        l.mark(vec![vec![(3, 2)]]);
+        assert!(!l.check(vec![vec![(3, 3)]]));
+        assert_eq!(l.witnessed(), (2, 1));
     }
 
     #[test]

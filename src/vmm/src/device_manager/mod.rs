@@ -401,6 +401,9 @@ impl DeviceManager {
     /// stopped guest: the screen's thread runs again after its devices were kicked.
     pub fn kick_virtio_devices(&self) {
         info!("Artificially kick devices");
+        if let Some(screen) = &self.screen {
+            screen.check(self.screen_positions());
+        }
         self.for_each_virtio_device_mut(|_, device| device.kick());
         if let Some(screen) = &self.screen {
             screen.resume();
@@ -422,10 +425,30 @@ impl DeviceManager {
     /// work that the stop held (the worker threads of a drive take their queues, the screen's
     /// thread its events).
     pub fn resume_virtio_devices_after_checkpoint(&self) {
+        if let Some(screen) = &self.screen {
+            screen.check(self.screen_positions());
+        }
         self.for_each_virtio_device_mut(|_, device| device.resume_after_checkpoint());
         if let Some(screen) = &self.screen {
             screen.resume();
         }
+    }
+
+    /// The places of the screen's devices in their queues (`fc_screen`'s check of a checkpoint).
+    fn screen_positions(&self) -> Vec<Vec<(u16, u16)>> {
+        let mut out = Vec::new();
+        self.for_each_virtio_device(|t, device| {
+            if matches!(
+                t,
+                VirtioDeviceType::Gpu
+                    | VirtioDeviceType::Input
+                    | VirtioDeviceType::Sound
+                    | VirtioDeviceType::Vsock
+            ) {
+                out.push(device.queue_positions());
+            }
+        });
+        out
     }
 
     /// Lets the held frames of each network device go out, up to the mark `upto`.
@@ -480,6 +503,9 @@ impl DeviceManager {
     /// Saves the state of the devices for a snapshot of the state only (the stop of a move): each
     /// device is readied by `prepare_move` in the place of `prepare_save`.
     pub fn save_move(&self) -> DevicesState {
+        if let Some(screen) = &self.screen {
+            screen.unmark();
+        }
         let virtio_state = match &self.virtio_devices {
             VirtioDevices::Mmio(mmio_devices) => {
                 VirtioDevicesState::Mmio(mmio_devices.save_with(&|device| device.prepare_move()))
@@ -509,6 +535,10 @@ impl DeviceManager {
                 pci_devices.save_with(&|device| device.prepare_checkpoint()),
             ),
         };
+        // from here to the resume no device of the screen may move a queue
+        if let Some(screen) = &self.screen {
+            screen.mark(self.screen_positions());
+        }
 
         DevicesState {
             virtio_state,
@@ -915,6 +945,9 @@ impl<'a> Persist<'a> for DeviceManager {
     type Error = DeviceManagerPersistError;
 
     fn save(&self) -> Self::State {
+        if let Some(screen) = &self.screen {
+            screen.unmark();
+        }
         let virtio_state = match &self.virtio_devices {
             VirtioDevices::Mmio(mmio_devices) => VirtioDevicesState::Mmio(mmio_devices.save()),
             VirtioDevices::Pci(pci_devices) => VirtioDevicesState::Pci(pci_devices.save()),

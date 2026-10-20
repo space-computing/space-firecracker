@@ -295,6 +295,21 @@ pub trait VirtioDevice: AsAny + MutEventSubscriber + Send {
     /// the pages of its queues are marked: a device whose work `quiesce` or `prepare_checkpoint`
     /// held (the worker threads of a drive) takes it again.
     fn resume_after_checkpoint(&mut self) {}
+
+    /// The device's place in each of its queues (the next available and the next used index),
+    /// for the check that a device that runs on a thread of its own moved no queue from the save
+    /// of a checkpoint's state to its resume (the screen's devices, `crate::devices::screen`).
+    fn queue_positions(&self) -> Vec<(u16, u16)> {
+        Vec::new()
+    }
+}
+
+/// [`VirtioDevice::queue_positions`] of a device's queues.
+pub fn positions_of(queues: &[crate::devices::virtio::queue::Queue]) -> Vec<(u16, u16)> {
+    queues
+        .iter()
+        .map(|q| (q.next_avail.0, q.next_used.0))
+        .collect()
 }
 
 impl fmt::Debug for dyn VirtioDevice {

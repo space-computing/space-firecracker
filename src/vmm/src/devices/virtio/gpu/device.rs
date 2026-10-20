@@ -3519,6 +3519,10 @@ impl VirtioDevice for Gpu {
         self.queue_events.get(index)
     }
 
+    fn queue_positions(&self) -> Vec<(u16, u16)> {
+        crate::devices::virtio::device::positions_of(&self.queues)
+    }
+
     fn reset_queues(&mut self) {
         self.queues.iter_mut().for_each(Queue::reset);
     }
