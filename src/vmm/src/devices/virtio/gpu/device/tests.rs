@@ -558,6 +558,22 @@ fn display_events_set_the_config() {
 }
 
 #[test]
+fn a_display_the_guest_has_not_been_shown_raises_a_display_event() {
+    let mem = single_region_mem(0x100000);
+    let mut r = rig_with(&mem, cfg("/nonexistent"));
+    let d1 = [1u8; 24];
+    r.sink_says(SP_INFO, 0, &d1, &[], [2, 0, 0]);
+    assert_eq!(r.gpu.config_word(0), 1);
+    r.gpu.write_config(4, &1u32.to_le_bytes());
+    // the same display again (a new pairing of the same renderer): no event
+    r.sink_says(SP_INFO, 0, &d1, &[], [2, 0, 0]);
+    assert_eq!(r.gpu.config_word(0), 0);
+    // another display: the guest reads it again
+    r.sink_says(SP_INFO, 0, &[2u8; 24], &[], [2, 0, 0]);
+    assert_eq!(r.gpu.config_word(0), 1);
+}
+
+#[test]
 fn transfers_send_their_bytes_and_hint_the_filter() {
     let mem = single_region_mem(0x200000);
     let mut r = rig_with(&mem, cfg("/nonexistent"));

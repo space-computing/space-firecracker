@@ -103,6 +103,8 @@ const RESP_OK_CAPSET_INFO: u32 = 0x1102;
 const RESP_OK_CAPSET: u32 = 0x1103;
 const RESP_ERR_UNSPEC: u32 = 0x1200;
 const FLAG_FENCE: u32 = 1;
+/// `VIRTIO_GPU_EVENT_DISPLAY` of `events_read`: the display information changed.
+const VIRTIO_GPU_EVENT_DISPLAY: u64 = 1;
 
 const CAPSET_VIRGL: u32 = 1;
 const CAPSET_VIRGL2: u32 = 2;
@@ -1962,7 +1964,16 @@ impl Gpu {
                     );
                 }
             }
-            2 => self.dinfo = Some(a.to_vec()),
+            2 => {
+                // A display that the guest has not been shown: it reads the display again (a
+                // guest booted with no screen gets the in-guest renderer's size, one whose user's
+                // renderer comes later that renderer's).
+                let changed = self.dinfo.as_deref() != Some(a);
+                self.dinfo = Some(a.to_vec());
+                if changed && self.is_activated() {
+                    self.display_event(VIRTIO_GPU_EVENT_DISPLAY);
+                }
+            }
             3 => self.edid = Some(a.to_vec()),
             _ => {}
         }
