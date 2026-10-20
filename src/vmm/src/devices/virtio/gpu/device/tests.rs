@@ -786,6 +786,12 @@ struct Sink {
 }
 
 impl Sink {
+    /// The device closed the connection (with nothing sent on it).
+    fn closed(&mut self) -> bool {
+        let mut b = [0u8; 1];
+        matches!(self.s.read(&mut b), Ok(0))
+    }
+
     fn read_hello(&mut self) -> Hdr {
         let mut h = [0u8; 80];
         self.s.read_exact(&mut h).unwrap();
@@ -1152,6 +1158,33 @@ fn input_scroll_and_sound_go_through_the_connection() {
 
 fn sink_on(listener: &UnixListener) -> Sink {
     let (s, _) = listener.accept().unwrap();
+    sink_from(s)
+}
+
+/// The in-guest renderer of a test connects to the device's socket; the device takes the
+/// connection as its event does ([`Link::accept`]), and pairs it when it wants that renderer.
+fn guest_connects(path: &std::path::Path, gpu: &mut Gpu) -> UnixStream {
+    let s = UnixStream::connect(path).unwrap();
+    assert!(gpu.conns[GUEST].link.accept());
+    s
+}
+
+/// A connection that the device has not paired (no HELLO is read).
+fn sink_from_no_hello(s: UnixStream) -> Sink {
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    Sink {
+        s,
+        z: ZUnpacker::new(),
+        zw: ZPacker::new(),
+        rxw: Vec::new(),
+        rx: Vec::new(),
+        compressed: false,
+        last_hello: None,
+        specs: Vec::new(),
+    }
+}
+
+fn sink_from(s: UnixStream) -> Sink {
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let mut sink = Sink {
         s,
@@ -1173,7 +1206,7 @@ fn pump2(gpu: &mut Gpu, mut done: impl FnMut(&Gpu) -> bool) {
     while !done(gpu) {
         assert!(t.elapsed() < Duration::from_secs(5), "timed out");
         gpu.process_remote(USER);
-        gpu.process_remote(CPU);
+        gpu.process_remote(GUEST);
         std::thread::sleep(Duration::from_millis(2));
     }
 }
@@ -1235,16 +1268,16 @@ fn export_hdr(id: u64, typ: u32, a: &[u8], b: &[u8], args: [u64; 3]) -> Hdr {
 }
 
 #[test]
-fn switches_between_the_users_renderer_and_the_cpu_renderer() {
+fn switches_between_the_users_renderer_and_the_in_guest_renderer() {
     let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
-    let (up, cp) = (dir.as_path().join("u.sock"), dir.as_path().join("c.sock"));
-    let (ul, cl) = (
-        UnixListener::bind(&up).unwrap(),
-        UnixListener::bind(&cp).unwrap(),
+    let (up, cp) = (
+        dir.as_path().join("u.sock"),
+        dir.as_path().join("v.sock_5001"),
     );
+    let ul = UnixListener::bind(&up).unwrap();
     let mem = single_region_mem(0x200000);
     let mut c = cfg(up.to_str().unwrap());
-    c.cpu_socket_path = Some(cp.to_str().unwrap().into());
+    c.guest_renderer_socket_path = Some(cp.to_str().unwrap().into());
     let mut r = rig_with(&mem, c);
     r.gpu.process_retry();
     let mut user = sink_on(&ul);
@@ -1295,12 +1328,17 @@ fn switches_between_the_users_renderer_and_the_cpu_renderer() {
         ]
     );
 
-    // The user's renderer detaches: the CPU renderer is connected, reset, gets the scanout's
+    // The in-guest renderer has connected; it is held, not paired, while the user's renderer
+    // runs the guest.
+    let gs = guest_connects(&cp, &mut r.gpu);
+    r.gpu.process_retry();
+    assert!(!r.gpu.conns[GUEST].link.is_connected());
+    // The user's renderer detaches: the in-guest renderer is paired, reset, gets the scanout's
     // resource and its contents first, then the rest; the old one is told it may go.
     user.say(1, SP_DETACH, &[], &[], 0);
     pump2(&mut r.gpu, |g| g.switch.is_some());
     r.gpu.process_retry();
-    let mut cpu = sink_on(&cl);
+    let mut cpu = sink_from(gs);
     cpu.hello(0x222, 0, 0, false);
     pump2(&mut r.gpu, |g| {
         g.switch.as_ref().unwrap().phase == Phase::Reset
@@ -1320,7 +1358,7 @@ fn switches_between_the_users_renderer_and_the_cpu_renderer() {
     user.say_args(4, SP_EXPORT_DONE, &[], &[], [1, 100, e.arg0]);
     pump2(&mut r.gpu, |g| g.switch.is_none());
     assert_eq!(r.gpu.counters.export_stale, 1);
-    assert_eq!(r.gpu.active, CPU);
+    assert_eq!(r.gpu.active, GUEST);
     assert_eq!(
         cpu.take(8),
         [
@@ -1338,7 +1376,7 @@ fn switches_between_the_users_renderer_and_the_cpu_renderer() {
     r.give(hdr(CMD_RESOURCE_FLUSH, None, 0));
     assert_eq!(cpu.take(1), [(SP_CTRL, CMD_RESOURCE_FLUSH)]);
 
-    // The user's renderer, started again, connects: a planned switch back, the CPU renderer
+    // The user's renderer, started again, connects: a planned switch back, the in-guest renderer
     // exporting.
     drop(user);
     pump2(&mut r.gpu, |g| !g.conns[USER].link.is_connected());
@@ -1361,12 +1399,12 @@ fn switches_between_the_users_renderer_and_the_cpu_renderer() {
     cpu.say_args(3, SP_EXPORT_DONE, &[], &[], [1, 100, e2.arg0]);
     pump2(&mut r.gpu, |g| g.switch.is_none());
     assert_eq!(r.gpu.active, USER);
-    assert!(!r.gpu.conns[CPU].link.is_connected());
+    assert!(!r.gpu.conns[GUEST].link.is_connected());
     let got = user.take(8);
     assert_eq!(got[2], (SP_IMPORT, 5));
     assert_eq!(r.gpu.n_switch, 2);
 
-    // The user's renderer is gone for 10 s: the CPU renderer takes over from the journal. A
+    // The user's renderer is gone for 10 s: the in-guest renderer takes over from the journal. A
     // forward with no renderer behind it (a connection closed before its HELLO) does not
     // count as being back.
     drop(user);
@@ -1381,8 +1419,9 @@ fn switches_between_the_users_renderer_and_the_cpu_renderer() {
     r.gpu.conns[USER].lost_at -= TAKEOVER_US + 1;
     r.gpu.process_ack_timer();
     assert_eq!(r.gpu.switch.as_ref().unwrap().from, None);
+    let gs = guest_connects(&cp, &mut r.gpu);
     r.gpu.process_retry();
-    let mut cpu = sink_on(&cl);
+    let mut cpu = sink_from(gs);
     cpu.hello(0x444, 0, 0, false);
     pump2(&mut r.gpu, |g| {
         g.switch.as_ref().unwrap().phase == Phase::Reset
@@ -1390,7 +1429,7 @@ fn switches_between_the_users_renderer_and_the_cpu_renderer() {
     assert_eq!(cpu.take(1), [(SP_STATE_RESET, 0)]);
     cpu.say(1, SP_STATE_KEPT, &[], &[], 0);
     pump2(&mut r.gpu, |g| g.switch.is_none());
-    assert_eq!(r.gpu.active, CPU);
+    assert_eq!(r.gpu.active, GUEST);
     assert_eq!(
         cpu.take(6),
         [
@@ -2217,7 +2256,7 @@ fn a_guest_whose_renderer_never_came_is_served_by_the_device_after_the_first_wai
 }
 
 #[test]
-fn a_lost_renderer_is_waited_for_and_then_let_go_when_there_is_no_cpu_renderer() {
+fn a_lost_renderer_is_waited_for_and_then_let_go_when_there_is_no_in_guest_renderer() {
     let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
     let path = dir.as_path().join("gpu.sock");
     let listener = UnixListener::bind(&path).unwrap();
@@ -2582,16 +2621,16 @@ fn a_renderer_that_cannot_do_the_spec_is_not_paired_and_is_tried_again_later() {
 }
 
 #[test]
-fn a_switch_to_a_cpu_renderer_that_cannot_do_the_spec_is_given_up() {
+fn a_switch_to_an_in_guest_renderer_that_cannot_do_the_spec_is_given_up() {
     let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
-    let (up, cp) = (dir.as_path().join("u.sock"), dir.as_path().join("c.sock"));
-    let (ul, cl) = (
-        UnixListener::bind(&up).unwrap(),
-        UnixListener::bind(&cp).unwrap(),
+    let (up, cp) = (
+        dir.as_path().join("u.sock"),
+        dir.as_path().join("v.sock_5001"),
     );
+    let ul = UnixListener::bind(&up).unwrap();
     let mem = single_region_mem(0x200000);
     let mut c = cfg(up.to_str().unwrap());
-    c.cpu_socket_path = Some(cp.to_str().unwrap().into());
+    c.guest_renderer_socket_path = Some(cp.to_str().unwrap().into());
     let mut r = rig_with(&mem, c);
     r.gpu.process_retry();
     let mut user = sink_on(&ul);
@@ -2599,22 +2638,23 @@ fn a_switch_to_a_cpu_renderer_that_cannot_do_the_spec_is_given_up() {
     pump2(&mut r.gpu, |g| g.conns[USER].up());
     r.give(ctx_create(1));
     assert_eq!(user.take(1), [(SP_CTRL, CMD_CTX_CREATE)]);
-    // The user's renderer detaches; the CPU renderer cannot do the spec: the switch is given
+    // The user's renderer detaches; the in-guest renderer cannot do the spec: the switch is given
     // up, the user's renderer is let go, and the guest is served alone.
+    let gs = guest_connects(&cp, &mut r.gpu);
     user.say(1, SP_DETACH, &[], &[], 0);
     pump2(&mut r.gpu, |g| g.switch.is_some());
     r.gpu.process_retry();
-    let mut cpu = sink_on(&cl);
+    let mut cpu = sink_from(gs);
     cpu.hello_only(0x222, 0, 0, false);
-    pump2(&mut r.gpu, |g| g.conns[CPU].hello_done);
+    pump2(&mut r.gpu, |g| g.conns[GUEST].hello_done);
     assert_eq!(cpu.next_any().0.typ, SP_SPEC);
     cpu.spec_reply(
         false,
         " capset 2 min_aliased_point_size[0]: 1 here, profile 0 (fle);",
     );
     pump2(&mut r.gpu, |g| g.switch.is_none());
-    assert!(r.gpu.conns[CPU].refused && !r.gpu.conns[CPU].wanted);
-    assert!(!r.gpu.conns[CPU].link.is_connected());
+    assert!(r.gpu.conns[GUEST].refused && !r.gpu.conns[GUEST].wanted);
+    assert!(!r.gpu.conns[GUEST].link.is_connected());
     assert_eq!(r.gpu.active, USER);
     assert_eq!(r.gpu.conns[USER].peer_session, 0);
     assert_eq!(user.take(1), [(SP_BYE, 0)]);
@@ -2623,11 +2663,194 @@ fn a_switch_to_a_cpu_renderer_that_cannot_do_the_spec_is_given_up() {
     let a0 = guest_put(&r, 0, &submit(Some(5), 1, &[]));
     r.gpu.process_ack_timer();
     assert_eq!(answered(&r, a0), Some(RESP_OK_NODATA));
-    // no takeover by a CPU renderer that cannot do the spec
+    // no takeover by an in-guest renderer that cannot do the spec
     r.gpu.conns[USER].lost_at -= TAKEOVER_US + 1;
     r.gpu.process_ack_timer();
     assert!(r.gpu.switch.is_none());
-    assert!(!r.gpu.conns[CPU].wanted);
+    assert!(!r.gpu.conns[GUEST].wanted);
+}
+
+/// A device with the in-guest renderer's socket at `<dir>/v.sock_5001`, and a user's renderer
+/// paired that has run a context; returns the user's sink and the socket path.
+fn with_user_and_guest_socket<'a>(
+    mem: &'a GuestMemoryMmap,
+    dir: &std::path::Path,
+) -> (Rig<'a>, Sink, std::path::PathBuf, UnixListener) {
+    let (up, cp) = (dir.join("u.sock"), dir.join("v.sock_5001"));
+    let ul = UnixListener::bind(&up).unwrap();
+    let mut c = cfg(up.to_str().unwrap());
+    c.guest_renderer_socket_path = Some(cp.to_str().unwrap().into());
+    let mut r = rig_with(mem, c);
+    r.gpu.process_retry();
+    let mut user = sink_on(&ul);
+    user.hello(0x111, r.gpu.session, 0, false);
+    pump2(&mut r.gpu, |g| g.conns[USER].up());
+    r.give(ctx_create(1));
+    assert_eq!(user.take(1), [(SP_CTRL, CMD_CTX_CREATE)]);
+    (r, user, cp, ul)
+}
+
+#[test]
+fn a_detach_with_no_in_guest_renderer_connected_ends_at_once() {
+    let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+    let mem = single_region_mem(0x200000);
+    let (mut r, mut user, _, _ul) = with_user_and_guest_socket(&mem, dir.as_path());
+    // nothing to hand the state to: the renderer may go, and the guest is served alone
+    user.say(1, SP_DETACH, &[], &[], 0);
+    pump2(&mut r.gpu, |g| g.conns[USER].peer_session == 0);
+    assert_eq!(user.take(1), [(SP_BYE, 0)]);
+    assert!(r.gpu.switch.is_none());
+    assert_eq!(r.gpu.conns[USER].peer_session, 0);
+    drop(user);
+    pump2(&mut r.gpu, |g| !g.conns[USER].link.is_connected());
+    let a0 = guest_put(&r, 0, &submit(Some(5), 1, &[]));
+    r.gpu.process_ack_timer();
+    assert_eq!(answered(&r, a0), Some(RESP_OK_NODATA));
+}
+
+#[test]
+fn a_takeover_serves_the_guest_alone_until_the_in_guest_renderer_connects() {
+    let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+    let mem = single_region_mem(0x200000);
+    let (mut r, user, cp, _ul) = with_user_and_guest_socket(&mem, dir.as_path());
+    drop(user);
+    pump2(&mut r.gpu, |g| !g.conns[USER].link.is_connected());
+    r.gpu.conns[USER].lost_at -= TAKEOVER_US + 1;
+    r.gpu.process_ack_timer();
+    // the takeover has begun, and no in-guest renderer is there: the guest does not wait
+    assert_eq!(
+        r.gpu.switch.as_ref().map(|s| (s.from, s.to)),
+        Some((None, GUEST))
+    );
+    let a0 = guest_put(&r, 0, &submit(Some(5), 1, &[]));
+    r.gpu.process_ack_timer();
+    assert_eq!(answered(&r, a0), Some(RESP_OK_NODATA));
+    // the in-guest renderer connects (a newer connection replaces a held one): it is paired at
+    // once, built from the journal, and runs the guest
+    let old = guest_connects(&cp, &mut r.gpu);
+    let gs = guest_connects(&cp, &mut r.gpu);
+    let mut old = sink_from_no_hello(old);
+    r.gpu.process_retry();
+    let mut g = sink_from(gs);
+    g.hello(0x222, 0, 0, false);
+    pump2(&mut r.gpu, |g| {
+        g.switch.as_ref().is_some_and(|s| s.phase == Phase::Reset)
+    });
+    assert_eq!(g.take(1), [(SP_STATE_RESET, 0)]);
+    g.say(1, SP_STATE_KEPT, &[], &[], 0);
+    pump2(&mut r.gpu, |g| g.switch.is_none());
+    assert_eq!(r.gpu.active, GUEST);
+    assert_eq!(
+        g.take(2),
+        [(SP_CTRL, CMD_CTX_CREATE), (SP_CTRL, CMD_SUBMIT_3D)]
+    );
+    // the older connection was closed with nothing sent
+    assert!(old.closed());
+}
+
+#[test]
+fn the_users_renderer_back_first_takes_the_guest_from_a_takeover_that_waits() {
+    let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+    let mem = single_region_mem(0x200000);
+    let (mut r, user, _cp, ul) = with_user_and_guest_socket(&mem, dir.as_path());
+    drop(user);
+    pump2(&mut r.gpu, |g| !g.conns[USER].link.is_connected());
+    r.gpu.conns[USER].lost_at -= TAKEOVER_US + 1;
+    r.gpu.process_ack_timer();
+    assert!(r.gpu.switch.is_some());
+    // the user's renderer starts again before any in-guest renderer has come
+    r.gpu.process_retry();
+    let mut user = sink_on(&ul);
+    user.hello(0x333, 0, 0, false);
+    pump2(&mut r.gpu, |g| {
+        g.switch
+            .as_ref()
+            .is_some_and(|s| s.to == USER && s.phase == Phase::Reset)
+    });
+    assert!(!r.gpu.conns[GUEST].wanted);
+    assert_eq!(user.take(1), [(SP_STATE_RESET, 0)]);
+    user.say(1, SP_STATE_KEPT, &[], &[], 0);
+    pump2(&mut r.gpu, |g| g.switch.is_none());
+    assert_eq!(r.gpu.active, USER);
+    assert_eq!(user.take(1), [(SP_CTRL, CMD_CTX_CREATE)]);
+}
+
+#[test]
+fn a_snapshot_while_the_in_guest_renderer_runs_waits_for_nothing_and_it_resumes_after_the_restore()
+{
+    let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+    let mem = single_region_mem(0x200000);
+    let (mut r, user, cp, _ul) = with_user_and_guest_socket(&mem, dir.as_path());
+    // the in-guest renderer runs the guest (a planned switch)
+    let gs = guest_connects(&cp, &mut r.gpu);
+    let mut user = user;
+    user.say(1, SP_DETACH, &[], &[], 0);
+    pump2(&mut r.gpu, |g| g.switch.is_some());
+    r.gpu.process_retry();
+    let mut g = sink_from(gs);
+    g.hello(0x222, 0, 0, false);
+    pump2(&mut r.gpu, |g| {
+        g.switch.as_ref().is_some_and(|s| s.phase == Phase::Reset)
+    });
+    assert_eq!(g.take(1), [(SP_STATE_RESET, 0)]);
+    g.say(1, SP_STATE_KEPT, &[], &[], 0);
+    pump2(&mut r.gpu, |g| g.switch.is_none());
+    assert_eq!(r.gpu.active, GUEST);
+    assert_eq!(g.take(1), [(SP_CTRL, CMD_CTX_CREATE)]);
+    assert_eq!(user.take(1), [(SP_BYE, 0)]);
+    // a fenced command that the renderer has not answered
+    r.gpu.fence_window = 0;
+    r.give(submit(Some(7), 1, &[]));
+    let (m, _) = g.next();
+    assert_eq!((m.typ, r.gpu.pending.len()), (SP_CTRL, 1));
+    // the snapshot does not wait for it (its state is in the guest's memory) and exports nothing
+    let t = Instant::now();
+    r.gpu.prepare_save();
+    assert!(t.elapsed() < Duration::from_millis(200));
+    assert!(!r.gpu.conns[GUEST].link.is_connected());
+    let st = through_a_snapshot(&r.gpu);
+    let side = st.side.as_ref().unwrap();
+    assert_eq!(side.pending.len(), 1);
+    assert!(side.scanout_saved.is_empty() && side.scanout_missing.is_empty());
+    assert_eq!(st.active, GUEST);
+    // a checkpoint and the stop of a move record nothing as missing either
+    r.gpu.kick();
+    r.gpu.prepare_checkpoint();
+    let ck = through_a_snapshot(&r.gpu);
+    assert!(ck.side.as_ref().unwrap().scanout_missing.is_empty());
+    drop(r);
+    drop(g);
+
+    // Restored: the in-guest renderer, restored with the guest's memory of the same instant,
+    // connects again and resumes; the command it had not answered comes again with its id.
+    let mut d = restored(&mem, &st);
+    let gs = guest_connects(&cp, &mut d);
+    d.process_retry();
+    let mut g = sink_from(gs);
+    let h = g.last_hello.unwrap();
+    assert_eq!((h.arg1, h.flags & SP_F_RESTORED), (0x222, SP_F_RESTORED));
+    g.hello(0x222, st.session, m.id - 1, false);
+    pump2(&mut d, |d| d.conns[GUEST].up());
+    assert!(d.switch.is_none());
+    assert_eq!(d.counters.n_reconnect, 1);
+    // what it had not acknowledged comes again with the same ids (a sink drops the ids it has), the command it had
+    // not received among them
+    let mut ids = Vec::new();
+    let (m2, a) = loop {
+        let (x, a) = g.next();
+        if x.id >= m.id {
+            break (x, a);
+        }
+        ids.push(x.id);
+    };
+    assert!(
+        ids.iter().enumerate().all(|(i, id)| *id == i as u64 + 1),
+        "{ids:?}"
+    );
+    assert_eq!(
+        (m2.typ, m2.id, u32_at(&a, 0)),
+        (SP_CTRL, m.id, CMD_SUBMIT_3D)
+    );
 }
 
 #[test]

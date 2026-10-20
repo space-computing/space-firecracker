@@ -68,12 +68,16 @@ pub struct GpuConfig {
     /// path (the agent uses port 5000). The device creates the socket.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_socket_path: Option<String>,
-    /// The unix socket of a renderer on this server's CPU (the same sink, run with software
-    /// GL). With it, the device switches to that renderer when the user's renderer detaches or
-    /// has been silent for 10 s, and back when the user's renderer connects again; the guest
-    /// keeps running, and the device builds the renderer's state again from its journal.
+    /// A unix socket on which the device takes the connection of the renderer inside the guest
+    /// (the same sink, run in the guest on its own CPU with software GL). With the vsock device,
+    /// that renderer connects to the host's port P and Firecracker connects that to
+    /// `<vsock uds_path>_P`, so this is that path (the renderer uses port 5001). The device
+    /// creates the socket. With it, the device switches to that renderer when the user's renderer
+    /// detaches or has been silent for 10 s, and back when the user's renderer connects again;
+    /// the guest keeps running, and the device builds the renderer's state again from its
+    /// journal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cpu_socket_path: Option<String>,
+    pub guest_renderer_socket_path: Option<String>,
 }
 
 impl GpuConfig {
@@ -120,8 +124,8 @@ impl GpuConfig {
         if self.agent_socket_path.as_deref() == Some("") {
             return Err(GpuConfigError::AgentSocketPath);
         }
-        if self.cpu_socket_path.as_deref() == Some("") {
-            return Err(GpuConfigError::CpuSocketPath);
+        if self.guest_renderer_socket_path.as_deref() == Some("") {
+            return Err(GpuConfigError::GuestRendererSocketPath);
         }
         Ok(())
     }
@@ -140,8 +144,8 @@ pub enum GpuConfigError {
     ZstdLevel(i32),
     /// The socket path of the guest agent's channel is empty.
     AgentSocketPath,
-    /// The socket path of the CPU renderer is empty.
-    CpuSocketPath,
+    /// The socket path of the renderer inside the guest is empty.
+    GuestRendererSocketPath,
 }
 
 #[cfg(test)]
@@ -170,7 +174,7 @@ mod tests {
             r#"{"socket_path": "/s", "spec_path": "/g.spec", "stats_path": "/t", "fence_window": 0, "fence_age_ms": 5,
                 "tx_limit_mib": 2, "zstd_level": 0, "debug_wait": true, "dump_path": "/d",
                 "input": true, "sound": true, "agent_socket_path": "/v.sock_5000",
-                "cpu_socket_path": "/c.sock"}"#,
+                "guest_renderer_socket_path": "/v.sock_5001"}"#,
         )
         .unwrap();
         c.validate().unwrap();
@@ -178,7 +182,10 @@ mod tests {
         assert_eq!(c.tx_limit_bytes(), 2 << 20);
         assert!(c.input() && c.sound());
         assert_eq!(c.agent_socket_path.as_deref(), Some("/v.sock_5000"));
-        assert_eq!(c.cpu_socket_path.as_deref(), Some("/c.sock"));
+        assert_eq!(
+            c.guest_renderer_socket_path.as_deref(),
+            Some("/v.sock_5001")
+        );
 
         serde_json::from_str::<GpuConfig>(
             r#"{"socket_path": "/s", "spec_path": "/g", "other": 1}"#,
@@ -209,9 +216,14 @@ mod tests {
             Err(GpuConfigError::AgentSocketPath)
         );
         assert_eq!(
-            bad(r#"{"socket_path": "/s", "spec_path": "/g", "cpu_socket_path": ""}"#),
-            Err(GpuConfigError::CpuSocketPath)
+            bad(r#"{"socket_path": "/s", "spec_path": "/g", "guest_renderer_socket_path": ""}"#),
+            Err(GpuConfigError::GuestRendererSocketPath)
         );
+        // the CPU renderer on the host is gone: its field is refused
+        serde_json::from_str::<GpuConfig>(
+            r#"{"socket_path": "/s", "spec_path": "/g", "cpu_socket_path": "/c.sock"}"#,
+        )
+        .unwrap_err();
         serde_json::from_str::<GpuConfig>(
             r#"{"socket_path": "/s", "spec_path": "/g", "input": 1}"#,
         )

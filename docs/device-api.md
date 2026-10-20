@@ -118,7 +118,7 @@ specification:
 |                           | input               |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |     O      |   **R**    |
 |                           | sound               |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |     O      |   **R**    |
 |                           | agent_socket_path   |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |     O      |   **R**    |
-|                           | cpu_socket_path     |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |     O      |   **R**    |
+|                           | guest_renderer_socket_path |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |     O      |   **R**    |
 | `Pmem`                    | id                  |    O     |       O        |      O       |        O         |     O      |      O       |     O      |    **R**    |     O      |     O      |
 |                           | path_on_host        |    O     |       O        |      O       |        O         |     O      |      O       |     O      |    **R**    |     O      |     O      |
 |                           | root_device         |    O     |       O        |      O       |        O         |     O      |      O       |     O      |    **R**    |     O      |     O      |

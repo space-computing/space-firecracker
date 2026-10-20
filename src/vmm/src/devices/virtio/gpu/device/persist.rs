@@ -39,7 +39,10 @@
 //! guest goes on at once after a checkpoint, and a move resumes the same renderer. Their side
 //! state records every resource the GPU wrote as missing, so a rollback to one of them is
 //! redrawn as the rollback to a snapshot whose export did not complete. A checkpoint is a mark
-//! point as a snapshot is; a move closes the connections as a snapshot does.
+//! point as a snapshot is; a move closes the connections as a snapshot does. While the in-guest
+//! renderer runs the guest, a snapshot waits for nothing and exports nothing either, and none of
+//! the three records anything as missing: that renderer's state is in the guest's memory of the
+//! same instant, and it resumes after the restore.
 //!
 //! The side state is in two parts: its structure (the journal with its uploads empty, the
 //! messages not acknowledged with no bytes, the rest as it is), compressed, and the bytes it
@@ -69,7 +72,7 @@ use std::sync::Arc;
 use gpu_journal::{Blob, Journal};
 use serde::{Deserialize, Serialize};
 
-use super::{CAPSET_IDS, Cmd, Conn, Gpu, Parked, Pending, Resource, SaveKind, now_us};
+use super::{CAPSET_IDS, Cmd, Conn, GUEST, Gpu, Parked, Pending, Resource, SaveKind, now_us};
 use crate::devices::virtio::device::VirtioDeviceType;
 use crate::devices::virtio::gpu::GPU_NUM_QUEUES;
 use crate::devices::virtio::gpu::spec::Spec;
@@ -444,6 +447,10 @@ impl Persist<'_> for Gpu {
                     .collect(),
                 self.saved_missing.clone(),
             ),
+            // the in-guest renderer's content is in the guest's memory of the same instant
+            SaveKind::Checkpoint | SaveKind::Move if self.active == GUEST => {
+                (Vec::new(), Vec::new())
+            }
             SaveKind::Checkpoint | SaveKind::Move => {
                 // as at a snapshot whose renderer cannot export: nothing shown, nothing to keep
                 let (shown, rest) = self.written_shown_first();

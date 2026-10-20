@@ -5,7 +5,7 @@ use event_manager::{EventOps, Events, MutEventSubscriber};
 use vmm_sys_util::epoll::EventSet;
 
 use super::agent::AgentRead;
-use super::device::{CPU, USER};
+use super::device::{GUEST, USER};
 use super::{CTRL_QUEUE, CURSOR_QUEUE, Gpu};
 use crate::devices::virtio::device::VirtioDevice;
 use crate::logger::{error, warn};
@@ -20,7 +20,8 @@ impl Gpu {
     const PROCESS_STATS: u32 = 6;
     const PROCESS_AGENT_LISTEN: u32 = 7;
     const PROCESS_AGENT_CONN: u32 = 8;
-    const PROCESS_REMOTE_CPU: u32 = 9;
+    const PROCESS_REMOTE_GUEST: u32 = 9;
+    const PROCESS_GUEST_LISTEN: u32 = 10;
 
     fn add(ops: &mut EventOps, fd: &impl std::os::fd::AsRawFd, data: u32) {
         if let Err(err) = ops.add(Events::with_data(fd, data, EventSet::IN)) {
@@ -31,8 +32,11 @@ impl Gpu {
     /// The connection and the timers work whether the guest's driver is up or not.
     fn register_connection_events(&self, ops: &mut EventOps) {
         Self::add(ops, &self.conns[USER].link.rx_event, Self::PROCESS_REMOTE);
-        if let Some(c) = self.conns.get(CPU) {
-            Self::add(ops, &c.link.rx_event, Self::PROCESS_REMOTE_CPU);
+        if let Some(c) = self.conns.get(GUEST) {
+            Self::add(ops, &c.link.rx_event, Self::PROCESS_REMOTE_GUEST);
+            if let Some(l) = c.link.listener() {
+                Self::add(ops, l, Self::PROCESS_GUEST_LISTEN);
+            }
         }
         Self::add(ops, &self.retry_timer, Self::PROCESS_RETRY);
         Self::add(ops, &self.ack_timer, Self::PROCESS_ACK);
@@ -42,6 +46,30 @@ impl Gpu {
             if let Some(c) = &ag.conn {
                 Self::add(ops, c, Self::PROCESS_AGENT_CONN);
             }
+        }
+    }
+
+    /// A connection of the in-guest renderer: it is held, and paired at once when that renderer
+    /// is wanted (a newer one replaces one that is held).
+    fn process_guest_listen(&mut self) {
+        if !self.conns[GUEST].link.accept() {
+            return;
+        }
+        let c = &self.conns[GUEST];
+        let msg = format!(
+            "spacebox remote gpu: the in-guest renderer connected on {}{}",
+            c.link.path(),
+            if c.wanted && !c.link.is_connected() {
+                ""
+            } else {
+                " (held until it is wanted)"
+            }
+        );
+        self.log_info_line(&msg);
+        let c = &self.conns[GUEST];
+        if c.wanted && !c.link.is_connected() {
+            self.retry_timer
+                .arm(std::time::Duration::from_millis(1), None);
         }
     }
 
@@ -94,12 +122,14 @@ impl Gpu {
         }
         Self::add(
             ops,
-            self.queue_event(CTRL_QUEUE).expect("an event of each queue"),
+            self.queue_event(CTRL_QUEUE)
+                .expect("an event of each queue"),
             Self::PROCESS_CTRL_QUEUE,
         );
         Self::add(
             ops,
-            self.queue_event(CURSOR_QUEUE).expect("an event of each queue"),
+            self.queue_event(CURSOR_QUEUE)
+                .expect("an event of each queue"),
             Self::PROCESS_CURSOR_QUEUE,
         );
         self.runtime_events_registered = true;
@@ -152,11 +182,12 @@ impl MutEventSubscriber for Gpu {
         match source {
             Self::PROCESS_ACTIVATE => self.process_activate_event(ops),
             Self::PROCESS_REMOTE => self.process_remote(USER),
-            Self::PROCESS_REMOTE_CPU => self.process_remote(CPU),
+            Self::PROCESS_REMOTE_GUEST => self.process_remote(GUEST),
             Self::PROCESS_RETRY => self.process_retry(),
             Self::PROCESS_ACK => self.process_ack_timer(),
             Self::PROCESS_STATS => self.process_stats_timer(),
             Self::PROCESS_AGENT_LISTEN => self.process_agent_listen(ops),
+            Self::PROCESS_GUEST_LISTEN => self.process_guest_listen(),
             Self::PROCESS_CTRL_QUEUE | Self::PROCESS_CURSOR_QUEUE => {
                 let q = if source == Self::PROCESS_CTRL_QUEUE {
                     CTRL_QUEUE

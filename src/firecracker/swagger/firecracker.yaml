@@ -2163,13 +2163,15 @@ definitions:
           A unix socket on which the device takes the connection of the guest agent and carries
           the renderer's scroll channel to it; with the vsock device this is
           `<vsock uds_path>_<port>` of the agent's port. The device creates it.
-      cpu_socket_path:
+      guest_renderer_socket_path:
         type: string
         description:
-          The unix socket of a renderer on the server's CPU. With it, the device switches to that
-          renderer when the renderer of socket_path detaches or has been gone or silent for 10 s,
-          and back when that renderer connects again; the guest keeps running, and the device
-          builds the renderer's state again from what it keeps.
+          A unix socket on which the device takes the connection of the renderer inside the guest
+          (the same renderer, run in the guest on the guest's CPU); with the vsock device this is
+          `<vsock uds_path>_<port>` of that renderer's port (5001). The device creates it. With
+          it, the device switches to that renderer when the renderer of socket_path detaches or
+          has been gone or silent for 10 s, and back when that renderer connects again; the guest
+          keeps running, and the device builds the renderer's state again from what it keeps.
 
   SerialDevice:
     type: object
