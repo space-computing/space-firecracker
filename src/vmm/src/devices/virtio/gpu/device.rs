@@ -157,6 +157,9 @@ const ROLLBACK_REDRAW_US: i64 = 2_000_000;
 /// A picture of the in-guest renderer for the user's renderer is dropped while more than this
 /// waits to be sent on the user's link (a newer one comes).
 const PICTURE_BACKLOG: usize = 1 << 20;
+/// The user's toggle off waits this long for an in-guest renderer that is not connected (after a
+/// switch back it connects again within a second) before it is refused.
+const OFF_WAIT_US: i64 = 5_000_000;
 /// The guest's cursor (`struct virtio_gpu_update_cursor` names a resource of 64 x 64, 32 bit).
 const CURSOR_BYTES: u64 = 64 * 64 * 4;
 /// A piece of a renderer's export, as an `SP_IMPORT` (the header, the bytes).
@@ -588,6 +591,8 @@ pub struct Gpu {
     pub(crate) gpu_off: bool,
     /// The user turned it on; the switch back waits for the switch under way.
     gpu_on_pending: bool,
+    /// When the user turned it off ([`OFF_WAIT_US`]).
+    gpu_off_at: i64,
     /// The in-guest renderer was asked for pictures (`SP_STREAM`) on its current pairing.
     pub(crate) stream_on: bool,
     /// What the user's renderer was last told of its toggle (`SP_GPU_STATE`) on this pairing: on,
@@ -759,6 +764,7 @@ impl Gpu {
             release_at_kick: false,
             gpu_off: false,
             gpu_on_pending: false,
+            gpu_off_at: 0,
             stream_on: false,
             gpu_state_said: None,
             gpu_state_owed: false,
@@ -2149,6 +2155,9 @@ impl Gpu {
         self.gpu_off = !on;
         self.gpu_on_pending = on;
         self.gpu_state_owed = true;
+        if !on {
+            self.gpu_off_at = now_us();
+        }
         if changed {
             self.log_info(&format!(
                 "spacebox remote gpu: the user turned the GPU acceleration {}",
@@ -2176,6 +2185,8 @@ impl Gpu {
                         GUEST,
                         "the user turned the GPU acceleration off",
                     );
+                } else if self.has_fallback() && now_us() - self.gpu_off_at < OFF_WAIT_US {
+                    // its link connects again after a switch back: the ack timer looks again
                 } else {
                     self.gpu_off = false;
                     self.log_info(
@@ -2208,7 +2219,9 @@ impl Gpu {
         if user_up && self.switch.is_none() {
             let on = self.active == USER;
             let changed = self.gpu_state_said.is_some_and(|s| s != on);
-            if (self.gpu_state_owed || changed) && (on || self.gpu_off) {
+            // (not while what the toggle asks for still waits)
+            let waits = (on && self.gpu_off) || (!on && self.gpu_on_pending);
+            if (self.gpu_state_owed || changed) && (on || self.gpu_off) && !waits {
                 self.gpu_state_said = Some(on);
                 self.gpu_state_owed = false;
                 self.send_on(USER, true, SP_GPU_STATE, 0, &[], &[], u64::from(on), 0, 0);
@@ -3348,6 +3361,10 @@ impl Gpu {
         }
         self.check_takeover();
         self.say_answered_lost();
+        if self.gpu_off && self.active == USER && self.switch.is_none() {
+            // a toggle off that waits for the in-guest renderer's link
+            self.toggle_settle();
+        }
         // the wait for a first or a lost renderer may have ended with commands waiting
         if self.conns[self.active].up() {
             self.alone_said = false;

@@ -3275,14 +3275,32 @@ fn a_sudden_loss_with_the_toggle_off_stops_the_pictures_and_the_renderer_back_st
 }
 
 #[test]
-fn the_toggle_off_with_no_in_guest_renderer_there_stays_on() {
+fn the_toggle_off_waits_5_s_for_the_in_guest_renderer_and_then_stays_on() {
     let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
     let mem = single_region_mem(0x200000);
+    let (mut r, mut user, cp, _ul) = with_user_and_guest_socket(&mem, dir.as_path());
+    // no in-guest renderer connected: the toggle waits for it
+    user.say(1, SP_GPU, &[], &[], 0);
+    pump2(&mut r.gpu, |g| g.gpu_off);
+    r.gpu.process_ack_timer();
+    assert!(r.gpu.switch.is_none() && r.gpu.gpu_state_said.is_none());
+    // it connects within the wait: the planned switch to it begins
+    let _gs = guest_connects(&cp, &mut r.gpu);
+    r.gpu.process_ack_timer();
+    assert_eq!(
+        r.gpu.switch.as_ref().map(|s| (s.from, s.to)),
+        Some((Some(USER), GUEST))
+    );
+
+    // another device whose in-guest renderer does not come in 5 s: the toggle stays on
+    let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
     let (mut r, mut user, _cp, _ul) = with_user_and_guest_socket(&mem, dir.as_path());
     user.say(1, SP_GPU, &[], &[], 0);
-    pump2(&mut r.gpu, |g| g.gpu_state_said.is_some());
+    pump2(&mut r.gpu, |g| g.gpu_off);
+    r.gpu.gpu_off_at -= OFF_WAIT_US + 1;
+    r.gpu.process_ack_timer();
     assert!(r.gpu.switch.is_none() && !r.gpu.gpu_off);
     assert_eq!(r.gpu.active, USER);
-    let (h, _) = user.next();
-    assert_eq!((h.typ, h.arg0, h.arg1), (SP_GPU_STATE, 1, 1));
+    let (h, _, _) = until(&mut user, SP_GPU_STATE);
+    assert_eq!((h.arg0, h.arg1), (1, 1));
 }
