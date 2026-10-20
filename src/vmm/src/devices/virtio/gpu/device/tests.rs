@@ -2869,6 +2869,71 @@ fn a_snapshot_while_the_in_guest_renderer_runs_waits_for_nothing_and_it_resumes_
     );
 }
 
+/// The in-guest renderer runs the guest (a takeover from the journal); returns its sink.
+fn guest_runs_it(r: &mut Rig<'_>, cp: &std::path::Path) -> Sink {
+    r.gpu.conns[USER].lost_at -= TAKEOVER_US + 1;
+    r.gpu.process_ack_timer();
+    let gs = guest_connects(cp, &mut r.gpu);
+    r.gpu.process_retry();
+    let mut g = sink_from(gs);
+    g.hello(0x222, 0, 0, false);
+    pump2(&mut r.gpu, |g| {
+        g.switch.as_ref().is_some_and(|s| s.phase == Phase::Reset)
+    });
+    assert_eq!(g.take(1), [(SP_STATE_RESET, 0)]);
+    g.say(1, SP_STATE_KEPT, &[], &[], 0);
+    pump2(&mut r.gpu, |g| g.switch.is_none());
+    assert_eq!(r.gpu.active, GUEST);
+    g
+}
+
+#[test]
+fn a_lost_in_guest_renderer_that_runs_the_guest_is_let_go_after_5_s() {
+    let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+    let mem = single_region_mem(0x200000);
+    let (mut r, user, cp, _ul) = with_user_and_guest_socket(&mem, dir.as_path());
+    drop(user);
+    pump2(&mut r.gpu, |g| !g.conns[USER].link.is_connected());
+    let g = guest_runs_it(&mut r, &cp);
+    // it goes (the guest's shutdown stops it): the guest's commands wait for it a while
+    drop(g);
+    pump2(&mut r.gpu, |g| !g.conns[GUEST].link.is_connected());
+    let a0 = guest_put(&r, 0, &submit(Some(5), 1, &[]));
+    r.gpu.process_ack_timer();
+    assert_eq!(answered(&r, a0), None);
+    // then it is let go: the device answers them, and the renderer starts empty when it comes back
+    r.gpu.conns[GUEST].lost_at -= GUEST_LOST_WAIT_US + 1;
+    r.gpu.process_ack_timer();
+    assert_eq!(answered(&r, a0), Some(RESP_OK_NODATA));
+    assert_eq!(r.gpu.conns[GUEST].peer_session, 0);
+    // the user's renderer that comes now is built from the journal: nothing is asked of the lost one
+    r.gpu.process_retry();
+    let mut user = sink_on(&_ul);
+    user.hello(0x333, 0, 0, false);
+    pump2(&mut r.gpu, |g| {
+        g.switch.as_ref().is_some_and(|s| s.phase == Phase::Reset)
+    });
+    assert_eq!(r.gpu.switch.as_ref().unwrap().from, None);
+    assert_eq!(user.take(1), [(SP_STATE_RESET, 0)]);
+    user.say(1, SP_STATE_KEPT, &[], &[], 0);
+    pump2(&mut r.gpu, |g| g.switch.is_none());
+    assert_eq!(r.gpu.active, USER);
+}
+
+#[test]
+fn the_wait_for_a_renderer_counts_from_the_resume() {
+    let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+    let mem = single_region_mem(0x200000);
+    let (mut r, user, _cp, _ul) = with_user_and_guest_socket(&mem, dir.as_path());
+    drop(user);
+    pump2(&mut r.gpu, |g| !g.conns[USER].link.is_connected());
+    r.gpu.conns[USER].lost_at -= TAKEOVER_US + 1;
+    // the VM resumes (after a restore, a pause): the 10 s count from now
+    r.gpu.kick();
+    r.gpu.process_ack_timer();
+    assert!(r.gpu.switch.is_none());
+}
+
 #[test]
 fn the_snapshot_keeps_the_spec_and_a_pairing_without_its_yes_starts_again() {
     let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();

@@ -136,6 +136,11 @@ const TAKEOVER_US: i64 = 10_000_000;
 /// the renderer starts empty when it comes back: longer than the cut of 60 s that the screen
 /// track's D1 (c) resumes (the agent's choice, 2026-10-19).
 const LOST_WAIT_US: i64 = 120_000_000;
+/// How long the in-guest renderer that runs the guest and is lost is waited for (a renderer that
+/// restarts, or its link after a reset of vsock, is back within it) before the device serves the
+/// guest alone and that renderer starts empty when it comes back: the guest's shutdown stops it,
+/// and the guest's last GPU work must not wait for it.
+const GUEST_LOST_WAIT_US: i64 = 5_000_000;
 /// How long a device that no renderer has paired with since it was made waits for its first
 /// one before it serves the guest alone (the user's renderer is opened before the guest starts;
 /// a guest whose user's device is not attached must still run and shut down).
@@ -1796,16 +1801,30 @@ impl Gpu {
             return false;
         }
         let now = now_us();
-        if self.conns[a].peer_session != 0
-            && !self.has_fallback()
-            && now - self.conns[a].lost_at > LOST_WAIT_US
+        // the user's renderer is replaced by the in-guest renderer (`check_takeover`); with no
+        // in-guest renderer it is waited for long, the in-guest renderer itself briefly
+        let wait = if a == GUEST {
+            Some(GUEST_LOST_WAIT_US)
+        } else if !self.has_fallback() {
+            Some(LOST_WAIT_US)
+        } else {
+            None
+        };
+        if let Some(wait) = wait
+            && self.conns[a].peer_session != 0
+            && now - self.conns[a].lost_at > wait
         {
             // it starts empty when it comes back, and gets the state from the journal
             self.conns[a].peer_session = 0;
             self.log_info(&format!(
-                "spacebox remote gpu: {} lost for {} s, and no in-guest renderer: let go",
+                "spacebox remote gpu: {} lost for {} s{}: let go",
                 CONN_NAMES[a],
-                LOST_WAIT_US / 1_000_000
+                wait / 1_000_000,
+                if a == GUEST {
+                    ""
+                } else {
+                    ", and no in-guest renderer"
+                }
             ));
         }
         self.conns[a].peer_session == 0 && (self.paired_once || now - self.made_at > FIRST_WAIT_US)
@@ -2245,7 +2264,11 @@ impl Gpu {
                 }
             }
             None if ci == USER => {
-                self.start_switch(Some(self.active), USER, "the user's renderer connected")
+                // what only the GPU wrote is taken from the renderer that runs the guest, if it is
+                // there; from a lost one nothing can be (the journal only, then the redraw)
+                let a = self.active;
+                let from = self.conns[a].up().then_some(a);
+                self.start_switch(from, USER, "the user's renderer connected")
             }
             None => {}
         }
@@ -3284,7 +3307,13 @@ impl Gpu {
         if let Some(w) = self.saved_wanted.take() {
             for (c, w) in self.conns.iter_mut().zip(w) {
                 c.wanted = w;
-                c.lost_at = now_us();
+            }
+        }
+        // the waits for a renderer that is not there count from the VM's resume (a restored
+        // device was made long before it may run)
+        for c in &mut self.conns {
+            if !c.up() {
+                c.lost_at = now;
             }
         }
         self.retry_timer.arm(Duration::from_millis(1), None);
