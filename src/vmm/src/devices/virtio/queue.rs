@@ -408,6 +408,49 @@ impl Queue {
         Ok(())
     }
 
+    /// The guest memory that the device may write through this queue while the guest runs, as
+    /// (address, length, part): the descriptor table, the available and the used ring, and the
+    /// write-only buffers of every chain that a slot of the available ring names (those not
+    /// taken yet, those the device holds, and older ones). For the observation of the test of a
+    /// checkpoint's consistency (`crate::devices::screen`). Empty for a queue that is not set up.
+    pub fn watched_ranges(&self) -> Vec<(GuestAddress, usize, &'static str)> {
+        if self.desc_table_ptr.is_null() || self.avail_ring_ptr.is_null() {
+            return Vec::new();
+        }
+        let mut out = vec![
+            (
+                self.config.desc_table_address,
+                self.desc_table_size(),
+                "descriptors",
+            ),
+            (
+                self.config.avail_ring_address,
+                self.avail_ring_size(),
+                "avail",
+            ),
+            (self.config.used_ring_address, self.used_ring_size(), "used"),
+        ];
+        let mut seen = vec![false; usize::from(self.config.size)];
+        for slot in 0..usize::from(self.config.size) {
+            // SAFETY: `slot` is in 0..queue_size
+            let head = unsafe { self.avail_ring_ring_get(slot) };
+            let Some(chain) =
+                DescriptorChain::checked_new(self.desc_table_ptr, self.config.size, head)
+            else {
+                continue;
+            };
+            if std::mem::replace(&mut seen[usize::from(head)], true) {
+                continue;
+            }
+            for desc in chain {
+                if desc.is_write_only() {
+                    out.push((desc.addr, u64_to_usize(u64::from(desc.len)), "buffer"));
+                }
+            }
+        }
+        out
+    }
+
     /// Get AvailRing.idx
     #[inline(always)]
     pub fn avail_ring_idx_get(&self) -> u16 {
@@ -1303,6 +1346,34 @@ mod tests {
 
             assert!(c.next_descriptor().unwrap().next_descriptor().is_none());
         }
+    }
+
+    #[test]
+    fn test_watched_ranges_are_the_rings_and_the_write_only_buffers_the_ring_names() {
+        let m = &default_mem();
+        let vq = VirtQueue::new(GuestAddress(0), m, 16);
+        // a queue that is not set up watches nothing
+        assert!(Queue::new(16).watched_ranges().is_empty());
+        let mut q = vq.create_queue();
+        q.initialize(m).unwrap();
+        // every slot names chain 0 (the ring is zeros) but slot 1, which names chain 2
+        vq.dtable[0].set(0x1000, 0x100, VIRTQ_DESC_F_NEXT, 1);
+        vq.dtable[1].set(0x2000, 0x200, VIRTQ_DESC_F_WRITE, 0);
+        vq.dtable[2].set(0x3000, 0x300, VIRTQ_DESC_F_WRITE, 0);
+        // a write-only buffer that no slot names
+        vq.dtable[3].set(0x4000, 0x400, VIRTQ_DESC_F_WRITE, 0);
+        vq.avail.ring[1].set(2);
+        let r = q.watched_ranges();
+        assert_eq!(
+            r,
+            vec![
+                (vq.dtable_start(), 16 * 16, "descriptors"),
+                (vq.avail_start(), 6 + 2 * 16, "avail"),
+                (vq.used_start(), 6 + 8 * 16, "used"),
+                (GuestAddress(0x2000), 0x200, "buffer"),
+                (GuestAddress(0x3000), 0x300, "buffer"),
+            ]
+        );
     }
 
     #[test]

@@ -35,7 +35,7 @@ use crate::devices::legacy::RTCDevice;
 use crate::devices::legacy::SerialDevice;
 use crate::devices::legacy::serial::{SerialOut, SerialOutInner};
 use crate::devices::pseudo::BootTimer;
-use crate::devices::screen::ScreenLoop;
+use crate::devices::screen::{ScreenLoop, Seen};
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::balloon::BalloonError;
 use crate::devices::virtio::block::BlockError;
@@ -52,7 +52,9 @@ use crate::devices::virtio::net::persist::NetPersistError;
 use crate::devices::virtio::pmem::device::Pmem;
 use crate::devices::virtio::pmem::persist::PmemPersistError;
 use crate::devices::virtio::rng::persist::EntropyPersistError;
-use crate::devices::virtio::vsock::{VsockError, VsockUnixBackendError};
+use crate::devices::virtio::vsock::{
+    Vsock, VsockChannel, VsockError, VsockUnixBackend, VsockUnixBackendError,
+};
 use crate::logger::{error, info};
 use crate::rate_limiter::TokenBucket;
 use crate::resources::VmResources;
@@ -399,11 +401,12 @@ impl DeviceManager {
 
     /// Artificially kick VirtIO devices as if they had external events, at the resume of a
     /// stopped guest. The screen's thread stays paused: [`Self::resume_screen`] lets it run once
-    /// the guest's vCPUs run.
-    pub fn kick_virtio_devices(&self) {
+    /// the guest's vCPUs run. The screen's places in its queues are checked first, before any device
+    /// works (with the observation on, also the guest pages it watches, read from `mem`).
+    pub fn kick_virtio_devices(&self, mem: &GuestMemoryMmap) {
         info!("Artificially kick devices");
         if let Some(screen) = &self.screen {
-            screen.check(self.screen_positions());
+            screen.check(self.screen_positions(), self.screen_seen(screen, Some(mem)));
         }
         self.for_each_virtio_device_mut(|_, device| device.kick());
     }
@@ -418,20 +421,24 @@ impl DeviceManager {
     /// Ends the work in flight of every VirtIO device at a stop of the guest. The screen's
     /// thread is paused first, before any device is locked (its devices lock each other), and
     /// stays paused until the guest resumes: through the save of the devices and of KVM, the
-    /// copy of the memory and the reset of the dirty tracking.
-    pub fn quiesce_virtio_devices(&self) {
+    /// copy of the memory and the reset of the dirty tracking. Its places in its queues are
+    /// marked at its acknowledged pause (with the observation on, the guest pages it watches too,
+    /// read from `mem`; `None` at the load of a snapshot, whose memory may come from a page
+    /// server).
+    pub fn quiesce_virtio_devices(&self, mem: Option<&GuestMemoryMmap>) {
         if let Some(screen) = &self.screen {
             screen.pause();
+            screen.mark(self.screen_positions(), self.screen_seen(screen, mem));
         }
         self.for_each_virtio_device_mut(|_, device| device.quiesce());
     }
 
     /// The end of the stop of a checkpoint of a running guest: each device takes again the
     /// work that the stop held (the worker threads of a drive take their queues, the screen's
-    /// thread its events).
-    pub fn resume_virtio_devices_after_checkpoint(&self) {
+    /// thread its events), after the check of the screen's places (and pages, from `mem`).
+    pub fn resume_virtio_devices_after_checkpoint(&self, mem: &GuestMemoryMmap) {
         if let Some(screen) = &self.screen {
-            screen.check(self.screen_positions());
+            screen.check(self.screen_positions(), self.screen_seen(screen, Some(mem)));
         }
         self.for_each_virtio_device_mut(|_, device| device.resume_after_checkpoint());
         if let Some(screen) = &self.screen {
@@ -439,21 +446,58 @@ impl DeviceManager {
         }
     }
 
-    /// The places of the screen's devices in their queues (`fc_screen`'s check of a checkpoint).
+    fn is_screen_device(t: VirtioDeviceType) -> bool {
+        matches!(
+            t,
+            VirtioDeviceType::Gpu
+                | VirtioDeviceType::Input
+                | VirtioDeviceType::Sound
+                | VirtioDeviceType::Vsock
+        )
+    }
+
+    /// The places of the screen's devices in their queues (`fc_screen`'s check of a stop).
     fn screen_positions(&self) -> Vec<Vec<(u16, u16)>> {
         let mut out = Vec::new();
         self.for_each_virtio_device(|t, device| {
-            if matches!(
-                t,
-                VirtioDeviceType::Gpu
-                    | VirtioDeviceType::Input
-                    | VirtioDeviceType::Sound
-                    | VirtioDeviceType::Vsock
-            ) {
+            if Self::is_screen_device(t) {
                 out.push(device.queue_positions());
             }
         });
         out
+    }
+
+    /// What the observation of the stops reads of the screen's devices, when it is on.
+    fn screen_seen<'m>(
+        &self,
+        screen: &ScreenLoop,
+        mem: Option<&'m GuestMemoryMmap>,
+    ) -> Option<(Seen, &'m GuestMemoryMmap)> {
+        let mem = mem.filter(|_| screen.observing())?;
+        let mut seen = Seen::default();
+        self.for_each_virtio_device(|t, device| {
+            if !Self::is_screen_device(t) {
+                return;
+            }
+            let d = seen.devices.len();
+            seen.devices.push(format!("{t:?}:{}", device.id()));
+            seen.pending.push(device.queue_pending());
+            if device.is_activated() {
+                seen.watched.extend(
+                    device
+                        .watched_ranges()
+                        .into_iter()
+                        .map(|(q, addr, len, part)| (d, q, addr, len, part)),
+                );
+            }
+            if let Some(gpu) = device.as_any().downcast_ref::<Gpu>() {
+                seen.traffic = gpu.traffic();
+            }
+            if let Some(vsock) = device.as_any().downcast_ref::<Vsock<VsockUnixBackend>>() {
+                seen.vsock_rx_pending = vsock.backend.has_pending_rx();
+            }
+        });
+        Some((seen, mem))
     }
 
     /// Lets the held frames of each network device go out, up to the mark `upto`.
@@ -540,10 +584,6 @@ impl DeviceManager {
                 pci_devices.save_with(&|device| device.prepare_checkpoint()),
             ),
         };
-        // from here to the resume no device of the screen may move a queue
-        if let Some(screen) = &self.screen {
-            screen.mark(self.screen_positions());
-        }
 
         DevicesState {
             virtio_state,

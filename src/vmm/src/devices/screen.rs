@@ -22,7 +22,21 @@
 //! The thread is made at the build and at the restore of the VM, paused (the first resume of the
 //! VM starts it), and applies the `vmm` seccomp filter: it runs the same device code as the VMM
 //! thread did, and makes no thread.
+//!
+//! Two checks watch the pause. The witness, always on and cheap: the devices' places in their
+//! queues at the acknowledged pause must be the same at the resume. The observation, for the
+//! test of a checkpoint's consistency (on with [`OBSERVE_ENV`]`=1` when the thread is made; off it
+//! costs nothing): at the acknowledged pause it hashes each guest page that the screen's devices
+//! may write (their rings and descriptor tables, and the write-only buffers of every chain that
+//! their available rings name), and again just before the resume; a page whose content changed
+//! is logged. It also logs, at each pause, what moved since the last resume (the queues, the
+//! pictures of the in-guest renderer passed on, the message ids of each renderer), so that the
+//! test sees the traffic go on after each resume. The content of the pages, not the dirty log,
+//! is observed: KVM's dirty log does not see the VMM's own writes, and the checkpoint resets and
+//! marks again Firecracker's bitmap inside the interval.
 
+use std::collections::BTreeMap;
+use std::hash::{DefaultHasher, Hasher};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -32,14 +46,23 @@ use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::EventManager;
+use crate::devices::virtio::gpu::GpuTraffic;
 use crate::logger::{error, info, warn};
 use crate::seccomp::BpfProgram;
+use crate::vstate::memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 /// The name of the thread (the host places it by name).
 pub const SCREEN_THREAD_NAME: &str = "fc_screen";
 
 /// A pause that has not been answered after this long is logged (and still waited for).
 const PAUSE_WARN: Duration = Duration::from_secs(1);
+
+/// The environment variable that turns the observation on (`1`): read when the thread is made.
+pub const OBSERVE_ENV: &str = "SPACE_TEST_SCREEN_OBSERVE";
+
+/// The size of the pages that the observation hashes.
+const PAGE_BYTES: usize = 4096;
+const PAGE: u64 = PAGE_BYTES as u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Want {
@@ -103,17 +126,87 @@ struct Witness {
 /// A summary of the checks is logged after this many.
 const WITNESS_SUMMARY: u64 = 60;
 
+/// What the device manager reads of the screen's devices for the observation, at a pause and
+/// at a resume.
+#[derive(Debug, Default, Clone)]
+pub struct Seen {
+    /// The devices (type and id), in the order of the positions.
+    pub devices: Vec<String>,
+    /// The guest memory that each device may write: (device, queue, address, length, part).
+    pub watched: Vec<(usize, usize, GuestAddress, usize, &'static str)>,
+    /// The GPU device's pictures and message ids.
+    pub traffic: GpuTraffic,
+    /// Each device's chains made available by the guest and not taken yet, by queue.
+    pub pending: Vec<Vec<u16>>,
+    /// The vsock device's muxer holds data for the guest.
+    pub vsock_rx_pending: bool,
+}
+
+/// The observation of one stop, from its acknowledged pause.
+#[derive(Debug)]
+struct Observed {
+    stop: u64,
+    at: Instant,
+    devices: Vec<String>,
+    /// Each page watched (its guest address), what it holds first (device, queue, part), and
+    /// the hash of its content at the pause.
+    pages: Vec<(u64, String, u64)>,
+    bytes: u64,
+}
+
+/// The observation's state between stops.
+#[derive(Debug, Default)]
+struct Observer {
+    stops: u64,
+    open: Option<Observed>,
+    /// The last resume: when, the places, the GPU's traffic.
+    resumed: Option<(Instant, Positions, GpuTraffic)>,
+}
+
+/// The hash of a page's content (`None`: the page is not guest memory).
+fn page_hash(mem: &GuestMemoryMmap, page: u64) -> Option<u64> {
+    let mut buf = [0u8; PAGE_BYTES];
+    mem.read_slice(&mut buf, GuestAddress(page)).ok()?;
+    let mut h = DefaultHasher::new();
+    h.write(&buf);
+    Some(h.finish())
+}
+
+/// `a` less `b` for each queue's (next available, next used) of each device.
+fn moved(a: &Positions, b: &Positions) -> Vec<Vec<(u16, u16)>> {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| {
+            x.iter()
+                .zip(y)
+                .map(|(p, q)| (p.0.wrapping_sub(q.0), p.1.wrapping_sub(q.1)))
+                .collect()
+        })
+        .collect()
+}
+
 /// The handle of the screen's thread, kept by the device manager.
 #[derive(Debug)]
 pub struct ScreenLoop {
     ctl: Arc<Ctl>,
     witness: Mutex<Witness>,
+    /// The observation, when it is on.
+    observer: Option<Mutex<Observer>>,
 }
 
 impl ScreenLoop {
     /// Starts the thread with the event loop `em`, which holds the screen's devices, paused. It
-    /// applies `filter` before anything else.
-    pub fn spawn(mut em: EventManager, filter: Arc<BpfProgram>) -> std::io::Result<ScreenLoop> {
+    /// applies `filter` before anything else. The observation is on when [`OBSERVE_ENV`] is `1`.
+    pub fn spawn(em: EventManager, filter: Arc<BpfProgram>) -> std::io::Result<ScreenLoop> {
+        let observe = std::env::var(OBSERVE_ENV).is_ok_and(|v| v == "1");
+        Self::spawn_with(em, filter, observe)
+    }
+
+    fn spawn_with(
+        mut em: EventManager,
+        filter: Arc<BpfProgram>,
+        observe: bool,
+    ) -> std::io::Result<ScreenLoop> {
         let wake = EventFd::new(libc::EFD_NONBLOCK)?;
         em.add_subscriber(Arc::new(Mutex::new(Wake(wake.try_clone()?))));
         let ctl = Arc::new(Ctl {
@@ -139,10 +232,18 @@ impl ScreenLoop {
                 run(moved.0, &thread_ctl);
             })?;
         match ok_rx.recv() {
-            Ok(Ok(())) => Ok(ScreenLoop {
-                ctl,
-                witness: Mutex::new(Witness::default()),
-            }),
+            Ok(Ok(())) => {
+                if observe {
+                    info!(
+                        "{SCREEN_THREAD_NAME}: the observation of the stops is on ({OBSERVE_ENV})"
+                    );
+                }
+                Ok(ScreenLoop {
+                    ctl,
+                    witness: Mutex::new(Witness::default()),
+                    observer: observe.then(|| Mutex::new(Observer::default())),
+                })
+            }
             Ok(Err(e)) => Err(std::io::Error::other(format!(
                 "{SCREEN_THREAD_NAME}: seccomp filter: {e}"
             ))),
@@ -197,19 +298,88 @@ impl ScreenLoop {
         self.ctl.st.lock().expect("Poisoned lock").paused
     }
 
-    /// The screen's devices' places in their queues when a checkpoint's state was saved (the
-    /// thread is paused). The first mark of a stop counts.
-    pub fn mark(&self, positions: Positions) {
+    /// Whether the observation is on: the device manager then gives [`Self::mark`] and
+    /// [`Self::check`] what it reads of the devices.
+    pub fn observing(&self) -> bool {
+        self.observer.is_some()
+    }
+
+    /// The screen's devices' places in their queues at the acknowledged pause of a stop (the
+    /// thread is paused), and with the observation on what it watches (`seen`, read from `mem`).
+    /// The first mark of a stop counts.
+    pub fn mark(&self, positions: Positions, seen: Option<(Seen, &GuestMemoryMmap)>) {
         let mut w = self.witness.lock().expect("Poisoned lock");
-        if w.mark.is_none() {
-            w.mark = Some((Instant::now(), positions));
+        if w.mark.is_some() {
+            return;
         }
+        w.mark = Some((Instant::now(), positions.clone()));
+        drop(w);
+        let (Some(observer), Some((seen, mem))) = (&self.observer, seen) else {
+            return;
+        };
+        let mut o = observer.lock().expect("Poisoned lock");
+        o.stops += 1;
+        let mut pages: BTreeMap<u64, String> = BTreeMap::new();
+        let mut bytes = 0u64;
+        for (d, q, addr, len, part) in &seen.watched {
+            bytes += *len as u64;
+            if *len == 0 {
+                continue;
+            }
+            let first = addr.0 & !(PAGE - 1);
+            let last = (addr.0 + *len as u64 - 1) & !(PAGE - 1);
+            let mut page = first;
+            while page <= last {
+                pages
+                    .entry(page)
+                    .or_insert_with(|| format!("{} q{q} {part}", seen.devices[*d]));
+                page += PAGE;
+            }
+        }
+        let pages: Vec<(u64, String, u64)> = pages
+            .into_iter()
+            .filter_map(|(page, what)| page_hash(mem, page).map(|h| (page, what, h)))
+            .collect();
+        // what moved since the last resume: the traffic of the interval before this stop
+        let since = o.resumed.as_ref().map(|(t, before, traffic)| {
+            serde_json::json!({
+                "ms": u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "queues": moved(&positions, before),
+                "pictures": seen.traffic.pictures.wrapping_sub(traffic.pictures),
+                "user_sent": seen.traffic.user.0.wrapping_sub(traffic.user.0),
+                "user_received": seen.traffic.user.1.wrapping_sub(traffic.user.1),
+                "guest_sent": seen.traffic.guest.0.wrapping_sub(traffic.guest.0),
+                "guest_received": seen.traffic.guest.1.wrapping_sub(traffic.guest.1),
+            })
+        });
+        info!(
+            "{SCREEN_THREAD_NAME}: observe pause {}",
+            serde_json::json!({
+                "stop": o.stops,
+                "devices": seen.devices,
+                "positions": positions,
+                "pending": seen.pending,
+                "vsock_rx_pending": seen.vsock_rx_pending,
+                "pages": pages.len(),
+                "watched_bytes": bytes,
+                "since_resume": since,
+            })
+        );
+        let open = Observed {
+            stop: o.stops,
+            at: Instant::now(),
+            devices: seen.devices,
+            pages,
+            bytes,
+        };
+        o.open = Some(open);
     }
 
     /// At the resume, before any device runs again: the places must be those of the mark. A move is
-    /// logged as an error; a summary every [`WITNESS_SUMMARY`] checks. Returns whether they were
-    /// the same (true with no mark).
-    pub fn check(&self, positions: Positions) -> bool {
+    /// logged as an error; a summary every [`WITNESS_SUMMARY`] checks. With the observation on, the
+    /// pages watched at the pause are hashed again (`seen`, from `mem`), and the stop is logged.
+    /// Returns whether the places were the same and no page watched changed (true with no mark).
+    pub fn check(&self, positions: Positions, seen: Option<(Seen, &GuestMemoryMmap)>) -> bool {
         let mut w = self.witness.lock().expect("Poisoned lock");
         let Some((t0, before)) = w.mark.take() else {
             return true;
@@ -219,24 +389,65 @@ impl ScreenLoop {
         if !same {
             w.moved += 1;
             error!(
-                "{SCREEN_THREAD_NAME}: a queue of the screen's devices moved between the save of a checkpoint and its resume: {before:?} -> {positions:?}"
+                "{SCREEN_THREAD_NAME}: a queue of the screen's devices moved between the pause of a stop and its resume: {before:?} -> {positions:?}"
             );
         }
         if w.checked.is_multiple_of(WITNESS_SUMMARY) {
             info!(
-                "{SCREEN_THREAD_NAME}: {} checkpoint stops checked, a queue of the screen moved in {}; the last from its save to its resume {} us",
+                "{SCREEN_THREAD_NAME}: {} checkpoint stops checked, a queue of the screen moved in {}; the last from its pause to its resume {} us",
                 w.checked,
                 w.moved,
                 t0.elapsed().as_micros()
             );
         }
-        same
+        drop(w);
+        let (Some(observer), Some((seen, mem))) = (&self.observer, seen) else {
+            return same;
+        };
+        let mut o = observer.lock().expect("Poisoned lock");
+        let Some(open) = o.open.take() else {
+            return same;
+        };
+        let changed: Vec<serde_json::Value> = open
+            .pages
+            .iter()
+            .filter(|(page, _, h)| page_hash(mem, *page) != Some(*h))
+            .map(|(page, what, _)| serde_json::json!({"page": format!("{page:#x}"), "what": what}))
+            .collect();
+        let unchanged = changed.is_empty();
+        let line = serde_json::json!({
+            "stop": open.stop,
+            "devices": open.devices,
+            "paused_us": u64::try_from(open.at.elapsed().as_micros()).unwrap_or(u64::MAX),
+            "pages": open.pages.len(),
+            "watched_bytes": open.bytes,
+            "changed": changed,
+            "positions_at_pause": before,
+            "positions_at_resume": positions,
+            "positions_same": same,
+        });
+        if unchanged && same {
+            info!("{SCREEN_THREAD_NAME}: observe resume {line}");
+        } else {
+            error!("{SCREEN_THREAD_NAME}: observe resume {line}");
+        }
+        o.resumed = Some((Instant::now(), positions, seen.traffic));
+        same && unchanged
     }
 
-    /// A save of a snapshot or of a move's state: the device threads of the VMM may work the queues
-    /// in it (the GPU device drains its renderer), so a mark of a checkpoint before it is dropped.
+    /// A save of a snapshot or of a move's state: the devices may work their queues in it (vsock
+    /// sends its reset event, the GPU device drains its renderer), so the mark of the stop is
+    /// dropped, and the stop is not observed.
     pub fn unmark(&self) {
         self.witness.lock().expect("Poisoned lock").mark = None;
+        if let Some(observer) = &self.observer
+            && let Some(open) = observer.lock().expect("Poisoned lock").open.take()
+        {
+            info!(
+                "{SCREEN_THREAD_NAME}: observe stop {} not checked: the state of a snapshot or a move was saved",
+                open.stop
+            );
+        }
     }
 
     /// (checked, moved) so far.
@@ -403,18 +614,79 @@ mod tests {
     }
 
     #[test]
-    fn the_witness_counts_a_queue_that_moved_from_the_save_to_the_resume() {
+    fn the_witness_counts_a_queue_that_moved_from_the_pause_to_the_resume() {
         let l = ScreenLoop::spawn(EventManager::new().unwrap(), Arc::new(vec![])).unwrap();
         // no mark (a stop that saved no checkpoint): nothing checked
-        assert!(l.check(vec![vec![(1, 1)]]));
+        assert!(l.check(vec![vec![(1, 1)]], None));
         assert_eq!(l.witnessed(), (0, 0));
-        l.mark(vec![vec![(3, 2)], vec![(7, 7), (0, 0)]]);
-        // a second save in the same stop keeps the first mark
-        l.mark(vec![vec![(9, 9)]]);
-        assert!(l.check(vec![vec![(3, 2)], vec![(7, 7), (0, 0)]]));
-        l.mark(vec![vec![(3, 2)]]);
-        assert!(!l.check(vec![vec![(3, 3)]]));
+        l.mark(vec![vec![(3, 2)], vec![(7, 7), (0, 0)]], None);
+        // a second mark in the same stop keeps the first
+        l.mark(vec![vec![(9, 9)]], None);
+        assert!(l.check(vec![vec![(3, 2)], vec![(7, 7), (0, 0)]], None));
+        l.mark(vec![vec![(3, 2)]], None);
+        assert!(!l.check(vec![vec![(3, 3)]], None));
         assert_eq!(l.witnessed(), (2, 1));
+    }
+
+    #[test]
+    fn the_observation_sees_a_write_to_a_watched_page_between_the_pause_and_the_resume() {
+        let mem = crate::test_utils::single_region_mem(0x10000);
+        let l =
+            ScreenLoop::spawn_with(EventManager::new().unwrap(), Arc::new(vec![]), true).unwrap();
+        assert!(l.observing());
+        let seen = Seen {
+            devices: vec!["Vsock:vsock".into()],
+            // a ring within one page and a buffer over two
+            watched: vec![
+                (0, 0, GuestAddress(0x1010), 0x20, "used"),
+                (0, 0, GuestAddress(0x2f00), 0x200, "buffer"),
+            ],
+            traffic: GpuTraffic::default(),
+            pending: vec![vec![0]],
+            vsock_rx_pending: false,
+        };
+        let at = || vec![vec![(5, 4)]];
+        let open_pages = |l: &ScreenLoop| {
+            let o = l.observer.as_ref().unwrap().lock().unwrap();
+            o.open
+                .as_ref()
+                .map(|x| x.pages.iter().map(|p| p.0).collect::<Vec<_>>())
+        };
+        // nothing written: the same
+        l.mark(at(), Some((seen.clone(), &mem)));
+        assert_eq!(open_pages(&l), Some(vec![0x1000, 0x2000, 0x3000]));
+        assert!(l.check(at(), Some((seen.clone(), &mem))));
+        // a write into the second page of the buffer while the stop lasts
+        l.mark(at(), Some((seen.clone(), &mem)));
+        mem.write_obj(0xabu8, GuestAddress(0x3004)).unwrap();
+        assert!(!l.check(at(), Some((seen.clone(), &mem))));
+        // a write outside the watched pages, or after the resume, is not the stop's
+        mem.write_obj(0xcdu8, GuestAddress(0x5000)).unwrap();
+        l.mark(at(), Some((seen.clone(), &mem)));
+        assert!(l.check(at(), Some((seen.clone(), &mem))));
+        // the witness counted them all, with no queue moved
+        assert_eq!(l.witnessed(), (3, 0));
+        // a snapshot's save drops the stop's observation: its devices may write
+        l.mark(at(), Some((seen.clone(), &mem)));
+        l.unmark();
+        mem.write_obj(0xefu8, GuestAddress(0x1010)).unwrap();
+        assert!(l.check(at(), Some((seen, &mem))));
+        assert_eq!(l.witnessed(), (3, 0));
+    }
+
+    #[test]
+    fn the_observation_is_off_by_default() {
+        let l = ScreenLoop::spawn(EventManager::new().unwrap(), Arc::new(vec![])).unwrap();
+        assert_eq!(
+            l.observing(),
+            std::env::var(OBSERVE_ENV).is_ok_and(|v| v == "1")
+        );
+        let l =
+            ScreenLoop::spawn_with(EventManager::new().unwrap(), Arc::new(vec![]), false).unwrap();
+        assert!(!l.observing());
+        // with no observation a mark and a check are the witness's only
+        l.mark(vec![vec![(1, 1)]], None);
+        assert!(l.check(vec![vec![(1, 1)]], None));
     }
 
     #[test]

@@ -537,14 +537,15 @@ impl Vmm {
                 .set_clock(&stopped.clock, stopped.realtime)
                 .map_err(vstate::vm::VmError::Arch)?;
         }
-        self.device_manager.kick_virtio_devices();
+        self.device_manager
+            .kick_virtio_devices(kvm_vm.guest_memory());
         if let Err(err) = kvm_vm.resume_vcpus() {
             // vCPUs that took the resume stop again; the guest stays stopped with its devices
             // quiet (the screen's thread was not resumed).
             if let Err(again) = kvm_vm.pause_vcpus() {
                 error!("A failed resume could not stop the vCPUs again: {}", again);
             }
-            self.device_manager.quiesce_virtio_devices();
+            self.device_manager.quiesce_virtio_devices(None);
             return Err(err);
         }
         self.device_manager.resume_screen();
@@ -596,7 +597,8 @@ impl Vmm {
                 Err(err) => error!("Failed to save the guest's clock at a stop: {}", err),
             }
         }
-        self.device_manager.quiesce_virtio_devices();
+        self.device_manager
+            .quiesce_virtio_devices(Some(kvm_vm.guest_memory()));
         info!("The guest stopped: {}", reason.name());
         self.instance_info.set_paused(reason);
         Ok(())

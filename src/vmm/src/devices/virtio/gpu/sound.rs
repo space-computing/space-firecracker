@@ -565,6 +565,14 @@ impl VirtioDevice for Sound {
         crate::devices::virtio::device::positions_of(&self.queues)
     }
 
+    fn watched_ranges(&self) -> Vec<(usize, GuestAddress, usize, &'static str)> {
+        crate::devices::virtio::device::watched_of(&self.queues)
+    }
+
+    fn queue_pending(&self) -> Vec<u16> {
+        crate::devices::virtio::device::pending_of(&self.queues)
+    }
+
     fn queue_config_mut(&mut self, index: usize) -> Option<&mut QueueConfig> {
         self.queues.get_mut(index).map(|queue| &mut queue.config)
     }

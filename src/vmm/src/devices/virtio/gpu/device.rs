@@ -449,6 +449,17 @@ pub(crate) struct SoundCounts {
 /// The keyboard and the tablet.
 type InputPair = (Arc<Mutex<Input>>, Arc<Mutex<Input>>);
 
+/// [`Gpu::traffic`]: pictures passed on, and (sent, received) message ids of each renderer.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct GpuTraffic {
+    /// The in-guest renderer's pictures passed to the user's renderer since the start.
+    pub pictures: u64,
+    /// The user's renderer: the last message id sent, the last received.
+    pub user: (u64, u64),
+    /// The in-guest renderer: the last message id sent, the last received.
+    pub guest: (u64, u64),
+}
+
 #[derive(Debug)]
 pub struct Gpu {
     avail_features: u64,
@@ -533,6 +544,8 @@ pub struct Gpu {
     rtt_us: i64,
 
     pub(crate) counters: Counters,
+    /// The in-guest renderer's pictures passed to the user's renderer since the start.
+    pictures_all: u64,
     /// Used elements were added to a queue: advance its used index and interrupt.
     used: [bool; GPU_NUM_QUEUES],
 
@@ -748,6 +761,7 @@ impl Gpu {
                 rx_min_prev: i64::MAX,
                 ..Default::default()
             },
+            pictures_all: 0,
             used: [false; GPU_NUM_QUEUES],
             inputs: None,
             agent,
@@ -2261,6 +2275,7 @@ impl Gpu {
             return;
         }
         self.counters.n_picture += 1;
+        self.pictures_all += 1;
         self.counters.picture_bytes += a.len() as u64;
         self.send_on(USER, false, SP_PICTURE, 0, a, &[], h.arg0, h.arg1, h.arg2);
     }
@@ -3593,6 +3608,22 @@ impl Gpu {
         self.notify_used();
     }
 
+    /// What the test of a checkpoint's consistency reads of the device at each stop of the guest
+    /// (`crate::devices::screen`): the in-guest renderer's pictures passed on since the start, and
+    /// the last message id sent to and received from each renderer.
+    pub(crate) fn traffic(&self) -> GpuTraffic {
+        let ids = |ci: usize| {
+            self.conns
+                .get(ci)
+                .map_or((0, 0), |c| (c.link.lock().q.tx_id, c.rx_id))
+        };
+        GpuTraffic {
+            pictures: self.pictures_all,
+            user: ids(USER),
+            guest: ids(GUEST),
+        }
+    }
+
     /// `sp_stats`, every 5 s: the same lines as the QEMU source, so that the same tools read
     /// them, and the query counters of this device.
     pub(crate) fn process_stats_timer(&mut self) {
@@ -3844,6 +3875,14 @@ impl VirtioDevice for Gpu {
 
     fn queue_positions(&self) -> Vec<(u16, u16)> {
         crate::devices::virtio::device::positions_of(&self.queues)
+    }
+
+    fn watched_ranges(&self) -> Vec<(usize, GuestAddress, usize, &'static str)> {
+        crate::devices::virtio::device::watched_of(&self.queues)
+    }
+
+    fn queue_pending(&self) -> Vec<u16> {
+        crate::devices::virtio::device::pending_of(&self.queues)
     }
 
     fn reset_queues(&mut self) {

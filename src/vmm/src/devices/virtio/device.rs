@@ -20,7 +20,7 @@ use crate::devices::virtio::AsAny;
 use crate::devices::virtio::generated::virtio_ids;
 use crate::logger::{error, info, warn};
 use crate::utils::u64_to_usize;
-use crate::vstate::memory::GuestMemoryMmap;
+use crate::vstate::memory::{GuestAddress, GuestMemoryMmap};
 
 /// State of an active VirtIO device
 #[derive(Debug, Clone)]
@@ -302,6 +302,19 @@ pub trait VirtioDevice: AsAny + MutEventSubscriber + Send {
     fn queue_positions(&self) -> Vec<(u16, u16)> {
         Vec::new()
     }
+
+    /// The descriptor chains of each queue that the guest made available and the device has not
+    /// taken, for the observation of the test of a checkpoint's consistency.
+    fn queue_pending(&self) -> Vec<u16> {
+        Vec::new()
+    }
+
+    /// The guest memory that the device may write through its queues, as (queue, address,
+    /// length, part), for the observation of the test of a checkpoint's consistency (the
+    /// screen's devices, `crate::devices::screen`).
+    fn watched_ranges(&self) -> Vec<(usize, GuestAddress, usize, &'static str)> {
+        Vec::new()
+    }
 }
 
 /// [`VirtioDevice::queue_positions`] of a device's queues.
@@ -309,6 +322,35 @@ pub fn positions_of(queues: &[crate::devices::virtio::queue::Queue]) -> Vec<(u16
     queues
         .iter()
         .map(|q| (q.next_avail.0, q.next_used.0))
+        .collect()
+}
+
+/// [`VirtioDevice::queue_pending`] of a device's queues (0 for a queue that is not set up).
+pub fn pending_of(queues: &[crate::devices::virtio::queue::Queue]) -> Vec<u16> {
+    queues
+        .iter()
+        .map(|q| {
+            if q.avail_ring_ptr.is_null() {
+                0
+            } else {
+                q.avail_ring_idx_get().wrapping_sub(q.next_avail.0)
+            }
+        })
+        .collect()
+}
+
+/// [`VirtioDevice::watched_ranges`] of a device's queues.
+pub fn watched_of(
+    queues: &[crate::devices::virtio::queue::Queue],
+) -> Vec<(usize, GuestAddress, usize, &'static str)> {
+    queues
+        .iter()
+        .enumerate()
+        .flat_map(|(i, q)| {
+            q.watched_ranges()
+                .into_iter()
+                .map(move |(addr, len, part)| (i, addr, len, part))
+        })
         .collect()
 }
 

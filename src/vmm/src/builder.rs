@@ -715,7 +715,7 @@ pub fn build_microvm_from_snapshot(
 
     // A loaded guest is stopped until its resume: the worker threads of its drives take no
     // request until then (the queues of a drive on the VMM thread wait with that thread).
-    vmm.device_manager.quiesce_virtio_devices();
+    vmm.device_manager.quiesce_virtio_devices(None);
     let vmm = Arc::new(Mutex::new(vmm));
     vmm.lock()
         .unwrap()
