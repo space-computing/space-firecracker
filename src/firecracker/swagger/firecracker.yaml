@@ -2128,6 +2128,13 @@ definitions:
         description:
           Beyond the window, fenced commands are answered early while the oldest unanswered
           one was sent less than two round trips and this many milliseconds ago (default 20).
+          This is the age while the guest decodes no video.
+      fence_age_video_ms:
+        type: integer
+        minimum: 0
+        description:
+          The same age while the guest decodes video, from each decode command until one
+          second after it (default 100).
       tx_limit_mib:
         type: integer
         minimum: 1

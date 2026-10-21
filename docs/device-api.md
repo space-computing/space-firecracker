@@ -111,6 +111,7 @@ specification:
 |                           | stats_path          |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |     O      |   **R**    |
 |                           | fence_window        |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |     O      |   **R**    |
 |                           | fence_age_ms        |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |     O      |   **R**    |
+|                           | fence_age_video_ms  |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |     O      |   **R**    |
 |                           | tx_limit_mib        |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |     O      |   **R**    |
 |                           | zstd_level          |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |     O      |   **R**    |
 |                           | debug_wait          |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |     O      |   **R**    |

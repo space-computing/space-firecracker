@@ -345,6 +345,61 @@ fn beyond_the_window_by_age_only() {
 }
 
 #[test]
+fn beyond_the_window_a_longer_age_while_the_guest_decodes_video() {
+    let mem = single_region_mem(0x100000);
+    let mut c = cfg("/nonexistent");
+    c.fence_window = Some(2);
+    c.fence_age_ms = Some(20);
+    // fence_age_video_ms: the default, 100
+    let mut r = rig_with(&mem, c);
+    r.gpu.rtt_min_cur = 1000;
+    r.give(submit(Some(1), 1, &[]));
+    r.give(submit(Some(2), 1, &[]));
+    // The oldest unanswered command is 50 ms old, and no video: the third waits.
+    let head = r.gpu.fq_head;
+    r.gpu.fq[head] = now_us() - 50_000;
+    r.give(submit(Some(3), 1, &[]));
+    assert!(r.answer_of(2).is_none());
+    // A decode command (DECODE_BITSTREAM, 59): video for the next second.
+    r.give(submit(None, 1, &[59]));
+    assert!(r.gpu.video_until > now_us() + 900_000);
+    let n = r.give(submit(Some(4), 1, &[]));
+    assert!(r.answer_of(n).is_some());
+    assert_eq!(r.gpu.counters.n_ahead, 1);
+    assert_eq!(r.gpu.counters.n_ahead_video, 1);
+    // The fence of a decode command is answered by the same rule.
+    let n = r.give(submit(Some(5), 1, &[59]));
+    assert!(r.answer_of(n).is_some());
+    assert_eq!(r.gpu.counters.n_ahead_video, 2);
+    // Over 100 ms (and two round trips): no more, even with video.
+    r.gpu.fq[head] = now_us() - 150_000;
+    let n = r.give(submit(Some(6), 1, &[59]));
+    assert!(r.answer_of(n).is_none());
+    // A second after the last decode the short age is back.
+    r.gpu.fq[head] = now_us() - 50_000;
+    r.gpu.video_until = now_us() - 1;
+    let n = r.give(submit(Some(7), 1, &[]));
+    assert!(r.answer_of(n).is_none());
+    assert_eq!(r.gpu.counters.n_ahead, 2);
+}
+
+#[test]
+fn beyond_the_window_no_age_of_video_with_0() {
+    let mem = single_region_mem(0x100000);
+    let mut c = cfg("/nonexistent");
+    c.fence_window = Some(2);
+    c.fence_age_video_ms = Some(0);
+    let mut r = rig_with(&mem, c);
+    r.gpu.rtt_min_cur = 1000;
+    r.give(submit(Some(1), 1, &[]));
+    r.give(submit(Some(2), 1, &[]));
+    // Video, and the oldest command just sent: with an age of 0 nothing beyond the window.
+    let n = r.give(submit(Some(3), 1, &[59]));
+    assert!(r.answer_of(n).is_none());
+    assert_eq!(r.gpu.counters.n_ahead, 0);
+}
+
+#[test]
 fn query_buffer_reads_are_answered_here_and_parked() {
     let mem = single_region_mem(0x200000);
     let mut r = rig_with(&mem, cfg("/nonexistent"));

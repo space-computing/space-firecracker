@@ -11,7 +11,8 @@
 //! network:
 //!
 //! - Commands whose answer carries nothing are answered at once; fenced ones up to a window of
-//!   commands and an age ahead of the sink ([`Gpu::may_answer_early`]).
+//!   commands and an age ahead of the sink, a longer age while the guest decodes video
+//!   ([`Gpu::may_answer_early`]).
 //! - Reads of query result buffers are answered from guest memory, which the sink keeps current
 //!   (it watches the buffers), and parked while the result is not in yet.
 //! - Capability queries are answered from the GPU spec ([`super::spec`], `spec_path`) from the
@@ -399,6 +400,8 @@ pub(crate) struct Counters {
     n_local: u64,
     n_waited: u64,
     n_ahead: u64,
+    /// ... of which with the age of video.
+    n_ahead_video: u64,
     n_defer: u64,
     defer_bytes: u64,
     n_reconnect: u64,
@@ -507,6 +510,7 @@ pub struct Gpu {
     pub(crate) spec: Spec,
     dinfo: Option<Vec<u8>>,
     edid: Option<Vec<u8>>,
+    /// The guest decodes video until about then: one second after its last decode command.
     video_until: i64,
 
     tx_limit: usize,
@@ -521,6 +525,8 @@ pub struct Gpu {
     fq_head: usize,
     fq_len: usize,
     fence_age_us: i64,
+    /// `fence_age_us` while the guest decodes video.
+    fence_age_video_us: i64,
     rtt_min_cur: i64,
     rtt_min_prev: i64,
     rtt_min_t0: i64,
@@ -732,6 +738,7 @@ impl Gpu {
             fq_head: 0,
             fq_len: 0,
             fence_age_us: cfg.fence_age_us(),
+            fence_age_video_us: cfg.fence_age_video_us(),
             rtt_min_cur: i64::MAX,
             rtt_min_prev: i64::MAX,
             rtt_min_t0: 0,
@@ -1362,6 +1369,13 @@ impl Gpu {
     /// for the first `fence_window` commands the sink has not answered; beyond that only while
     /// the sink keeps up: the oldest unanswered command was sent no longer ago than two
     /// shortest round trips plus `fence_age`.
+    ///
+    /// The age is `fence_age_video` while the guest decodes video (until one second after its
+    /// last decode, the time of `SP_F_VIDEO`, so the pauses between a clip's frames keep it).
+    /// Decoding a large video loads the link, the sink's answers come up to about 150 ms late,
+    /// and with the short age the guest's player waits for them and drops frames. The sink
+    /// shows video frames by the guest's clock anyway. Without video the short age bounds how
+    /// much later than the guest the user sees an answer to the input.
     fn may_answer_early(&mut self) -> bool {
         let out = self.fence_out + self.wait_out;
         let rtt_min = self.rtt_min_cur.min(self.rtt_min_prev);
@@ -1371,15 +1385,21 @@ impl Gpu {
         if out < self.fence_window {
             return true;
         }
-        if self.fence_age_us == 0
-            || self.fq_len == 0
-            || self.fq_len >= FQ_LEN / 2
-            || rtt_min == i64::MAX
-        {
+        let now = now_us();
+        let video = self.video_until > now;
+        let age = if video {
+            self.fence_age_video_us
+        } else {
+            self.fence_age_us
+        };
+        if age == 0 || self.fq_len == 0 || self.fq_len >= FQ_LEN / 2 || rtt_min == i64::MAX {
             return false;
         }
-        if now_us() - self.fq[self.fq_head] < 2 * rtt_min + self.fence_age_us {
+        if now - self.fq[self.fq_head] < 2 * rtt_min + age {
             self.counters.n_ahead += 1;
+            if video {
+                self.counters.n_ahead_video += 1;
+            }
             return true;
         }
         false
@@ -3641,7 +3661,7 @@ impl Gpu {
         }
         let rtt_min = self.rtt_min_cur.min(self.rtt_min_prev);
         pend.push_str(&format!(
-            " last_seq={} answered_here={} fence_early={} waited={} fence_out={} rtt_ms={:.1} not_sent={} not_sent_bytes={} early_by_age={} rtt_min_ms={:.1}",
+            " last_seq={} answered_here={} fence_early={} waited={} fence_out={} rtt_ms={:.1} not_sent={} not_sent_bytes={} early_by_age={} rtt_min_ms={:.1} early_by_video_age={}",
             self.seq,
             c.n_local,
             c.n_early,
@@ -3651,7 +3671,8 @@ impl Gpu {
             c.n_defer,
             c.defer_bytes,
             c.n_ahead,
-            if rtt_min == i64::MAX { 0.0 } else { ms(rtt_min) }
+            if rtt_min == i64::MAX { 0.0 } else { ms(rtt_min) },
+            c.n_ahead_video
         ));
         lines.push(pend);
         for i in 0..64 {
@@ -3775,6 +3796,7 @@ impl Gpu {
         c.n_early = 0;
         c.n_waited = 0;
         c.n_ahead = 0;
+        c.n_ahead_video = 0;
         c.n_defer = 0;
         c.defer_bytes = 0;
         c.n_ctrl = 0;

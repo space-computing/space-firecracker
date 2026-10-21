@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 /// The defaults of the QEMU fork's remote GPU source (`SPACEBOX_GPU_REMOTE_*`).
 const DEFAULT_FENCE_WINDOW: u32 = 8;
 const DEFAULT_FENCE_AGE_MS: u32 = 20;
+const DEFAULT_FENCE_AGE_VIDEO_MS: u32 = 100;
 const DEFAULT_TX_LIMIT_MIB: u32 = 8;
 const DEFAULT_ZSTD_LEVEL: i32 = 1;
 const MAX_ZSTD_LEVEL: i32 = 19;
@@ -35,9 +36,14 @@ pub struct GpuConfig {
     pub fence_window: Option<u32>,
     /// Beyond the window, fenced commands are answered early while the oldest unanswered one
     /// was sent less than two round trips and this many milliseconds ago (default 20, 0 =
-    /// not beyond the window).
+    /// not beyond the window). This is the age while the guest decodes no video.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fence_age_ms: Option<u32>,
+    /// The same age while the guest decodes video: from each decode command until one second
+    /// after it (default 100, 0 = not beyond the window). The renderer shows a video's frames
+    /// late on purpose, by the guest's clock, so the guest may run further ahead then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fence_age_video_ms: Option<u32>,
     /// The device stops taking the guest's commands while more than this many MiB wait to be
     /// written to the renderer (default 8, at least 1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -87,6 +93,13 @@ impl GpuConfig {
 
     pub(crate) fn fence_age_us(&self) -> i64 {
         i64::from(self.fence_age_ms.unwrap_or(DEFAULT_FENCE_AGE_MS)) * 1000
+    }
+
+    pub(crate) fn fence_age_video_us(&self) -> i64 {
+        i64::from(
+            self.fence_age_video_ms
+                .unwrap_or(DEFAULT_FENCE_AGE_VIDEO_MS),
+        ) * 1000
     }
 
     pub(crate) fn tx_limit_bytes(&self) -> usize {
@@ -160,6 +173,7 @@ mod tests {
         c.validate().unwrap();
         assert_eq!(c.fence_window(), 8);
         assert_eq!(c.fence_age_us(), 20_000);
+        assert_eq!(c.fence_age_video_us(), 100_000);
         assert_eq!(c.tx_limit_bytes(), 8 << 20);
         assert_eq!(c.zstd_level(), 1);
         // Only the given fields are listed back.
@@ -172,6 +186,7 @@ mod tests {
 
         let c: GpuConfig = serde_json::from_str(
             r#"{"socket_path": "/s", "spec_path": "/g.spec", "stats_path": "/t", "fence_window": 0, "fence_age_ms": 5,
+                "fence_age_video_ms": 0,
                 "tx_limit_mib": 2, "zstd_level": 0, "debug_wait": true, "dump_path": "/d",
                 "input": true, "sound": true, "agent_socket_path": "/v.sock_5000",
                 "guest_renderer_socket_path": "/v.sock_5001"}"#,
@@ -179,6 +194,8 @@ mod tests {
         .unwrap();
         c.validate().unwrap();
         assert_eq!(c.fence_window(), 0);
+        assert_eq!(c.fence_age_us(), 5_000);
+        assert_eq!(c.fence_age_video_us(), 0);
         assert_eq!(c.tx_limit_bytes(), 2 << 20);
         assert!(c.input() && c.sound());
         assert_eq!(c.agent_socket_path.as_deref(), Some("/v.sock_5000"));
