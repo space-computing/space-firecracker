@@ -397,14 +397,19 @@ impl DeviceManager {
         Ok(())
     }
 
-    /// Artificially kick VirtIO devices as if they had external events. It is the resume of a
-    /// stopped guest: the screen's thread runs again after its devices were kicked.
+    /// Artificially kick VirtIO devices as if they had external events, at the resume of a
+    /// stopped guest. The screen's thread stays paused: [`Self::resume_screen`] lets it run once
+    /// the guest's vCPUs run.
     pub fn kick_virtio_devices(&self) {
         info!("Artificially kick devices");
         if let Some(screen) = &self.screen {
             screen.check(self.screen_positions());
         }
         self.for_each_virtio_device_mut(|_, device| device.kick());
+    }
+
+    /// The screen's thread runs again: the last step of the resume of a stopped guest.
+    pub fn resume_screen(&self) {
         if let Some(screen) = &self.screen {
             screen.resume();
         }

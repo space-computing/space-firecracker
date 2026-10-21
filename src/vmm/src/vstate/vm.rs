@@ -91,6 +91,9 @@ pub struct VmCommon {
     /// to exercise partial-failure handling. 0 means never fail.
     #[cfg(test)]
     fail_set_user_memory_region_in: AtomicU32,
+    /// Test-only: the next `resume_vcpus` fails, as when a vCPU does not answer.
+    #[cfg(test)]
+    fail_resume_vcpus: std::sync::atomic::AtomicBool,
 }
 
 /// Errors associated with the wrappers over KVM ioctls.
@@ -202,6 +205,8 @@ impl KvmVm {
             log_dirty: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_set_user_memory_region_in: AtomicU32::new(0),
+            #[cfg(test)]
+            fail_resume_vcpus: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -310,6 +315,14 @@ impl KvmVm {
 
     /// Sends a resume event to all vCPUs and waits for acknowledgement.
     pub fn resume_vcpus(&self) -> Result<(), crate::VmmError> {
+        #[cfg(test)]
+        if self
+            .common
+            .fail_resume_vcpus
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(crate::VmmError::VcpuMessage);
+        }
         let mut handles = self.vcpus_handles();
         handles
             .iter_mut()
@@ -453,6 +466,14 @@ impl KvmVm {
 
     /// Test-only: arm the fault injector so the `n`th subsequent call to
     /// [`Self::set_user_memory_region`] fails (n == 1 fails the very next call).
+    /// Test-only: the next `resume_vcpus` fails.
+    #[cfg(test)]
+    pub(crate) fn fail_next_resume_vcpus(&self) {
+        self.common
+            .fail_resume_vcpus
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     #[cfg(test)]
     pub(crate) fn fail_next_set_user_memory_region(&self, n: u32) {
         self.common

@@ -515,9 +515,11 @@ impl Vmm {
         }
     }
 
-    /// Resumes a stopped guest: the devices are kicked (a drive runs its kept requests again),
-    /// the clock of the stop is set, and the vCPUs run. A refused or failed resume leaves the
-    /// guest stopped, with its reason.
+    /// Resumes a stopped guest: the clock of the stop is set, the devices are kicked (a drive
+    /// runs its kept requests again), the vCPUs run, and then the screen's thread. A refused or
+    /// failed resume leaves the guest stopped, with its reason, and its devices as a stop leaves
+    /// them: the screen's thread is resumed only once nothing can fail, and a failure of the
+    /// vCPUs stops them again and ends the devices' work in flight again.
     pub fn resume_vm(&mut self) -> Result<(), VmmError> {
         // The lease is checked against its clock too: its timer cannot fire while the guest is
         // stopped by a long call.
@@ -529,14 +531,23 @@ impl Vmm {
         if let Some(why) = &self.resume_refused {
             return Err(VmmError::ResumeRefused(why.clone()));
         }
-        self.device_manager.kick_virtio_devices();
         #[cfg(target_arch = "x86_64")]
         if let Some(stopped) = &self.stopped_clock {
             kvm_vm
                 .set_clock(&stopped.clock, stopped.realtime)
                 .map_err(vstate::vm::VmError::Arch)?;
         }
-        kvm_vm.resume_vcpus()?;
+        self.device_manager.kick_virtio_devices();
+        if let Err(err) = kvm_vm.resume_vcpus() {
+            // vCPUs that took the resume stop again; the guest stays stopped with its devices
+            // quiet (the screen's thread was not resumed).
+            if let Err(again) = kvm_vm.pause_vcpus() {
+                error!("A failed resume could not stop the vCPUs again: {}", again);
+            }
+            self.device_manager.quiesce_virtio_devices();
+            return Err(err);
+        }
+        self.device_manager.resume_screen();
         #[cfg(target_arch = "x86_64")]
         {
             self.stopped_clock = None;
@@ -1240,6 +1251,51 @@ mod tests {
         assert!(!vmm.is_stopped());
         assert!(vmm.instance_info.ran_since_load);
         assert!(vmm.instance_info.paused_reason.is_none());
+    }
+
+    #[test]
+    fn test_failed_resume_keeps_the_screen_paused() {
+        use crate::devices::screen::ScreenLoop;
+        let wait_for = |f: &dyn Fn() -> bool| {
+            let t0 = Instant::now();
+            while t0.elapsed() < Duration::from_secs(5) {
+                if f() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            false
+        };
+        let mut vmm = running_vmm();
+        vmm.device_manager.screen =
+            Some(ScreenLoop::spawn(EventManager::new().unwrap(), Arc::new(vec![])).unwrap());
+        // the guest runs, and its screen's thread
+        vmm.device_manager.resume_screen();
+        let paused = |vmm: &Vmm| vmm.device_manager.screen.as_ref().unwrap().is_paused();
+        assert!(wait_for(&|| !paused(&vmm)));
+        vmm.pause_vm().unwrap();
+        assert!(paused(&vmm));
+
+        // the vCPUs do not take the resume: the guest stays stopped and so does its screen
+        vmm.vm.as_kvm().unwrap().fail_next_resume_vcpus();
+        assert!(matches!(vmm.resume_vm(), Err(VmmError::VcpuMessage)));
+        assert!(vmm.is_stopped());
+        assert_eq!(vmm.instance_info.paused_reason, Some(PausedReason::Api));
+        #[cfg(target_arch = "x86_64")]
+        assert!(vmm.stopped_clock().is_some());
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(paused(&vmm));
+        // a pause request now returns at once, and the state of a snapshot is saved with the
+        // screen paused
+        vmm.pause_vm().unwrap();
+        let vm_info = VmInfo::from(&vmm);
+        vmm.save_state(&vm_info).unwrap();
+        assert!(paused(&vmm));
+
+        // a resume that succeeds lets the screen run
+        vmm.resume_vm().unwrap();
+        assert!(!vmm.is_stopped());
+        assert!(wait_for(&|| !paused(&vmm)));
     }
 
     #[test]
