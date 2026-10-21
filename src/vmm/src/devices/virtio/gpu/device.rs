@@ -458,6 +458,9 @@ pub struct GpuTraffic {
     pub user: (u64, u64),
     /// The in-guest renderer: the last message id sent, the last received.
     pub guest: (u64, u64),
+    /// The in-guest renderer's link: the bytes sent and not acknowledged, and those waiting to
+    /// be sent (the traffic in flight over vsock).
+    pub guest_in_flight: (u64, u64),
 }
 
 #[derive(Debug)]
@@ -3610,17 +3613,23 @@ impl Gpu {
 
     /// What the test of a checkpoint's consistency reads of the device at each stop of the guest
     /// (`crate::devices::screen`): the in-guest renderer's pictures passed on since the start, and
-    /// the last message id sent to and received from each renderer.
+    /// the last message id sent to and received from each renderer, and what the in-guest
+    /// renderer's link has in flight.
     pub(crate) fn traffic(&self) -> GpuTraffic {
         let ids = |ci: usize| {
             self.conns
                 .get(ci)
                 .map_or((0, 0), |c| (c.link.lock().q.tx_id, c.rx_id))
         };
+        let in_flight = self.conns.get(GUEST).map_or((0, 0), |c| {
+            let st = c.link.lock();
+            (st.q.unacked as u64, st.q.backlog as u64)
+        });
         GpuTraffic {
             pictures: self.pictures_all,
             user: ids(USER),
             guest: ids(GUEST),
+            guest_in_flight: in_flight,
         }
     }
 

@@ -31,9 +31,11 @@
 //! their available rings name), and again just before the resume; a page whose content changed
 //! is logged. It also logs, at each pause, what moved since the last resume (the queues, the
 //! pictures of the in-guest renderer passed on, the message ids of each renderer), so that the
-//! test sees the traffic go on after each resume. The content of the pages, not the dirty log,
-//! is observed: KVM's dirty log does not see the VMM's own writes, and the checkpoint resets and
-//! marks again Firecracker's bitmap inside the interval.
+//! test sees the traffic go on after each resume, and what was in flight (the chains the devices
+//! had not taken, data for the guest in the vsock muxer, the bytes of the in-guest renderer's link
+//! not acknowledged or not sent). The content of the pages, not the dirty log, is observed: KVM's
+//! dirty log does not see the VMM's own writes, and the checkpoint resets and marks again
+//! Firecracker's bitmap inside the interval.
 
 use std::collections::BTreeMap;
 use std::hash::{DefaultHasher, Hasher};
@@ -360,6 +362,8 @@ impl ScreenLoop {
                 "positions": positions,
                 "pending": seen.pending,
                 "vsock_rx_pending": seen.vsock_rx_pending,
+                "guest_link_unacked_bytes": seen.traffic.guest_in_flight.0,
+                "guest_link_backlog_bytes": seen.traffic.guest_in_flight.1,
                 "pages": pages.len(),
                 "watched_bytes": bytes,
                 "since_resume": since,
