@@ -631,7 +631,8 @@ paths:
       description:
         Enables a virtio-gpu device (virgl) whose commands are rendered outside Firecracker,
         by the renderer listening on a unix socket (the sink of the Spacebox QEMU fork's remote
-        GPU). The device connects when the microVM starts and again after a lost connection.
+        GPU). The guest is shown the capsets of the GPU spec of spec_path. The device connects
+        when the microVM starts and again after a lost connection.
         A snapshot of a microVM with this device has a second file beside the snapshot file,
         `<snapshot_path>.gpu` (the device's renderer state), which loading the snapshot needs.
       operationId: putGpuDevice
@@ -2097,10 +2098,19 @@ definitions:
       Defines a GPU device whose commands are rendered by a renderer outside Firecracker.
     required:
       - socket_path
+      - spec_path
     properties:
       socket_path:
         type: string
         description: Path of the renderer's unix socket.
+      spec_path:
+        type: string
+        description:
+          Path of the GPU spec, the capsets that the guest is shown (the capset profile format
+          of the Spacebox repository, screen/spec/). The device answers the guest's capset
+          queries from it from the start, with no renderer; every renderer checks at its
+          pairing that it can do all of it, and one that cannot is not paired. Read when the
+          device is made; a snapshot keeps it.
       stats_path:
         type: string
         description:
@@ -2118,6 +2128,13 @@ definitions:
         description:
           Beyond the window, fenced commands are answered early while the oldest unanswered
           one was sent less than two round trips and this many milliseconds ago (default 20).
+          This is the age while the guest decodes no video.
+      fence_age_video_ms:
+        type: integer
+        minimum: 0
+        description:
+          The same age while the guest decodes video, from each decode command until one
+          second after it (default 100).
       tx_limit_mib:
         type: integer
         minimum: 1
@@ -2153,13 +2170,15 @@ definitions:
           A unix socket on which the device takes the connection of the guest agent and carries
           the renderer's scroll channel to it; with the vsock device this is
           `<vsock uds_path>_<port>` of the agent's port. The device creates it.
-      cpu_socket_path:
+      guest_renderer_socket_path:
         type: string
         description:
-          The unix socket of a renderer on the server's CPU. With it, the device switches to that
-          renderer when the renderer of socket_path detaches or has been gone or silent for 10 s,
-          and back when that renderer connects again; the guest keeps running, and the device
-          builds the renderer's state again from what it keeps.
+          A unix socket on which the device takes the connection of the renderer inside the guest
+          (the same renderer, run in the guest on the guest's CPU); with the vsock device this is
+          `<vsock uds_path>_<port>` of that renderer's port (5001). The device creates it. With
+          it, the device switches to that renderer when the renderer of socket_path detaches or
+          has been gone or silent for 10 s, and back when that renderer connects again; the guest
+          keeps running, and the device builds the renderer's state again from what it keeps.
 
   SerialDevice:
     type: object

@@ -39,7 +39,7 @@ use crate::devices::virtio::vsock::VsockError;
 use crate::devices::virtio::vsock::metrics::METRICS;
 use crate::impl_device_type;
 use crate::logger::{IncMetric, error, info, warn};
-use crate::vstate::memory::{ByteValued, Bytes, GuestMemoryMmap};
+use crate::vstate::memory::{ByteValued, Bytes, GuestAddress, GuestMemoryMmap};
 
 pub(crate) const RXQ_INDEX: usize = 0;
 pub(crate) const TXQ_INDEX: usize = 1;
@@ -321,6 +321,18 @@ where
 
     fn queue_config(&self, index: usize) -> Option<&QueueConfig> {
         self.queues.get(index).map(|queue| &queue.config)
+    }
+
+    fn queue_positions(&self) -> Vec<(u16, u16)> {
+        crate::devices::virtio::device::positions_of(&self.queues)
+    }
+
+    fn watched_ranges(&self) -> Vec<(usize, GuestAddress, usize, &'static str)> {
+        crate::devices::virtio::device::watched_of(&self.queues)
+    }
+
+    fn queue_pending(&self) -> Vec<u16> {
+        crate::devices::virtio::device::pending_of(&self.queues)
     }
 
     fn queue_config_mut(&mut self, index: usize) -> Option<&mut QueueConfig> {

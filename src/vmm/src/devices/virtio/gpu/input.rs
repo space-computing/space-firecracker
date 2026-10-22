@@ -33,7 +33,7 @@ use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
 use crate::impl_device_type;
 use crate::logger::{error, warn};
 use crate::snapshot::Persist;
-use crate::vstate::memory::{Bytes, GuestMemoryMmap};
+use crate::vstate::memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 pub const KEYBOARD_DEV_ID: &str = "gpu-keyboard";
 pub const TABLET_DEV_ID: &str = "gpu-tablet";
@@ -434,6 +434,18 @@ impl VirtioDevice for Input {
 
     fn queue_config(&self, index: usize) -> Option<&QueueConfig> {
         self.queues.get(index).map(|queue| &queue.config)
+    }
+
+    fn queue_positions(&self) -> Vec<(u16, u16)> {
+        crate::devices::virtio::device::positions_of(&self.queues)
+    }
+
+    fn watched_ranges(&self) -> Vec<(usize, GuestAddress, usize, &'static str)> {
+        crate::devices::virtio::device::watched_of(&self.queues)
+    }
+
+    fn queue_pending(&self) -> Vec<u16> {
+        crate::devices::virtio::device::pending_of(&self.queues)
     }
 
     fn queue_config_mut(&mut self, index: usize) -> Option<&mut QueueConfig> {

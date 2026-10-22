@@ -14,10 +14,11 @@ mod keymap;
 mod link;
 mod protocol;
 pub mod sound;
+mod spec;
 
 pub use self::device::{
-    GPU_DEV_ID, Gpu, GpuConstructorArgs, GpuPersistError, GpuSideState, GpuState, SIDE_LOST,
-    SideParts, side_path,
+    GPU_DEV_ID, Gpu, GpuConstructorArgs, GpuPersistError, GpuSideState, GpuState, GpuTraffic,
+    SIDE_LOST, SideParts, side_path,
 };
 pub use self::input::{
     Input, InputConstructorArgs, InputKind, InputPersistError, InputState, KEYBOARD_DEV_ID,

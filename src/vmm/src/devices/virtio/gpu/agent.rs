@@ -9,7 +9,8 @@
 //! device listens there. The sink's precise scroll events and its `PING` go to the agent, the
 //! agent's answers (`READY`) back to the sink, which counts the channel ready on them. A new
 //! connection of the agent replaces the old one (all vsock connections end at a snapshot, and
-//! the agent connects again). Everything here is nonblocking and runs on the VMM thread.
+//! the agent connects again). Everything here is nonblocking and runs on the screen's thread
+//! (`fc_screen`).
 
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;

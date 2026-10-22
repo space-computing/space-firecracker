@@ -107,9 +107,11 @@ specification:
 |                           | vsock_id            |    O     |       O        |      O       |        O         |     O      |    **R**     |     O      |      O      |     O      |     O      |
 | `EntropyDevice`           | rate_limiter        |    O     |       O        |      O       |        O         |     O      |      O       |   **R**    |      O      |     O      |     O      |
 | `GpuDevice`               | socket_path         |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |     O      |   **R**    |
+|                           | spec_path           |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |     O      |   **R**    |
 |                           | stats_path          |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |     O      |   **R**    |
 |                           | fence_window        |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |     O      |   **R**    |
 |                           | fence_age_ms        |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |     O      |   **R**    |
+|                           | fence_age_video_ms  |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |     O      |   **R**    |
 |                           | tx_limit_mib        |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |     O      |   **R**    |
 |                           | zstd_level          |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |     O      |   **R**    |
 |                           | debug_wait          |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |     O      |   **R**    |
@@ -117,7 +119,7 @@ specification:
 |                           | input               |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |     O      |   **R**    |
 |                           | sound               |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |     O      |   **R**    |
 |                           | agent_socket_path   |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |     O      |   **R**    |
-|                           | cpu_socket_path     |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |     O      |   **R**    |
+|                           | guest_renderer_socket_path |    O     |       O        |      O       |        O         |     O      |      O       |     O      |      O      |     O      |   **R**    |
 | `Pmem`                    | id                  |    O     |       O        |      O       |        O         |     O      |      O       |     O      |    **R**    |     O      |     O      |
 |                           | path_on_host        |    O     |       O        |      O       |        O         |     O      |      O       |     O      |    **R**    |     O      |     O      |
 |                           | root_device         |    O     |       O        |      O       |        O         |     O      |      O       |     O      |    **R**    |     O      |     O      |

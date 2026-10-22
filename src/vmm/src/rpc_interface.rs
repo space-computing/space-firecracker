@@ -1240,6 +1240,7 @@ mod tests {
         let mut preboot = default_preboot(&mut vm_resources, &mut evmgr, &seccomp_filters);
         let cfg = GpuConfig {
             socket_path: "/gpu.sock".into(),
+            spec_path: "/gpu.spec".into(),
             ..Default::default()
         };
         preboot
@@ -1623,6 +1624,7 @@ mod tests {
         )));
         check_unsupported(runtime_request(VmmAction::SetGpuDevice(GpuConfig {
             socket_path: "/gpu.sock".into(),
+            spec_path: "/gpu.spec".into(),
             ..Default::default()
         })));
         check_unsupported(runtime_request(VmmAction::SetMemoryHotplugDevice(

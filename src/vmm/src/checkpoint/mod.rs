@@ -573,7 +573,8 @@ impl Vmm {
         if was_running {
             kvm_vm.pause_vcpus().map_err(|e| e.to_string())?;
         }
-        self.device_manager.quiesce_virtio_devices();
+        self.device_manager
+            .quiesce_virtio_devices(Some(kvm_vm.guest_memory()));
         let _ = self.device_manager.save_checkpoint();
         if self.checkpoint.logging {
             kvm_vm.reset_dirty_bitmap();
@@ -603,7 +604,8 @@ impl Vmm {
             mem.mark_dirty(addr, len);
         }
         if was_running {
-            self.device_manager.resume_virtio_devices_after_checkpoint();
+            self.device_manager
+                .resume_virtio_devices_after_checkpoint(kvm_vm.guest_memory());
             kvm_vm.resume_vcpus().map_err(|e| e.to_string())?;
             self.device_manager.kick_net_receive();
         }
@@ -1576,7 +1578,8 @@ impl Vmm {
             );
         }
         // No disk request is in work, and the hook is told the number of this checkpoint.
-        self.device_manager.quiesce_virtio_devices();
+        self.device_manager
+            .quiesce_virtio_devices(Some(kvm_vm.guest_memory()));
         let hook_gone = !hook_say(&self.checkpoint.hook, "epoch", epoch);
         self.checkpoint.open_stop = Some(OpenStop {
             epoch,
@@ -1666,7 +1669,8 @@ impl Vmm {
                 // The stop took longer than the lease had left: the guest does not run again.
                 self.lease_check();
             } else {
-                self.device_manager.resume_virtio_devices_after_checkpoint();
+                self.device_manager
+                    .resume_virtio_devices_after_checkpoint(kvm_vm.guest_memory());
                 if let Err(err) = kvm_vm.resume_vcpus() {
                     error!("The end of the stop of a checkpoint: {}", err);
                 } else {

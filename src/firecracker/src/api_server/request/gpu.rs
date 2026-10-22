@@ -22,12 +22,18 @@ mod tests {
         parse_put_gpu(&Body::new("invalid_payload")).unwrap_err();
         // No socket.
         parse_put_gpu(&Body::new("{}")).unwrap_err();
+        // No spec.
+        parse_put_gpu(&Body::new(r#"{"socket_path": "/gpu.sock"}"#)).unwrap_err();
         // An unknown field.
-        parse_put_gpu(&Body::new(r#"{"socket_path": "/gpu.sock", "some_id": 4}"#)).unwrap_err();
+        parse_put_gpu(&Body::new(
+            r#"{"socket_path": "/gpu.sock", "spec_path": "/gpu.spec", "some_id": 4}"#,
+        ))
+        .unwrap_err();
 
-        let body = r#"{"socket_path": "/gpu.sock", "stats_path": "/gpu.stats", "fence_window": 8}"#;
+        let body = r#"{"socket_path": "/gpu.sock", "spec_path": "/gpu.spec", "stats_path": "/gpu.stats", "fence_window": 8}"#;
         let expected = GpuConfig {
             socket_path: "/gpu.sock".into(),
+            spec_path: "/gpu.spec".into(),
             stats_path: Some("/gpu.stats".into()),
             fence_window: Some(8),
             ..Default::default()

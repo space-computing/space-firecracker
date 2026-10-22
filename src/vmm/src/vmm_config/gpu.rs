@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 /// The defaults of the QEMU fork's remote GPU source (`SPACEBOX_GPU_REMOTE_*`).
 const DEFAULT_FENCE_WINDOW: u32 = 8;
 const DEFAULT_FENCE_AGE_MS: u32 = 20;
+const DEFAULT_FENCE_AGE_VIDEO_MS: u32 = 100;
 const DEFAULT_TX_LIMIT_MIB: u32 = 8;
 const DEFAULT_ZSTD_LEVEL: i32 = 1;
 const MAX_ZSTD_LEVEL: i32 = 19;
@@ -19,6 +20,12 @@ pub struct GpuConfig {
     /// The unix socket of the renderer. The device connects to it, and again every 250 ms
     /// while it is not there or after the connection was lost.
     pub socket_path: String,
+    /// The GPU spec: what the guest is shown of the GPU (its capsets), in the format of the
+    /// capset profile of the spacebox repository (`screen/spec/`). The device answers the
+    /// guest's capset queries from it from the start, with no renderer, and every renderer
+    /// checks at its pairing that it can do all of it. Read when the device is made; a snapshot
+    /// keeps it.
+    pub spec_path: String,
     /// A file to which the device appends its statistics every 5 seconds and its messages
     /// about the connection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -29,9 +36,14 @@ pub struct GpuConfig {
     pub fence_window: Option<u32>,
     /// Beyond the window, fenced commands are answered early while the oldest unanswered one
     /// was sent less than two round trips and this many milliseconds ago (default 20, 0 =
-    /// not beyond the window).
+    /// not beyond the window). This is the age while the guest decodes no video.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fence_age_ms: Option<u32>,
+    /// The same age while the guest decodes video: from each decode command until one second
+    /// after it (default 100, 0 = not beyond the window). The renderer shows a video's frames
+    /// late on purpose, by the guest's clock, so the guest may run further ahead then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fence_age_video_ms: Option<u32>,
     /// The device stops taking the guest's commands while more than this many MiB wait to be
     /// written to the renderer (default 8, at least 1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -62,12 +74,16 @@ pub struct GpuConfig {
     /// path (the agent uses port 5000). The device creates the socket.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_socket_path: Option<String>,
-    /// The unix socket of a renderer on this server's CPU (the same sink, run with software
-    /// GL). With it, the device switches to that renderer when the user's renderer detaches or
-    /// has been silent for 10 s, and back when the user's renderer connects again; the guest
-    /// keeps running, and the device builds the renderer's state again from its journal.
+    /// A unix socket on which the device takes the connection of the renderer inside the guest
+    /// (the same sink, run in the guest on its own CPU with software GL). With the vsock device,
+    /// that renderer connects to the host's port P and Firecracker connects that to
+    /// `<vsock uds_path>_P`, so this is that path (the renderer uses port 5001). The device
+    /// creates the socket. With it, the device switches to that renderer when the user's renderer
+    /// detaches or has been silent for 10 s, and back when the user's renderer connects again;
+    /// the guest keeps running, and the device builds the renderer's state again from its
+    /// journal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cpu_socket_path: Option<String>,
+    pub guest_renderer_socket_path: Option<String>,
 }
 
 impl GpuConfig {
@@ -77,6 +93,13 @@ impl GpuConfig {
 
     pub(crate) fn fence_age_us(&self) -> i64 {
         i64::from(self.fence_age_ms.unwrap_or(DEFAULT_FENCE_AGE_MS)) * 1000
+    }
+
+    pub(crate) fn fence_age_video_us(&self) -> i64 {
+        i64::from(
+            self.fence_age_video_ms
+                .unwrap_or(DEFAULT_FENCE_AGE_VIDEO_MS),
+        ) * 1000
     }
 
     pub(crate) fn tx_limit_bytes(&self) -> usize {
@@ -100,6 +123,9 @@ impl GpuConfig {
         if self.socket_path.is_empty() {
             return Err(GpuConfigError::SocketPath);
         }
+        if self.spec_path.is_empty() {
+            return Err(GpuConfigError::SpecPath);
+        }
         if self.tx_limit_mib == Some(0) {
             return Err(GpuConfigError::TxLimit);
         }
@@ -111,8 +137,8 @@ impl GpuConfig {
         if self.agent_socket_path.as_deref() == Some("") {
             return Err(GpuConfigError::AgentSocketPath);
         }
-        if self.cpu_socket_path.as_deref() == Some("") {
-            return Err(GpuConfigError::CpuSocketPath);
+        if self.guest_renderer_socket_path.as_deref() == Some("") {
+            return Err(GpuConfigError::GuestRendererSocketPath);
         }
         Ok(())
     }
@@ -123,14 +149,16 @@ impl GpuConfig {
 pub enum GpuConfigError {
     /// The socket path of the renderer is empty.
     SocketPath,
+    /// The path of the GPU spec is empty.
+    SpecPath,
     /// The transmit limit must be at least 1 MiB.
     TxLimit,
     /// The zstd level {0} is not between 0 and 19.
     ZstdLevel(i32),
     /// The socket path of the guest agent's channel is empty.
     AgentSocketPath,
-    /// The socket path of the CPU renderer is empty.
-    CpuSocketPath,
+    /// The socket path of the renderer inside the guest is empty.
+    GuestRendererSocketPath,
 }
 
 #[cfg(test)]
@@ -139,57 +167,83 @@ mod tests {
 
     #[test]
     fn test_defaults_and_validation() {
-        let c: GpuConfig = serde_json::from_str(r#"{"socket_path": "/run/gpu.sock"}"#).unwrap();
+        let c: GpuConfig =
+            serde_json::from_str(r#"{"socket_path": "/run/gpu.sock", "spec_path": "/g.spec"}"#)
+                .unwrap();
         c.validate().unwrap();
         assert_eq!(c.fence_window(), 8);
         assert_eq!(c.fence_age_us(), 20_000);
+        assert_eq!(c.fence_age_video_us(), 100_000);
         assert_eq!(c.tx_limit_bytes(), 8 << 20);
         assert_eq!(c.zstd_level(), 1);
         // Only the given fields are listed back.
         assert_eq!(
             serde_json::to_string(&c).unwrap(),
-            r#"{"socket_path":"/run/gpu.sock"}"#
+            r#"{"socket_path":"/run/gpu.sock","spec_path":"/g.spec"}"#
         );
 
         assert!(!c.input() && !c.sound() && c.agent_socket_path.is_none());
 
         let c: GpuConfig = serde_json::from_str(
-            r#"{"socket_path": "/s", "stats_path": "/t", "fence_window": 0, "fence_age_ms": 5,
+            r#"{"socket_path": "/s", "spec_path": "/g.spec", "stats_path": "/t", "fence_window": 0, "fence_age_ms": 5,
+                "fence_age_video_ms": 0,
                 "tx_limit_mib": 2, "zstd_level": 0, "debug_wait": true, "dump_path": "/d",
                 "input": true, "sound": true, "agent_socket_path": "/v.sock_5000",
-                "cpu_socket_path": "/c.sock"}"#,
+                "guest_renderer_socket_path": "/v.sock_5001"}"#,
         )
         .unwrap();
         c.validate().unwrap();
         assert_eq!(c.fence_window(), 0);
+        assert_eq!(c.fence_age_us(), 5_000);
+        assert_eq!(c.fence_age_video_us(), 0);
         assert_eq!(c.tx_limit_bytes(), 2 << 20);
         assert!(c.input() && c.sound());
         assert_eq!(c.agent_socket_path.as_deref(), Some("/v.sock_5000"));
-        assert_eq!(c.cpu_socket_path.as_deref(), Some("/c.sock"));
+        assert_eq!(
+            c.guest_renderer_socket_path.as_deref(),
+            Some("/v.sock_5001")
+        );
 
-        serde_json::from_str::<GpuConfig>(r#"{"socket_path": "/s", "other": 1}"#).unwrap_err();
+        serde_json::from_str::<GpuConfig>(
+            r#"{"socket_path": "/s", "spec_path": "/g", "other": 1}"#,
+        )
+        .unwrap_err();
         serde_json::from_str::<GpuConfig>(r#"{}"#).unwrap_err();
+        // the spec is required
+        serde_json::from_str::<GpuConfig>(r#"{"socket_path": "/s"}"#).unwrap_err();
         let bad = |j: &str| serde_json::from_str::<GpuConfig>(j).unwrap().validate();
         assert_eq!(
-            bad(r#"{"socket_path": ""}"#),
+            bad(r#"{"socket_path": "", "spec_path": "/g"}"#),
             Err(GpuConfigError::SocketPath)
         );
         assert_eq!(
-            bad(r#"{"socket_path": "/s", "tx_limit_mib": 0}"#),
+            bad(r#"{"socket_path": "/s", "spec_path": ""}"#),
+            Err(GpuConfigError::SpecPath)
+        );
+        assert_eq!(
+            bad(r#"{"socket_path": "/s", "spec_path": "/g", "tx_limit_mib": 0}"#),
             Err(GpuConfigError::TxLimit)
         );
         assert_eq!(
-            bad(r#"{"socket_path": "/s", "zstd_level": 20}"#),
+            bad(r#"{"socket_path": "/s", "spec_path": "/g", "zstd_level": 20}"#),
             Err(GpuConfigError::ZstdLevel(20))
         );
         assert_eq!(
-            bad(r#"{"socket_path": "/s", "agent_socket_path": ""}"#),
+            bad(r#"{"socket_path": "/s", "spec_path": "/g", "agent_socket_path": ""}"#),
             Err(GpuConfigError::AgentSocketPath)
         );
         assert_eq!(
-            bad(r#"{"socket_path": "/s", "cpu_socket_path": ""}"#),
-            Err(GpuConfigError::CpuSocketPath)
+            bad(r#"{"socket_path": "/s", "spec_path": "/g", "guest_renderer_socket_path": ""}"#),
+            Err(GpuConfigError::GuestRendererSocketPath)
         );
-        serde_json::from_str::<GpuConfig>(r#"{"socket_path": "/s", "input": 1}"#).unwrap_err();
+        // the CPU renderer on the host is gone: its field is refused
+        serde_json::from_str::<GpuConfig>(
+            r#"{"socket_path": "/s", "spec_path": "/g", "cpu_socket_path": "/c.sock"}"#,
+        )
+        .unwrap_err();
+        serde_json::from_str::<GpuConfig>(
+            r#"{"socket_path": "/s", "spec_path": "/g", "input": 1}"#,
+        )
+        .unwrap_err();
     }
 }

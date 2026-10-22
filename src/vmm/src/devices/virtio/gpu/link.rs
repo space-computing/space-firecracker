@@ -3,7 +3,7 @@
 
 //! The connection to the renderer (the "sink" of the Spacebox QEMU fork's remote GPU).
 //!
-//! The device's state lives on the VMM thread ([`super::device`]); this module holds what the
+//! The device's state lives on the screen's thread (`fc_screen`, [`super::device`]); this module holds what the
 //! two I/O threads share with it:
 //!
 //! - The resend queue ([`TxQueue`]): reliable messages stay in it until the peer acknowledges
@@ -12,19 +12,22 @@
 //! - A writer thread (`fc_gpu_tx`) that takes the next message of the queue, compresses it when
 //!   the connection is compressed, and writes it.
 //! - A reader thread (`fc_gpu_rx`) that reads, takes the peer's HELLO out first, uncompresses,
-//!   cuts the stream into messages and hands them to the VMM thread through a channel and an
+//!   cuts the stream into messages and hands them to the device's thread through a channel and an
 //!   eventfd.
 //!
-//! The VMM thread connects (a unix socket connects at once or fails), writes its HELLO, and
-//! decides about everything that arrives. Both threads apply Firecracker's `vmm` seccomp filter
+//! The device's thread connects (a unix socket connects at once or fails), writes its HELLO, and
+//! decides about everything that arrives. The link of the renderer inside the guest listens
+//! instead ([`Link::listen`]): that renderer connects out through vsock, and the device takes its
+//! connection when it wants that renderer. Both threads apply Firecracker's `vmm` seccomp filter
 //! before anything else and never start other threads; they block only on the socket and on a
 //! condition variable.
 
 use std::collections::VecDeque;
 use std::fs::File;
+use std::io::ErrorKind;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -275,7 +278,7 @@ impl TxQueue {
     }
 }
 
-/// What the reader thread hands to the VMM thread.
+/// What the reader thread hands to the device's thread.
 #[derive(Debug)]
 pub(crate) enum RxEvent {
     /// A whole message of connection `cgen`.
@@ -318,7 +321,7 @@ struct Shared {
     z_level: i32,
 }
 
-/// The VMM thread's end of the connection.
+/// The device's end of the connection.
 #[derive(Debug)]
 pub(crate) struct Link {
     shared: Arc<Shared>,
@@ -326,6 +329,10 @@ pub(crate) struct Link {
     /// Readable when events wait in the channel.
     pub(crate) rx_event: EventFd,
     path: String,
+    /// A link that listens: its socket, and the newest connection that came and is not taken
+    /// yet (the device takes it when it wants that renderer).
+    listener: Option<UnixListener>,
+    held: Option<UnixStream>,
     /// The current connection, if any, and its number.
     stream: Option<Arc<UnixStream>>,
     pub(crate) cgen: u64,
@@ -404,10 +411,61 @@ impl Link {
             rx,
             rx_event,
             path,
+            listener: None,
+            held: None,
             stream: None,
             cgen: 0,
             stash: VecDeque::new(),
         })
+    }
+
+    /// A link whose renderer connects to it: the device listens on `path` (a stale socket file
+    /// is removed), takes each connection that comes ([`Self::accept`]), and pairs the newest
+    /// one when it wants that renderer ([`Self::connect`]).
+    pub(crate) fn listen(
+        name: &str,
+        path: String,
+        z_level: i32,
+        filter: Arc<BpfProgram>,
+        dump: Option<File>,
+    ) -> std::io::Result<Self> {
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        let listener = UnixListener::bind(&path)?;
+        listener.set_nonblocking(true)?;
+        let mut link = Self::new(name, path, z_level, filter, dump)?;
+        link.listener = Some(listener);
+        Ok(link)
+    }
+
+    /// The listening socket of a link that listens.
+    pub(crate) fn listener(&self) -> Option<&UnixListener> {
+        self.listener.as_ref()
+    }
+
+    /// Takes the connections that wait on the listening socket; the newest is held, the older
+    /// ones are closed. True if one came.
+    pub(crate) fn accept(&mut self) -> bool {
+        let Some(l) = self.listener.as_ref() else {
+            return false;
+        };
+        let mut came = false;
+        while let Ok((s, _)) = l.accept() {
+            // the threads block on the socket
+            if s.set_nonblocking(false).is_ok() {
+                self.held = Some(s);
+                came = true;
+            }
+        }
+        came
+    }
+
+    /// Whether the renderer can be paired now: connected, or (a link that listens) holding a
+    /// connection of the renderer, or (a link that connects) worth a try.
+    pub(crate) fn reachable(&self) -> bool {
+        self.stream.is_some() || self.listener.is_none() || self.held.is_some()
     }
 
     pub(crate) fn path(&self) -> &str {
@@ -430,7 +488,7 @@ impl Link {
         self.stash.pop_front().or_else(|| self.rx.try_recv().ok())
     }
 
-    /// Wait at most `d` for the reader to pass something on (for the VMM thread when it must
+    /// Wait at most `d` for the reader to pass something on (for the device when it must
     /// not return to the event loop: the drain before a snapshot). True if something waits.
     pub(crate) fn wait(&mut self, d: std::time::Duration) -> bool {
         if !self.stash.is_empty() {
@@ -458,10 +516,20 @@ impl Link {
         self.shared.rx_total.load(Ordering::Relaxed)
     }
 
-    /// Try to connect; on success write `hello` (the queue stays closed until the peer answers).
+    /// Try to connect (a link that listens takes the connection it holds); on success write
+    /// `hello` (the queue stays closed until the peer answers).
     pub(crate) fn connect(&mut self, hello: &Hdr) -> bool {
-        let Ok(s) = UnixStream::connect(&self.path) else {
-            return false;
+        let s = if self.listener.is_some() {
+            self.accept();
+            match self.held.take() {
+                Some(s) => s,
+                None => return false,
+            }
+        } else {
+            let Ok(s) = UnixStream::connect(&self.path) else {
+                return false;
+            };
+            s
         };
         let s = Arc::new(s);
         self.cgen = {

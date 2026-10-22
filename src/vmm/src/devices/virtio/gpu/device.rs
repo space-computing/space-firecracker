@@ -11,21 +11,32 @@
 //! network:
 //!
 //! - Commands whose answer carries nothing are answered at once; fenced ones up to a window of
-//!   commands and an age ahead of the sink ([`Gpu::may_answer_early`]).
+//!   commands and an age ahead of the sink, a longer age while the guest decodes video
+//!   ([`Gpu::may_answer_early`]).
 //! - Reads of query result buffers are answered from guest memory, which the sink keeps current
 //!   (it watches the buffers), and parked while the result is not in yet.
-//! - Capability, display and EDID queries are answered from what the sink sent ahead
-//!   (`SP_INFO`).
+//! - Capability queries are answered from the GPU spec ([`super::spec`], `spec_path`) from the
+//!   first moment, with no renderer; every renderer checks at its pairing that it can do the
+//!   spec (`SP_SPEC`), and one that cannot is not paired. Display and EDID queries are answered
+//!   from what the sink sent ahead (`SP_INFO`).
 //!
 //! The connection ([`super::link`]) resumes after a loss: both ends keep what the other has not
 //! acknowledged. Every command that is sent also goes into the journal ([`gpu_journal`]), from
 //! which the device builds the renderer's state again in a renderer that holds none of it: a
-//! sink that restarted, or the other renderer of a switch. With a CPU renderer configured
-//! (`cpu_socket_path`), the user's renderer that detaches hands its state over (a planned
-//! switch: the journal, then what only its GPU wrote, the scanout first); one that is gone or
-//! silent for 10 s is replaced (a sudden loss: the journal only, then the guest agent makes every
-//! program draw again); and while the CPU renderer runs, the device keeps trying the user's
-//! renderer, which is attached again by a planned switch when it connects.
+//! sink that restarted, or the other renderer of a switch. With the renderer inside the guest
+//! (`guest_renderer_socket_path`: the same sink, run in the guest on the guest's CPU, which
+//! connects out through vsock to the device), the user's renderer that detaches hands its state
+//! over (a planned switch: the journal, then what only its GPU wrote, the scanout first); one that
+//! is gone or silent for 10 s is replaced (a sudden loss: the journal only, then the guest agent
+//! makes every program draw again); and while the in-guest renderer runs, the device keeps trying
+//! the user's renderer, which is attached again by a planned switch when it connects. The
+//! in-guest renderer's state is in guest memory: a snapshot, a move or a checkpoint takes it with
+//! the device's own at the same instant, so the device waits for it and exports from it at none
+//! of them, and after a restore it connects again and resumes.
+//!
+//! The device's events run on the screen's thread (`fc_screen`, [`crate::devices::screen`]),
+//! which the VMM thread pauses at every stop of the guest; what the VMM thread does with the
+//! device (the save, the restore, the resume) runs while that thread is paused.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
@@ -43,10 +54,12 @@ use super::input::{Input, InputKind, translate};
 use super::link::{DelayStat, Link, RxEvent, now_us};
 use super::protocol::{
     Filter, HDR_LEN, Hdr, SP_ACK, SP_AUDIO, SP_BYE, SP_CTRL, SP_CURSOR, SP_DETACH, SP_DISPLAY,
-    SP_EXPECT, SP_EXPORT, SP_EXPORT_DATA, SP_EXPORT_DONE, SP_F_RESTORED, SP_F_SCROLL, SP_F_VIDEO,
-    SP_F_ZSTD, SP_HELLO, SP_IMPORT, SP_INFO, SP_INPUT, SP_MEMWRITE, SP_RESET, SP_RESP, SP_SCROLL,
-    SP_STATE_KEPT, SP_STATE_RESET, SP_WMARK, push_expect, u32_at, u64_at,
+    SP_EXPECT, SP_EXPORT, SP_EXPORT_DATA, SP_EXPORT_DONE, SP_F_RESTORED, SP_F_SCROLL, SP_F_SPEC,
+    SP_F_VIDEO, SP_F_ZSTD, SP_GPU, SP_GPU_STATE, SP_HELLO, SP_IMPORT, SP_INFO, SP_INPUT,
+    SP_MEMWRITE, SP_PICTURE, SP_RESET, SP_RESP, SP_SCROLL, SP_SPEC, SP_SPEC_REPLY, SP_STATE_KEPT,
+    SP_STATE_RESET, SP_STREAM, SP_WMARK, push_expect, u32_at, u64_at,
 };
+use super::spec::Spec;
 use super::{CTRL_QUEUE, CURSOR_QUEUE, GPU_NUM_QUEUES};
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::device::{ActiveState, DeviceState, VirtioDevice, VirtioDeviceType};
@@ -86,16 +99,19 @@ const CMD_TRANSFER_FROM_HOST_3D: u32 = 0x0206;
 const CMD_SUBMIT_3D: u32 = 0x0207;
 const CMD_RESOURCE_MAP_BLOB: u32 = 0x0208;
 const CMD_RESOURCE_UNMAP_BLOB: u32 = 0x0209;
+const CMD_UPDATE_CURSOR: u32 = 0x0300;
 const RESP_OK_NODATA: u32 = 0x1100;
 const RESP_OK_CAPSET_INFO: u32 = 0x1102;
 const RESP_OK_CAPSET: u32 = 0x1103;
 const RESP_ERR_UNSPEC: u32 = 0x1200;
 const FLAG_FENCE: u32 = 1;
+/// `VIRTIO_GPU_EVENT_DISPLAY` of `events_read`: the display information changed.
+const VIRTIO_GPU_EVENT_DISPLAY: u64 = 1;
 
 const CAPSET_VIRGL: u32 = 1;
 const CAPSET_VIRGL2: u32 = 2;
-/// The capsets the device advertises (as the QEMU source: the sink answers for them).
-const CAPSET_IDS: [u32; 2] = [CAPSET_VIRGL, CAPSET_VIRGL2];
+/// The capsets the device advertises, by index (the spec has exactly these).
+pub(crate) const CAPSET_IDS: [u32; 2] = [CAPSET_VIRGL, CAPSET_VIRGL2];
 
 /// `struct virtio_gpu_ctrl_hdr`.
 const HDR: usize = 24;
@@ -114,14 +130,19 @@ const ACK_PERIOD: Duration = Duration::from_millis(100);
 const STATS_PERIOD: Duration = Duration::from_secs(5);
 const RECONNECT: Duration = Duration::from_millis(250);
 const BACKLOG_RETRY: Duration = Duration::from_millis(1);
-/// With a CPU renderer: how long the user's renderer may be gone or silent before the CPU
-/// renderer takes over.
+/// With an in-guest renderer: how long the user's renderer may be gone or silent before the
+/// in-guest renderer takes over.
 const TAKEOVER_US: i64 = 10_000_000;
-/// With no CPU renderer: how long a renderer that was paired and is lost is waited for (the
+/// With no in-guest renderer: how long a renderer that was paired and is lost is waited for (the
 /// guest's commands wait for it, and it resumes) before the device serves the guest alone and
 /// the renderer starts empty when it comes back: longer than the cut of 60 s that the screen
 /// track's D1 (c) resumes (the agent's choice, 2026-10-19).
 const LOST_WAIT_US: i64 = 120_000_000;
+/// How long the in-guest renderer that runs the guest and is lost is waited for (a renderer that
+/// restarts, or its link after a reset of vsock, is back within it) before the device serves the
+/// guest alone and that renderer starts empty when it comes back: the guest's shutdown stops it,
+/// and the guest's last GPU work must not wait for it.
+const GUEST_LOST_WAIT_US: i64 = 5_000_000;
 /// How long a device that no renderer has paired with since it was made waits for its first
 /// one before it serves the guest alone (the user's renderer is opened before the guest starts;
 /// a guest whose user's device is not attached must still run and shut down).
@@ -129,9 +150,19 @@ const FIRST_WAIT_US: i64 = 5_000_000;
 /// Before a snapshot: how long the device waits for its renderer to answer and acknowledge
 /// everything.
 const SAVE_WAIT_US: i64 = 2_000_000;
+/// A renderer that cannot do the spec is tried again this long after its refusal.
+const SPEC_RETRY_US: i64 = 5_000_000;
 /// After a rollback the redraw (K6) comes this long after the VM resumes, so that the first
 /// picture is the snapshot's (the user's choice of 2026-10-17).
 const ROLLBACK_REDRAW_US: i64 = 2_000_000;
+/// A picture of the in-guest renderer for the user's renderer is dropped while more than this
+/// waits to be sent on the user's link (a newer one comes).
+const PICTURE_BACKLOG: usize = 1 << 20;
+/// The user's toggle off waits this long for an in-guest renderer that is not connected (after a
+/// switch back it connects again within a second) before it is refused.
+const OFF_WAIT_US: i64 = 5_000_000;
+/// The guest's cursor (`struct virtio_gpu_update_cursor` names a resource of 64 x 64, 32 bit).
+const CURSOR_BYTES: u64 = 64 * 64 * 4;
 /// A piece of a renderer's export, as an `SP_IMPORT` (the header, the bytes).
 type Piece = (Vec<u8>, Vec<u8>);
 
@@ -158,10 +189,10 @@ const SCANOUT_KEEP: usize = 4;
 /// incomplete.
 const SAVE_EXPORT_SILENCE_US: i64 = 2_000_000;
 
-/// The connections: the user's renderer, and the renderer on this server's CPU.
+/// The connections: the user's renderer, and the renderer inside the guest.
 pub(crate) const USER: usize = 0;
-pub(crate) const CPU: usize = 1;
-const CONN_NAMES: [&str; 2] = ["the user's renderer", "the CPU renderer"];
+pub(crate) const GUEST: usize = 1;
+const CONN_NAMES: [&str; 2] = ["the user's renderer", "the in-guest renderer"];
 
 /// The layout of picture data about to be sent (`sp_tx_hint`), for the compression filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -261,7 +292,7 @@ pub(crate) struct Conn {
     /// The renderer said it is ending on purpose (`SP_DETACH`).
     detaching: bool,
     /// Keep connecting to it.
-    wanted: bool,
+    pub(crate) wanted: bool,
     /// The resources listed in an `SP_WMARK` on this pairing since its newest mark point: the
     /// newest message id that the device may ask this renderer to reset to (`SP_STATE_RESET`
     /// N keeps what was not written after N). A resource written again before the next point
@@ -272,11 +303,21 @@ pub(crate) struct Conn {
     /// The device was restored from a snapshot and has not been paired with this renderer
     /// since: its HELLO says so (`SP_F_RESTORED`).
     pub(crate) restored: bool,
+    /// The renderer of `peer_session` said that it can do the spec (`SP_SPEC_REPLY`). A new
+    /// pairing is sent the spec and runs nothing before the answer; a pairing lost before it
+    /// starts again ([`Gpu::disconnected`]).
+    pub(crate) spec_ok: bool,
+    /// The renderer said that it cannot do the spec, and has not said otherwise since: it is
+    /// tried again [`SPEC_RETRY_US`] after `refused_at`, and the device switches to it no more.
+    pub(crate) refused: bool,
+    refused_at: i64,
+    /// Its refusals (logged at 1, 2, 4, ...).
+    n_refused: u64,
 }
 
 impl Conn {
     fn up(&self) -> bool {
-        self.link.is_connected() && self.hello_done
+        self.link.is_connected() && self.hello_done && self.spec_ok
     }
 }
 
@@ -329,13 +370,6 @@ struct SnapExport {
     skipped: Vec<u32>,
 }
 
-#[derive(Debug, Clone)]
-struct Capset {
-    id: u32,
-    ver: u32,
-    data: Vec<u8>,
-}
-
 /// Queries of the guest that the sink's information answers, by how they were handled.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct QueryCounts {
@@ -366,6 +400,8 @@ pub(crate) struct Counters {
     n_local: u64,
     n_waited: u64,
     n_ahead: u64,
+    /// ... of which with the age of video.
+    n_ahead_video: u64,
     n_defer: u64,
     defer_bytes: u64,
     n_reconnect: u64,
@@ -391,6 +427,12 @@ pub(crate) struct Counters {
     n_wmark: u64,
     wmark_ids: u64,
     wmark_skipped: u64,
+    /// The in-guest renderer's pictures passed to the user's renderer, their bytes, those dropped
+    /// for the user's link's backlog, and those that came with no stream asked (in the interval).
+    pub(crate) n_picture: u64,
+    picture_bytes: u64,
+    pub(crate) pictures_dropped: u64,
+    pub(crate) pictures_late: u64,
 }
 
 /// The sound device's samples sent on this connection (since the start).
@@ -407,6 +449,20 @@ pub(crate) struct SoundCounts {
 /// The keyboard and the tablet.
 type InputPair = (Arc<Mutex<Input>>, Arc<Mutex<Input>>);
 
+/// [`Gpu::traffic`]: pictures passed on, and (sent, received) message ids of each renderer.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct GpuTraffic {
+    /// The in-guest renderer's pictures passed to the user's renderer since the start.
+    pub pictures: u64,
+    /// The user's renderer: the last message id sent, the last received.
+    pub user: (u64, u64),
+    /// The in-guest renderer: the last message id sent, the last received.
+    pub guest: (u64, u64),
+    /// The in-guest renderer's link: the bytes sent and not acknowledged, and those waiting to
+    /// be sent (the traffic in flight over vsock).
+    pub guest_in_flight: (u64, u64),
+}
+
 #[derive(Debug)]
 pub struct Gpu {
     avail_features: u64,
@@ -422,7 +478,7 @@ pub struct Gpu {
     /// What the device was made from (`GET /vm/config`).
     pub(crate) cfg: GpuConfig,
 
-    /// The user's renderer, and the CPU renderer if one is configured.
+    /// The user's renderer, and the in-guest renderer if one is configured.
     pub(crate) conns: Vec<Conn>,
     /// The renderer that runs the guest's commands.
     pub(crate) active: usize,
@@ -443,6 +499,9 @@ pub struct Gpu {
     session: u64,
     /// Any `SP_INFO` has arrived from the renderer whose information the guest is shown.
     info_seen: bool,
+    /// A renderer sent capsets in `SP_INFO` (a sink that does not know the spec): said once;
+    /// the guest is shown the spec's.
+    caps_ignored_said: bool,
     /// The user's renderer has sent its information (the guest is shown its display).
     user_info: bool,
     pub(crate) n_switch: u64,
@@ -461,9 +520,11 @@ pub struct Gpu {
     parked: VecDeque<Parked>,
     ctx_name: Vec<String>,
     ctx_qpoll: [u32; 64],
-    caps: [Option<Capset>; 4],
+    /// The GPU spec: the capsets the guest is shown, and what each renderer checks.
+    pub(crate) spec: Spec,
     dinfo: Option<Vec<u8>>,
     edid: Option<Vec<u8>>,
+    /// The guest decodes video until about then: one second after its last decode command.
     video_until: i64,
 
     tx_limit: usize,
@@ -478,12 +539,16 @@ pub struct Gpu {
     fq_head: usize,
     fq_len: usize,
     fence_age_us: i64,
+    /// `fence_age_us` while the guest decodes video.
+    fence_age_video_us: i64,
     rtt_min_cur: i64,
     rtt_min_prev: i64,
     rtt_min_t0: i64,
     rtt_us: i64,
 
     pub(crate) counters: Counters,
+    /// The in-guest renderer's pictures passed to the user's renderer since the start.
+    pictures_all: u64,
     /// Used elements were added to a queue: advance its used index and interrupt.
     used: [bool; GPU_NUM_QUEUES],
 
@@ -531,12 +596,32 @@ pub struct Gpu {
     made_at: i64,
     /// The device serves the guest alone (`alone`): said once in the log each time it begins.
     alone_said: bool,
+    /// Commands of a lost renderer answered here since the last line about them, and when that
+    /// line was written ([`Self::say_answered_lost`]).
+    answered_lost: u64,
+    answered_lost_said: i64,
     /// A renderer has paired with this device (or with the device of the state it was restored
     /// from): no first wait any more.
     paired_once: bool,
     /// Restored: at the resume every key and button that the guest holds is released (the
     /// releases sent after the state was taken went to the VM of before).
     pub(crate) release_at_kick: bool,
+
+    /// The user's toggle is off (`SP_GPU`): the in-guest renderer runs the guest, and the user's
+    /// link stays up for input, sound, the cursor and the pictures. Cleared when that link is lost:
+    /// a user's renderer that comes back starts with it on.
+    pub(crate) gpu_off: bool,
+    /// The user turned it on; the switch back waits for the switch under way.
+    gpu_on_pending: bool,
+    /// When the user turned it off ([`OFF_WAIT_US`]).
+    gpu_off_at: i64,
+    /// The in-guest renderer was asked for pictures (`SP_STREAM`) on its current pairing.
+    pub(crate) stream_on: bool,
+    /// What the user's renderer was last told of its toggle (`SP_GPU_STATE`) on this pairing: on,
+    /// or off; and that it used its toggle and has not been told what it made. A renderer that has
+    /// not used it is told nothing.
+    pub(crate) gpu_state_said: Option<bool>,
+    gpu_state_owed: bool,
 }
 
 fn random_session() -> u64 {
@@ -552,9 +637,19 @@ fn random_session() -> u64 {
 }
 
 impl Gpu {
-    /// A device made from `cfg`. Its I/O threads start now and run under `filter` (the
-    /// `vmm` seccomp filter); connecting starts when the event loop runs.
+    /// A device made from `cfg`, with the spec of its `spec_path`. Its I/O threads start now and
+    /// run under `filter` (the `vmm` seccomp filter); connecting starts when the event loop runs.
     pub fn new(cfg: GpuConfig, filter: Arc<BpfProgram>) -> std::io::Result<Self> {
+        let spec = Spec::load(&cfg.spec_path, &CAPSET_IDS)?;
+        Self::with_spec(cfg, spec, filter)
+    }
+
+    /// A device made from `cfg` with `spec` (the spec of a snapshot).
+    pub(crate) fn with_spec(
+        cfg: GpuConfig,
+        spec: Spec,
+        filter: Arc<BpfProgram>,
+    ) -> std::io::Result<Self> {
         let queue_events = (0..GPU_NUM_QUEUES)
             .map(|_| EventFd::new(libc::EFD_NONBLOCK))
             .collect::<Result<Vec<_>, _>>()?;
@@ -576,6 +671,10 @@ impl Gpu {
             wanted: true,
             marked: HashSet::new(),
             restored: false,
+            spec_ok: false,
+            refused: false,
+            refused_at: 0,
+            n_refused: 0,
         };
         let mut conns = vec![conn(Link::new(
             "fc_gpu",
@@ -584,9 +683,10 @@ impl Gpu {
             filter.clone(),
             dump,
         )?)];
-        if let Some(p) = &cfg.cpu_socket_path {
-            // On this server: not compressed. Connected when it takes over.
-            let mut c = conn(Link::new("fc_gpu_cpu", p.clone(), 0, filter, None)?);
+        if let Some(p) = &cfg.guest_renderer_socket_path {
+            // Inside the guest: not compressed (memory to memory; zstd would cost the guest's CPU
+            // and the device's). It connects to the device; paired when it takes over.
+            let mut c = conn(Link::listen("fc_gpu_guest", p.clone(), 0, filter, None)?);
             c.wanted = false;
             conns.push(c);
         }
@@ -628,6 +728,7 @@ impl Gpu {
             debug_shown: 0,
             session: random_session(),
             info_seen: false,
+            caps_ignored_said: false,
             user_info: false,
             n_switch: 0,
             tx_hint: None,
@@ -640,7 +741,7 @@ impl Gpu {
             parked: VecDeque::new(),
             ctx_name: vec![String::new(); 64],
             ctx_qpoll: [0; 64],
-            caps: Default::default(),
+            spec,
             dinfo: None,
             edid: None,
             video_until: 0,
@@ -653,6 +754,7 @@ impl Gpu {
             fq_head: 0,
             fq_len: 0,
             fence_age_us: cfg.fence_age_us(),
+            fence_age_video_us: cfg.fence_age_video_us(),
             rtt_min_cur: i64::MAX,
             rtt_min_prev: i64::MAX,
             rtt_min_t0: 0,
@@ -662,6 +764,7 @@ impl Gpu {
                 rx_min_prev: i64::MAX,
                 ..Default::default()
             },
+            pictures_all: 0,
             used: [false; GPU_NUM_QUEUES],
             inputs: None,
             agent,
@@ -679,13 +782,27 @@ impl Gpu {
             saved_wanted: None,
             made_at: now_us(),
             alone_said: false,
+            answered_lost: 0,
+            answered_lost_said: 0,
             paired_once: false,
             release_at_kick: false,
+            gpu_off: false,
+            gpu_on_pending: false,
+            gpu_off_at: 0,
+            stream_on: false,
+            gpu_state_said: None,
+            gpu_state_owed: false,
             cfg,
         };
-        // One scanout; the two virgl capsets, which the sink answers for.
+        // One scanout; the two virgl capsets, of the spec.
         gpu.set_config(2, 1);
         gpu.set_config(3, u32::try_from(CAPSET_IDS.len()).unwrap());
+        let msg = format!(
+            "spacebox remote gpu: the spec {}: {}",
+            gpu.spec.digest(),
+            gpu.spec.describe()
+        );
+        gpu.log_info(&msg);
         Ok(gpu)
     }
 
@@ -757,6 +874,14 @@ impl Gpu {
         let hint = self.tx_hint.take();
         let c = &mut self.conns[ci];
         if !reliable && !c.link.is_connected() {
+            return;
+        }
+        if reliable && c.hello_done && !c.spec_ok {
+            // A new pairing before the renderer's yes to the spec: the renderer drops what comes
+            // before its answer, so a reliable message would be written, dropped, and its id
+            // given again after the queue is forgotten; the renderer then took the next message
+            // with that id as one it had (a switch that waited for ever, G4's F4). What the
+            // guest does meanwhile is in the journal, which the renderer gets after its yes.
             return;
         }
         let h = Hdr {
@@ -831,13 +956,20 @@ impl Gpu {
         if samples.is_empty() {
             return;
         }
-        if !self.conns[self.active].up() {
+        // the user's device plays it whichever renderer runs the guest (the toggle off)
+        let ci = if self.conns[USER].up() {
+            USER
+        } else {
+            self.active
+        };
+        if !self.conns[ci].up() {
             s.not_sent += samples.len() as u64;
             return;
         }
         s.messages += 1;
         s.bytes += samples.len() as u64;
-        self.send_full(
+        self.send_on(
+            ci,
             false,
             SP_AUDIO,
             0,
@@ -1173,52 +1305,11 @@ impl Gpu {
 
     /// `sp_source_query`: capability and display queries have a 5 second limit in the guest
     /// kernel; on a busy link the answer can arrive later than that, and then the guest's
-    /// desktop falls back to software rendering. Answer them from what the sink sent ahead.
-    /// Returns false if this query must be forwarded.
+    /// desktop falls back to software rendering. Capability queries are answered from the spec,
+    /// display and EDID queries from what the sink sent ahead. Returns false if this query must
+    /// be forwarded.
     fn query(&mut self, mem: &GuestMemoryMmap, cmd: &Cmd, req: &[u8], typ: u32) -> bool {
-        let resp: Option<Vec<u8>> = match typ {
-            CMD_GET_CAPSET_INFO if req.len() >= 32 => {
-                let index = u32_at(req, 24) as usize;
-                CAPSET_IDS.get(index).and_then(|&id| {
-                    self.caps.iter().flatten().find(|c| c.id == id).map(|c| {
-                        let mut r = vec![0u8; 40];
-                        r[0..4].copy_from_slice(&RESP_OK_CAPSET_INFO.to_le_bytes());
-                        r[24..28].copy_from_slice(&id.to_le_bytes());
-                        r[28..32].copy_from_slice(&c.ver.to_le_bytes());
-                        r[32..36]
-                            .copy_from_slice(&u32::try_from(c.data.len()).unwrap().to_le_bytes());
-                        self.counters.queries.capset_info += 1;
-                        r
-                    })
-                })
-            }
-            CMD_GET_CAPSET if req.len() >= 32 => {
-                let (id, ver) = (u32_at(req, 24), u32_at(req, 28));
-                // The renderer fills a virgl capset the same way for every version (Mesa asks
-                // for version 0), so the id alone selects the data.
-                self.caps
-                    .iter()
-                    .flatten()
-                    .find(|c| c.id == id && ver <= c.ver)
-                    .map(|c| {
-                        let mut r = vec![0u8; HDR];
-                        r[0..4].copy_from_slice(&RESP_OK_CAPSET.to_le_bytes());
-                        r.extend_from_slice(&c.data);
-                        r
-                    })
-                    .inspect(|_| self.counters.queries.capset += 1)
-            }
-            CMD_GET_DISPLAY_INFO => self
-                .dinfo
-                .clone()
-                .inspect(|_| self.counters.queries.display_info += 1),
-            CMD_GET_EDID if req.len() >= 32 && u32_at(req, 24) == 0 => self
-                .edid
-                .clone()
-                .inspect(|_| self.counters.queries.edid += 1),
-            _ => None,
-        };
-        match resp {
+        match self.query_answer(req, typ) {
             Some(r) => {
                 self.answer(mem, CTRL_QUEUE, cmd, &r);
                 true
@@ -1236,6 +1327,43 @@ impl Gpu {
                 }
                 false
             }
+        }
+    }
+
+    /// The answer to a query that the device has, counted.
+    fn query_answer(&mut self, req: &[u8], typ: u32) -> Option<Vec<u8>> {
+        match typ {
+            CMD_GET_CAPSET_INFO if req.len() >= 32 => {
+                let index = u32_at(req, 24) as usize;
+                let c = CAPSET_IDS.get(index).and_then(|&id| self.spec.capset(id))?;
+                let mut r = vec![0u8; 40];
+                r[0..4].copy_from_slice(&RESP_OK_CAPSET_INFO.to_le_bytes());
+                r[24..28].copy_from_slice(&c.id.to_le_bytes());
+                r[28..32].copy_from_slice(&c.ver.to_le_bytes());
+                r[32..36].copy_from_slice(&u32::try_from(c.data.len()).unwrap().to_le_bytes());
+                self.counters.queries.capset_info += 1;
+                Some(r)
+            }
+            CMD_GET_CAPSET if req.len() >= 32 => {
+                let (id, ver) = (u32_at(req, 24), u32_at(req, 28));
+                // A renderer fills a virgl capset the same way for every version (Mesa asks
+                // for version 0), so the id alone selects the data.
+                let c = self.spec.capset(id).filter(|c| ver <= c.ver)?;
+                let mut r = vec![0u8; HDR];
+                r[0..4].copy_from_slice(&RESP_OK_CAPSET.to_le_bytes());
+                r.extend_from_slice(&c.data);
+                self.counters.queries.capset += 1;
+                Some(r)
+            }
+            CMD_GET_DISPLAY_INFO => self
+                .dinfo
+                .clone()
+                .inspect(|_| self.counters.queries.display_info += 1),
+            CMD_GET_EDID if req.len() >= 32 && u32_at(req, 24) == 0 => self
+                .edid
+                .clone()
+                .inspect(|_| self.counters.queries.edid += 1),
+            _ => None,
         }
     }
 
@@ -1258,6 +1386,13 @@ impl Gpu {
     /// for the first `fence_window` commands the sink has not answered; beyond that only while
     /// the sink keeps up: the oldest unanswered command was sent no longer ago than two
     /// shortest round trips plus `fence_age`.
+    ///
+    /// The age is `fence_age_video` while the guest decodes video (until one second after its
+    /// last decode, the time of `SP_F_VIDEO`, so the pauses between a clip's frames keep it).
+    /// Decoding a large video loads the link, the sink's answers come up to about 150 ms late,
+    /// and with the short age the guest's player waits for them and drops frames. The sink
+    /// shows video frames by the guest's clock anyway. Without video the short age bounds how
+    /// much later than the guest the user sees an answer to the input.
     fn may_answer_early(&mut self) -> bool {
         let out = self.fence_out + self.wait_out;
         let rtt_min = self.rtt_min_cur.min(self.rtt_min_prev);
@@ -1267,15 +1402,21 @@ impl Gpu {
         if out < self.fence_window {
             return true;
         }
-        if self.fence_age_us == 0
-            || self.fq_len == 0
-            || self.fq_len >= FQ_LEN / 2
-            || rtt_min == i64::MAX
-        {
+        let now = now_us();
+        let video = self.video_until > now;
+        let age = if video {
+            self.fence_age_video_us
+        } else {
+            self.fence_age_us
+        };
+        if age == 0 || self.fq_len == 0 || self.fq_len >= FQ_LEN / 2 || rtt_min == i64::MAX {
             return false;
         }
-        if now_us() - self.fq[self.fq_head] < 2 * rtt_min + self.fence_age_us {
+        if now - self.fq[self.fq_head] < 2 * rtt_min + age {
             self.counters.n_ahead += 1;
+            if video {
+                self.counters.n_ahead_video += 1;
+            }
             return true;
         }
         false
@@ -1644,7 +1785,13 @@ impl Gpu {
         };
         let alone = self.alone();
         if !(self.active_up() || alone) || self.saving {
-            return Ok(()); // resumed by the sink's HELLO, or when a switch is done
+            // resumed by the sink's HELLO, or when a switch is done; meanwhile the queries that
+            // the device can answer are (the kernel's probe reads the capsets within 5 s of
+            // the device coming up, before any renderer may be there)
+            if !self.saving {
+                self.answer_queries_ahead(&mem)?;
+            }
+            return Ok(());
         }
         if self.switch.is_none()
             && (!self.scanout_saved.is_empty() || !self.saved_missing.is_empty())
@@ -1660,8 +1807,26 @@ impl Gpu {
                 self.retry_timer.arm(BACKLOG_RETRY, None);
                 break;
             }
-            let Some(head) = self.queues[CTRL_QUEUE].pop()? else {
+            let Some((cmd, req)) = self.pop_request(&mem)? else {
                 break;
+            };
+            self.source_one(&mem, cmd, req);
+        }
+        if alone {
+            self.serve_alone();
+        }
+        Ok(())
+    }
+
+    /// The next well-formed request of the control queue; a malformed one is answered with an
+    /// error here.
+    fn pop_request(
+        &mut self,
+        mem: &GuestMemoryMmap,
+    ) -> Result<Option<(Cmd, Vec<u8>)>, InvalidAvailIdx> {
+        loop {
+            let Some(head) = self.queues[CTRL_QUEUE].pop()? else {
+                return Ok(None);
             };
             let mut req = Vec::new();
             let mut writable = Vec::new();
@@ -1687,46 +1852,92 @@ impl Gpu {
             if bad || req.len() < HDR {
                 let mut resp = [0u8; HDR];
                 resp[0..4].copy_from_slice(&RESP_ERR_UNSPEC.to_le_bytes());
-                self.answer(&mem, CTRL_QUEUE, &cmd, &resp);
+                self.answer(mem, CTRL_QUEUE, &cmd, &resp);
                 continue;
             }
-            self.source_one(&mem, cmd, req);
+            return Ok(Some((cmd, req)));
         }
-        if alone {
-            self.serve_alone();
+    }
+
+    /// With no renderer to send to: answer the queries at the head of the control queue that
+    /// the device has the answer of (the capsets always, from the spec), in order, up to the
+    /// first command that waits for a renderer.
+    fn answer_queries_ahead(&mut self, mem: &GuestMemoryMmap) -> Result<(), InvalidAvailIdx> {
+        while let Some((cmd, req)) = self.pop_request(mem)? {
+            match self.query_answer(&req, u32_at(&req, 0)) {
+                Some(r) => self.answer(mem, CTRL_QUEUE, &cmd, &r),
+                None => {
+                    self.queues[CTRL_QUEUE].undo_pop();
+                    break;
+                }
+            }
         }
         Ok(())
     }
 
     /// No renderer runs the guest's commands now and none is waited for: the renderer that runs
     /// the guest is not paired, and it would start empty when it comes (no renderer has paired
-    /// since the device was made, for [`FIRST_WAIT_US`]; or it detached; or, with no CPU
-    /// renderer to switch to, it was lost for [`LOST_WAIT_US`], and is let go here). The
+    /// since the device was made, for [`FIRST_WAIT_US`]; or it detached; or, with no in-guest
+    /// renderer to switch to, it was lost for [`LOST_WAIT_US`], and is let go here); or a takeover
+    /// waits for an in-guest renderer that has not connected yet (it starts empty and gets
+    /// everything from the journal, so nothing needs to wait for it). The
     /// device then serves the guest alone ([`Self::serve_alone`]): a guest whose user's device
     /// is not attached runs, shuts down and reboots, where its commands waited for ever and the
     /// guest's shutdown stopped at its console (fc-switch, 2026-10-19).
     fn alone(&mut self) -> bool {
-        if self.switch.is_some() || self.saving {
+        if self.saving {
             return false;
+        }
+        if let Some(sw) = &self.switch {
+            return self.takeover_waits(sw);
         }
         let a = self.active;
         if self.conns[a].up() {
             return false;
         }
         let now = now_us();
-        if self.conns[a].peer_session != 0
-            && self.conns.len() <= CPU
-            && now - self.conns[a].lost_at > LOST_WAIT_US
+        // the user's renderer is replaced by the in-guest renderer (`check_takeover`); with no
+        // in-guest renderer it is waited for long, the in-guest renderer itself briefly
+        let wait = if a == GUEST {
+            Some(GUEST_LOST_WAIT_US)
+        } else if !self.has_fallback() {
+            Some(LOST_WAIT_US)
+        } else {
+            None
+        };
+        // (a renderer whose new pairing waits for its answer to the spec is not the lost one:
+        // its session is the new renderer's)
+        if let Some(wait) = wait
+            && self.conns[a].peer_session != 0
+            && !self.conns[a].hello_done
+            && now - self.conns[a].lost_at > wait
         {
             // it starts empty when it comes back, and gets the state from the journal
             self.conns[a].peer_session = 0;
             self.log_info(&format!(
-                "spacebox remote gpu: {} lost for {} s, and no CPU renderer: let go",
+                "spacebox remote gpu: {} lost for {} s{}: let go",
                 CONN_NAMES[a],
-                LOST_WAIT_US / 1_000_000
+                wait / 1_000_000,
+                if a == GUEST {
+                    ""
+                } else {
+                    ", and no in-guest renderer"
+                }
             ));
         }
         self.conns[a].peer_session == 0 && (self.paired_once || now - self.made_at > FIRST_WAIT_US)
+    }
+
+    /// A takeover (a switch with no old renderer) that waits for its new renderer, which has not
+    /// connected: the guest is served alone meanwhile.
+    fn takeover_waits(&self, sw: &Switch) -> bool {
+        sw.from.is_none() && sw.phase == Phase::Connect && !self.conns[sw.to].link.is_connected()
+    }
+
+    /// An in-guest renderer that the guest's state can move to: configured, and not one that
+    /// cannot do the spec.
+    fn has_fallback(&self) -> bool {
+        self.conns.len() > GUEST && !self.conns[GUEST].refused
     }
 
     /// Serve the guest with no renderer: what waits for a renderer is answered here (as when a
@@ -1741,7 +1952,12 @@ impl Gpu {
             );
         }
         self.drop_pending();
-        self.conns[self.active].link.forget();
+        // what was queued for a renderer that is not there; not the queue of a pairing under
+        // way (its spec may not be written yet)
+        let a = self.active;
+        if !self.conns[a].hello_done {
+            self.conns[a].link.forget();
+        }
     }
 
     /// The cursor queue: each element is answered at once; the cursor goes to the sink.
@@ -1769,6 +1985,13 @@ impl Gpu {
                 if self.switch.is_none() {
                     self.send(SP_CURSOR, 0, &req, &[], 0, 0, 0);
                 }
+                if self.gpu_off && self.active != USER && self.conns[USER].up() {
+                    // the user's renderer shows the cursor over the in-guest renderer's pictures;
+                    // it does not hold the guest's resources now, so a new image comes with its
+                    // pixels
+                    let px = self.cursor_pixels(&mem, &req);
+                    self.send_on(USER, true, SP_CURSOR, 0, &req, &px, 0, 0, 0);
+                }
             } else {
                 warn!("gpu: cursor size incorrect {} vs {CURSOR_LEN}", req.len());
             }
@@ -1779,6 +2002,25 @@ impl Gpu {
             self.answer(&mem, CURSOR_QUEUE, &cmd, &[]);
         }
         Ok(())
+    }
+
+    /// The pixels of the cursor that `req` (`struct virtio_gpu_update_cursor`) sets, from its
+    /// resource's backing in guest memory; none for a move, or a resource that is not a cursor's.
+    fn cursor_pixels(&self, mem: &GuestMemoryMmap, req: &[u8]) -> Vec<u8> {
+        let res = u32_at(req, 40);
+        if u32_at(req, 0) != CMD_UPDATE_CURSOR
+            || !self.resources.get(&res).is_some_and(|r| {
+                r.width == 64 && r.height == 64 && r.backing_size() >= CURSOR_BYTES
+            })
+        {
+            return Vec::new();
+        }
+        let px = self.read_backing(mem, res, 0, CURSOR_BYTES);
+        if px.len() as u64 == CURSOR_BYTES {
+            px
+        } else {
+            Vec::new()
+        }
     }
 
     /// Advance the used rings that got elements and interrupt the guest.
@@ -1857,28 +2099,29 @@ impl Gpu {
         }
     }
 
-    /// `sp_source_info`.
+    /// `sp_source_info`: the display and the EDID. The guest's capsets are the spec's, not a
+    /// renderer's.
     fn info(&mut self, h: &Hdr, a: &[u8]) {
         self.info_seen = true;
         match h.arg0 {
             1 => {
-                let id = u32::try_from(h.arg1).unwrap_or(u32::MAX);
-                let slot = self
-                    .caps
-                    .iter()
-                    .position(|c| c.as_ref().is_some_and(|c| c.id == id))
-                    .or_else(|| self.caps.iter().position(Option::is_none));
-                if let Some(slot) = slot
-                    && h.a_len == (h.arg2 & 0xffff_ffff) as u32
-                {
-                    self.caps[slot] = Some(Capset {
-                        id,
-                        ver: (h.arg2 >> 32) as u32,
-                        data: a.to_vec(),
-                    });
+                if !self.caps_ignored_said {
+                    self.caps_ignored_said = true;
+                    self.log_info(
+                        "spacebox remote gpu: a renderer sent its capsets; the guest is shown the spec's",
+                    );
                 }
             }
-            2 => self.dinfo = Some(a.to_vec()),
+            2 => {
+                // A display that the guest has not been shown: it reads the display again (a
+                // guest booted with no screen gets the in-guest renderer's size, one whose user's
+                // renderer comes later that renderer's).
+                let changed = self.dinfo.as_deref() != Some(a);
+                self.dinfo = Some(a.to_vec());
+                if changed && self.is_activated() {
+                    self.display_event(VIRTIO_GPU_EVENT_DISPLAY);
+                }
+            }
             3 => self.edid = Some(a.to_vec()),
             _ => {}
         }
@@ -1897,8 +2140,8 @@ impl Gpu {
     /// What renderer `ci` sent.
     fn dispatch(&mut self, ci: usize, h: &Hdr, a: &[u8], b: &[u8]) {
         let mem = self.mem();
-        // The guest is shown the user's renderer's display; the CPU renderer's only until the
-        // user's has been seen (the CPU renderer runs at the same size).
+        // The guest is shown the user's renderer's display; the in-guest renderer's only until the
+        // user's has been seen (the in-guest renderer runs at the same size).
         let shown = ci == USER || !self.user_info;
         match h.typ {
             SP_RESP => {
@@ -1931,8 +2174,113 @@ impl Gpu {
             SP_STATE_KEPT => self.switch_kept(ci, a),
             SP_EXPORT_DATA | SP_EXPORT_DONE => self.export_reply(ci, h, a, b),
             SP_DETACH => self.detach(ci),
+            SP_GPU if ci == USER => self.user_toggle(h.arg0 != 0),
+            SP_PICTURE if ci == GUEST => self.picture(h, a),
             _ => {}
         }
+    }
+
+    // ---- the user's toggle ---------------------------------------------------------------
+
+    /// The user's toggle (`SP_GPU`): off is the planned switch to the in-guest renderer with the
+    /// user's link kept up (input, sound, the cursor and the in-guest renderer's pictures go on
+    /// it); on is the planned switch back to the user's renderer (the journal and the in-guest
+    /// renderer's export, as a new attach). The sink says its toggle again when its pairing
+    /// resumes.
+    fn user_toggle(&mut self, on: bool) {
+        let changed = on == self.gpu_off || (on && self.active != USER);
+        self.gpu_off = !on;
+        self.gpu_on_pending = on;
+        self.gpu_state_owed = true;
+        if !on {
+            self.gpu_off_at = now_us();
+        }
+        if changed {
+            self.log_info(&format!(
+                "spacebox remote gpu: the user turned the GPU acceleration {}",
+                if on { "on" } else { "off" }
+            ));
+        }
+        self.toggle_settle();
+    }
+
+    /// After a change of the toggle, of a switch or of a link: the switch that the toggle asks for
+    /// is made once no other switch is under way (off: to the in-guest renderer, if one can take
+    /// the guest; on: back to the user's renderer); the in-guest renderer sends pictures while it
+    /// runs the guest with the toggle off and the user's link up; the user's renderer is told
+    /// what is in effect.
+    fn toggle_settle(&mut self) {
+        let user_up = self.conns[USER].up();
+        if self.switch.is_none() && user_up {
+            if self.gpu_on_pending && self.active == GUEST {
+                let from = self.conns[GUEST].up().then_some(GUEST);
+                self.start_switch(from, USER, "the user turned the GPU acceleration on");
+            } else if self.gpu_off && self.active == USER {
+                if self.has_fallback() && self.conns[GUEST].link.reachable() {
+                    self.start_switch(
+                        Some(USER),
+                        GUEST,
+                        "the user turned the GPU acceleration off",
+                    );
+                } else if self.has_fallback() && now_us() - self.gpu_off_at < OFF_WAIT_US {
+                    // its link connects again after a switch back: the ack timer looks again
+                } else {
+                    self.gpu_off = false;
+                    self.log_info(
+                        "spacebox remote gpu: no in-guest renderer can take the guest now: the GPU acceleration stays on",
+                    );
+                    self.gpu_state_said = Some(true);
+                    self.gpu_state_owed = false;
+                    self.send_on(USER, true, SP_GPU_STATE, 0, &[], &[], 1, 1, 0);
+                }
+            }
+        }
+        if self.active == USER && self.switch.is_none() {
+            self.gpu_on_pending = false;
+        }
+        if self.conns.len() > GUEST && self.conns[GUEST].up() {
+            let want = self.gpu_off && user_up && self.active == GUEST && self.switch.is_none();
+            if want != self.stream_on {
+                self.stream_on = want;
+                self.send_on(GUEST, true, SP_STREAM, 0, &[], &[], u64::from(want), 0, 0);
+                self.log_info(&format!(
+                    "spacebox remote gpu: the in-guest renderer's pictures {}",
+                    if want {
+                        "asked for: the user's renderer shows them"
+                    } else {
+                        "stopped"
+                    }
+                ));
+            }
+        }
+        if user_up && self.switch.is_none() {
+            let on = self.active == USER;
+            let changed = self.gpu_state_said.is_some_and(|s| s != on);
+            // (not while what the toggle asks for still waits)
+            let waits = (on && self.gpu_off) || (!on && self.gpu_on_pending);
+            if (self.gpu_state_owed || changed) && (on || self.gpu_off) && !waits {
+                self.gpu_state_said = Some(on);
+                self.gpu_state_owed = false;
+                self.send_on(USER, true, SP_GPU_STATE, 0, &[], &[], u64::from(on), 0, 0);
+            }
+        }
+    }
+
+    /// A picture of the in-guest renderer (`SP_PICTURE`): passed to the user's renderer while
+    /// the stream is on; dropped while more than [`PICTURE_BACKLOG`] waits on the user's link.
+    fn picture(&mut self, h: &Hdr, a: &[u8]) {
+        if !self.stream_on || !self.conns[USER].up() {
+            self.counters.pictures_late += 1;
+            return;
+        }
+        if self.conns[USER].link.backlog() > PICTURE_BACKLOG {
+            self.counters.pictures_dropped += 1;
+            return;
+        }
+        self.counters.n_picture += 1;
+        self.pictures_all += 1;
+        self.counters.picture_bytes += a.len() as u64;
+        self.send_on(USER, false, SP_PICTURE, 0, a, &[], h.arg0, h.arg1, h.arg2);
     }
 
     /// `sp_rx_delay`.
@@ -1968,6 +2316,11 @@ impl Gpu {
         c.hello_done = true;
         let restored = std::mem::take(&mut c.restored);
         let tx_id = c.link.lock().q.tx_id;
+        if ci == GUEST {
+            // every connection of the in-guest renderer starts with no pictures
+            self.stream_on = false;
+        }
+        let c = &mut self.conns[ci];
         if resume && restored && h.arg2 > tx_id {
             // The renderer ran on after the snapshot (a rollback). It goes back with this
             // device's stream to the snapshot's last id (SP_F_RESTORED), and keeps what did
@@ -2000,17 +2353,103 @@ impl Gpu {
             c.peer_session = h.arg0;
             c.detaching = false;
             c.marked.clear();
+            c.spec_ok = false;
             c.link.start(z_on, 0);
+            if ci == USER {
+                self.gpu_state_said = None;
+                self.gpu_state_owed = false;
+            }
+            // the renderer runs nothing of this device before it said that it can do the spec
+            let spec = self.spec.text().to_vec();
+            self.send_on(ci, false, SP_SPEC, 0, &spec, &[], 0, 0, 0);
+            let msg = format!(
+                "spacebox remote gpu: {} attached (session {:#x}); the spec {} sent",
+                CONN_NAMES[ci],
+                h.arg0,
+                self.spec.digest()
+            );
+            self.log_info(&msg);
+            return;
+        }
+        self.paired(ci);
+    }
+
+    /// The renderer's answer to the spec (`SP_SPEC_REPLY`) of a new pairing.
+    fn spec_reply(&mut self, ci: usize, h: &Hdr, a: &[u8]) {
+        let c = &mut self.conns[ci];
+        if c.spec_ok {
+            return;
+        }
+        if h.arg0 == 1 {
+            c.spec_ok = true;
+            c.refused = false;
             if ci == USER {
                 self.info_seen = false;
             }
             let msg = format!(
-                "spacebox remote gpu: {} attached (session {:#x})",
-                CONN_NAMES[ci], h.arg0
+                "spacebox remote gpu: {} can do the spec {}",
+                CONN_NAMES[ci],
+                self.spec.digest()
             );
             self.log_info(&msg);
             self.renderer_empty(ci);
+            self.paired(ci);
+            return;
         }
+        c.refused = true;
+        c.refused_at = now_us();
+        c.n_refused += 1;
+        c.peer_session = 0;
+        let n = c.n_refused;
+        if n.is_power_of_two() {
+            let msg = format!(
+                "spacebox remote gpu: {} cannot do the spec {} (refusal {n}):{} it is not paired; tried again in {} s",
+                CONN_NAMES[ci],
+                self.spec.digest(),
+                String::from_utf8_lossy(a),
+                SPEC_RETRY_US / 1_000_000
+            );
+            self.log_error(&msg);
+        }
+        if self.switch.as_ref().is_some_and(|s| s.to == ci) {
+            self.give_up_switch(ci);
+        }
+        self.disconnected(ci);
+        if let Err(err) = self.process_ctrl_queue() {
+            error!("gpu: control queue: {err}");
+        }
+    }
+
+    /// The switch to renderer `to` cannot be made: it cannot do the spec. The guest goes on with
+    /// the renderer it had, or, when that one is gone or ends, alone until a renderer pairs.
+    fn give_up_switch(&mut self, to: usize) {
+        let Some(sw) = self.switch.take() else {
+            return;
+        };
+        self.log_error(&format!(
+            "spacebox remote gpu: switch to {} ({}) given up: it cannot do the spec",
+            CONN_NAMES[to], sw.why
+        ));
+        match sw.from {
+            Some(f) if self.conns[f].detaching => {
+                // it ends, and its state can go nowhere
+                self.send_on(f, true, SP_BYE, 0, &[], &[], 0, 0, 0);
+                self.conns[f].peer_session = 0;
+            }
+            // the old renderer runs the guest on
+            Some(_) => {}
+            None => {
+                // the renderer that was lost is let go: the guest is served alone, and a renderer
+                // that pairs next is built from the journal
+                let a = self.active;
+                self.conns[a].peer_session = 0;
+            }
+        }
+        self.conns[to].wanted = to == USER;
+    }
+
+    /// A pairing is complete (resumed, or a new one whose renderer can do the spec).
+    fn paired(&mut self, ci: usize) {
         if let Err(err) = self.process_ctrl_queue() {
             error!("gpu: control queue: {err}");
         }
@@ -2024,6 +2463,7 @@ impl Gpu {
             // button stays held in the guest
             self.release_inputs();
         }
+        self.toggle_settle();
     }
 
     /// Release every key and button that the guest holds (a release that the renderer sent
@@ -2042,6 +2482,22 @@ impl Gpu {
 
     /// Renderer `ci` holds nothing of this guest.
     fn renderer_empty(&mut self, ci: usize) {
+        if ci == USER
+            && let Some(sw) = self.switch.as_ref()
+            && sw.to != USER
+            && self.takeover_waits(sw)
+        {
+            // the in-guest renderer has not come: the user's renderer, back, takes the guest
+            let to = sw.to;
+            self.switch = None;
+            self.conns[to].wanted = false;
+            self.log_info(&format!(
+                "spacebox remote gpu: the switch to {} is given up: the user's renderer is back first",
+                CONN_NAMES[to]
+            ));
+            self.start_switch(None, USER, "the user's renderer came back");
+            return;
+        }
         match self.switch.as_ref().map(|s| s.to) {
             Some(to) if to == ci => self.switch_reset(),
             // it waits until the switch under way is done
@@ -2052,7 +2508,11 @@ impl Gpu {
                 }
             }
             None if ci == USER => {
-                self.start_switch(Some(self.active), USER, "the user's renderer connected")
+                // what only the GPU wrote is taken from the renderer that runs the guest, if it is
+                // there; from a lost one nothing can be (the journal only, then the redraw)
+                let a = self.active;
+                let from = self.conns[a].up().then_some(a);
+                self.start_switch(from, USER, "the user's renderer connected")
             }
             None => {}
         }
@@ -2503,19 +2963,24 @@ impl Gpu {
         let Some(sw) = self.switch.take() else {
             return;
         };
+        // (before the old renderer's link closes: what that does sees the new renderer active)
+        self.active = sw.to;
         if let Some(f) = sw.from
             && f != sw.to
         {
             if self.conns[f].detaching {
                 self.send_on(f, true, SP_BYE, 0, &[], &[], 0, 0, 0);
+                self.conns[f].peer_session = 0;
+            } else if f == USER && self.gpu_off {
+                // the toggle: the user's link stays up for input, sound, the cursor and the
+                // pictures; its renderer is reset and built again when the toggle is on
             } else {
-                // the CPU renderer waits for the next time, when it starts empty
+                // the in-guest renderer waits for the next time, when it starts empty
                 self.conns[f].wanted = f == USER;
                 self.disconnected(f);
+                self.conns[f].peer_session = 0;
             }
-            self.conns[f].peer_session = 0;
         }
-        self.active = sw.to;
         if let Some(c) = self.journal.cursor_cmd().map(<[u8]>::to_vec) {
             self.send(SP_CURSOR, 0, &c, &[], 0, 0, 0);
         }
@@ -2563,6 +3028,7 @@ impl Gpu {
             // what only the GPU wrote is gone: every program draws again (K6)
             self.redraw();
         }
+        self.toggle_settle();
         if let Err(err) = self.process_ctrl_queue() {
             error!("gpu: control queue: {err}");
         }
@@ -2636,19 +3102,43 @@ impl Gpu {
             }
         }
         self.unpark(&mem, 0, -1);
-        if n != 0 {
-            self.log_info(&format!(
-                "spacebox remote gpu: {n} commands of the lost renderer were answered here"
-            ));
-        }
+        self.answered_lost += n as u64;
+        self.say_answered_lost();
     }
 
-    /// Renderer `ci` ends on purpose: with a CPU renderer the guest's state moves there first.
+    /// The line about the commands of a lost renderer answered here, at most once a second with
+    /// their count since the last line (with no renderer every run of the control queue answers
+    /// some: about 900 lines in the first 10 s of a boot with no screen, G3's F2).
+    fn say_answered_lost(&mut self) {
+        let now = now_us();
+        if self.answered_lost == 0 || now - self.answered_lost_said < 1_000_000 {
+            return;
+        }
+        let n = std::mem::take(&mut self.answered_lost);
+        self.answered_lost_said = now;
+        self.log_info(&format!(
+            "spacebox remote gpu: {n} commands of the lost renderer were answered here"
+        ));
+    }
+
+    /// Renderer `ci` ends on purpose: with an in-guest renderer that is connected (or whose
+    /// connection waits) the guest's state moves there first; with none there, the renderer
+    /// ends at once and the guest is served alone until the in-guest renderer takes over.
     fn detach(&mut self, ci: usize) {
         self.conns[ci].detaching = true;
+        if ci == USER {
+            // it ends: the toggle ends with it
+            self.gpu_off = false;
+            self.gpu_on_pending = false;
+        }
         self.log_info(&format!("spacebox remote gpu: {} detaches", CONN_NAMES[ci]));
-        if ci == self.active && self.switch.is_none() && ci == USER && self.conns.len() > CPU {
-            self.start_switch(Some(USER), CPU, "the user's renderer detached");
+        if ci == self.active
+            && self.switch.is_none()
+            && ci == USER
+            && self.has_fallback()
+            && self.conns[GUEST].link.reachable()
+        {
+            self.start_switch(Some(USER), GUEST, "the user's renderer detached");
         } else if self.switch.as_ref().is_none_or(|s| s.from != Some(ci)) {
             // nothing to take from it; the next renderer gets the state from the journal
             self.send_on(ci, true, SP_BYE, 0, &[], &[], 0, 0, 0);
@@ -2681,6 +3171,15 @@ impl Gpu {
             }
             c.rx_id = h.id;
         }
+        if h.typ == SP_SPEC_REPLY {
+            self.spec_reply(ci, &h, &a);
+            return;
+        }
+        if !self.conns[ci].spec_ok {
+            // a renderer that has not said that it can do the spec is sent nothing and takes
+            // nothing
+            return;
+        }
         if h.typ != SP_ACK {
             self.rx_delay(h.t_us);
             self.dispatch(ci, &h, &a, &b);
@@ -2699,10 +3198,14 @@ impl Gpu {
             return;
         }
         c.link.disconnect();
-        // While the CPU renderer runs, the user's socket is tried every 250 ms, and a forward
+        // While the in-guest renderer runs, the user's socket is tried every 250 ms, and a forward
         // with no renderer behind it takes the connection and closes it: that is not a loss.
-        let was_up = c.hello_done;
+        let was_up = c.hello_done && c.spec_ok;
         c.hello_done = false;
+        if !c.spec_ok {
+            // a pairing whose renderer had not answered the spec starts again
+            c.peer_session = 0;
+        }
         if was_up {
             // the 10 s of the takeover count from the last time it ran
             c.lost_at = now_us();
@@ -2719,22 +3222,36 @@ impl Gpu {
         if wanted {
             self.retry_timer.arm(RECONNECT, None);
         }
-        let Some(sw) = self.switch.as_mut() else {
-            return;
-        };
-        if sw.to == ci {
-            // it starts again from the beginning when it is back
-            sw.phase = Phase::Connect;
-            self.conns[ci].peer_session = 0;
-        } else if sw.from == Some(ci) {
-            // a planned switch whose old renderer went: what only the GPU wrote is lost
-            sw.from = None;
-            sw.scanout = None;
-            self.drop_pending();
-            if self.conns[self.switch.as_ref().unwrap().to].up() {
-                self.switch_reset();
+        if ci == GUEST {
+            self.stream_on = false;
+        }
+        if ci == USER && was_up && (self.gpu_off || self.gpu_on_pending) {
+            // a sudden loss with the toggle off: the in-guest renderer runs the guest on, with no
+            // pictures; the user's renderer that comes back is a new pairing, which starts with
+            // the toggle on
+            self.gpu_off = false;
+            self.gpu_on_pending = false;
+            self.conns[USER].peer_session = 0;
+            self.log_info(
+                "spacebox remote gpu: the user's renderer is lost while the GPU acceleration is off: the in-guest renderer runs the guest on, with no pictures",
+            );
+        }
+        if let Some(sw) = self.switch.as_mut() {
+            if sw.to == ci {
+                // it starts again from the beginning when it is back
+                sw.phase = Phase::Connect;
+                self.conns[ci].peer_session = 0;
+            } else if sw.from == Some(ci) {
+                // a planned switch whose old renderer went: what only the GPU wrote is lost
+                sw.from = None;
+                sw.scanout = None;
+                self.drop_pending();
+                if self.conns[self.switch.as_ref().unwrap().to].up() {
+                    self.switch_reset();
+                }
             }
         }
+        self.toggle_settle();
     }
 
     /// Handle what renderer `ci`'s reader thread passed on.
@@ -2776,19 +3293,24 @@ impl Gpu {
             if c.link.is_connected() || !c.wanted {
                 continue;
             }
+            if c.refused && now_us() - c.refused_at < SPEC_RETRY_US {
+                again = true;
+                continue;
+            }
             let hello = Hdr {
                 typ: SP_HELLO,
                 arg0: self.session,
                 arg1: c.peer_session,
                 arg2: c.rx_id,
                 seq: if c.restored { c.link.lock().q.tx_id } else { 0 },
-                flags: if c.link.z_level() != 0 { SP_F_ZSTD } else { 0 }
+                flags: SP_F_SPEC
+                    | if c.link.z_level() != 0 { SP_F_ZSTD } else { 0 }
                     | if self.agent.is_some() { SP_F_SCROLL } else { 0 }
                     | if c.restored { SP_F_RESTORED } else { 0 },
                 ..Default::default()
             };
             if self.conns[ci].link.connect(&hello) {
-                // The user's socket is tried every 250 ms while the CPU renderer runs; say so
+                // The user's socket is tried every 250 ms while the in-guest renderer runs; say so
                 // only for the renderer that runs the guest.
                 if ci == self.active {
                     let msg = format!(
@@ -2812,15 +3334,16 @@ impl Gpu {
         self.notify_used();
     }
 
-    /// With a CPU renderer: the user's renderer that is gone, or silent with work pending,
-    /// for 10 s is replaced by the CPU renderer.
+    /// With an in-guest renderer: the user's renderer that is gone, or silent with work pending,
+    /// for 10 s is replaced by the in-guest renderer.
     fn check_takeover(&mut self) {
-        if self.conns.len() <= CPU
+        if !self.has_fallback()
             || self.switch.is_some()
             || self.active != USER
             || self.saved_wanted.is_some()
         {
-            // (not while the VM is paused after a snapshot: the connections are closed)
+            // (not while the VM is paused after a snapshot: the connections are closed; not to
+            // an in-guest renderer that cannot do the spec)
             return;
         }
         let now = now_us();
@@ -2845,7 +3368,7 @@ impl Gpu {
         }
         // it starts empty when it comes back
         self.conns[USER].peer_session = 0;
-        self.start_switch(None, CPU, "the user's renderer was gone for 10 s");
+        self.start_switch(None, GUEST, "the user's renderer was gone for 10 s");
     }
 
     /// `sp_ack_timer`, every 100 ms.
@@ -2875,8 +3398,13 @@ impl Gpu {
             self.redraw();
         }
         self.check_takeover();
+        self.say_answered_lost();
+        if self.gpu_off && self.active == USER && self.switch.is_none() {
+            // a toggle off that waits for the in-guest renderer's link
+            self.toggle_settle();
+        }
         // the wait for a first or a lost renderer may have ended with commands waiting
-        if self.conns[self.active].hello_done {
+        if self.conns[self.active].up() {
             self.alone_said = false;
         } else if self.alone()
             && let Err(err) = self.process_ctrl_queue()
@@ -2904,6 +3432,10 @@ impl Gpu {
     /// connection, and the connections close: what a renderer sends from now on is for the
     /// VM that resumes (it reconnects, `kick`), not for the snapshot.
     fn save_prepare(&mut self) {
+        if self.active == GUEST {
+            self.guest_save_prepare();
+            return;
+        }
         let t0 = now_us();
         self.saving = true;
         loop {
@@ -2985,6 +3517,30 @@ impl Gpu {
         self.saving = false;
     }
 
+    /// Before a snapshot while the in-guest renderer runs the guest: its state is in the guest's
+    /// memory, which the snapshot holds at this same instant, so nothing is waited for and nothing
+    /// is exported (with the vCPUs paused it could not answer anyway). After a restore it connects
+    /// again and resumes; a renderer that takes the guest from it later gets what its GPU drew by
+    /// a planned switch. The snapshot is a mark point, and the connections close, as always.
+    fn guest_save_prepare(&mut self) {
+        self.scanout_saved = Vec::new();
+        self.saved_missing = Vec::new();
+        let wanted = self.conns.iter().map(|c| c.wanted).collect();
+        let pending = self.pending.len();
+        for c in &mut self.conns {
+            c.marked.clear();
+            c.wanted = false;
+            if c.link.is_connected() {
+                c.link.disconnect();
+                c.hello_done = false;
+            }
+        }
+        self.saved_wanted.get_or_insert(wanted);
+        self.log_info(&format!(
+            "spacebox remote gpu: snapshot: the in-guest renderer runs the guest; its state is in the guest's memory: nothing waited for or exported ({pending} commands not answered go with the state)"
+        ));
+    }
+
     /// The stop of a move (a snapshot of the state only): the guest goes on at the destination,
     /// whose device resumes the same renderer, so nothing is waited for and nothing is exported
     /// (what was not answered or acknowledged is in the state and goes on there). The stop is a
@@ -3037,7 +3593,13 @@ impl Gpu {
         if let Some(w) = self.saved_wanted.take() {
             for (c, w) in self.conns.iter_mut().zip(w) {
                 c.wanted = w;
-                c.lost_at = now_us();
+            }
+        }
+        // the waits for a renderer that is not there count from the VM's resume (a restored
+        // device was made long before it may run)
+        for c in &mut self.conns {
+            if !c.up() {
+                c.lost_at = now;
             }
         }
         self.retry_timer.arm(Duration::from_millis(1), None);
@@ -3047,6 +3609,28 @@ impl Gpu {
             error!("gpu: cursor queue: {err}");
         }
         self.notify_used();
+    }
+
+    /// What the test of a checkpoint's consistency reads of the device at each stop of the guest
+    /// (`crate::devices::screen`): the in-guest renderer's pictures passed on since the start, and
+    /// the last message id sent to and received from each renderer, and what the in-guest
+    /// renderer's link has in flight.
+    pub(crate) fn traffic(&self) -> GpuTraffic {
+        let ids = |ci: usize| {
+            self.conns
+                .get(ci)
+                .map_or((0, 0), |c| (c.link.lock().q.tx_id, c.rx_id))
+        };
+        let in_flight = self.conns.get(GUEST).map_or((0, 0), |c| {
+            let st = c.link.lock();
+            (st.q.unacked as u64, st.q.backlog as u64)
+        });
+        GpuTraffic {
+            pictures: self.pictures_all,
+            user: ids(USER),
+            guest: ids(GUEST),
+            guest_in_flight: in_flight,
+        }
     }
 
     /// `sp_stats`, every 5 s: the same lines as the QEMU source, so that the same tools read
@@ -3117,7 +3701,7 @@ impl Gpu {
         }
         let rtt_min = self.rtt_min_cur.min(self.rtt_min_prev);
         pend.push_str(&format!(
-            " last_seq={} answered_here={} fence_early={} waited={} fence_out={} rtt_ms={:.1} not_sent={} not_sent_bytes={} early_by_age={} rtt_min_ms={:.1}",
+            " last_seq={} answered_here={} fence_early={} waited={} fence_out={} rtt_ms={:.1} not_sent={} not_sent_bytes={} early_by_age={} rtt_min_ms={:.1} early_by_video_age={}",
             self.seq,
             c.n_local,
             c.n_early,
@@ -3127,7 +3711,8 @@ impl Gpu {
             c.n_defer,
             c.defer_bytes,
             c.n_ahead,
-            if rtt_min == i64::MAX { 0.0 } else { ms(rtt_min) }
+            if rtt_min == i64::MAX { 0.0 } else { ms(rtt_min) },
+            c.n_ahead_video
         ));
         lines.push(pend);
         for i in 0..64 {
@@ -3184,15 +3769,24 @@ impl Gpu {
             Some(_) => "down",
         };
         lines.push(format!(
-            "[SPACEBOX-REMOTE] source renderers: active={} switch={} switches={} user={} cpu={}",
-            if self.active == USER { "user" } else { "cpu" },
+            "[SPACEBOX-REMOTE] source renderers: active={} switch={} switches={} user={} guest={}",
+            if self.active == USER { "user" } else { "guest" },
             self.switch.as_ref().map_or_else(
                 || "none".into(),
                 |s| format!("{:?}", s.phase).to_lowercase()
             ),
             self.n_switch,
             up(USER),
-            up(CPU)
+            up(GUEST)
+        ));
+        lines.push(format!(
+            "[SPACEBOX-REMOTE] source toggle: gpu={} stream={} pictures={} picture_bytes={} dropped={} late={}",
+            if self.gpu_off { "off" } else { "on" },
+            u32::from(self.stream_on),
+            self.counters.n_picture,
+            self.counters.picture_bytes,
+            self.counters.pictures_dropped,
+            self.counters.pictures_late
         ));
         let j = self.journal.stats();
         lines.push(format!(
@@ -3242,6 +3836,7 @@ impl Gpu {
         c.n_early = 0;
         c.n_waited = 0;
         c.n_ahead = 0;
+        c.n_ahead_video = 0;
         c.n_defer = 0;
         c.defer_bytes = 0;
         c.n_ctrl = 0;
@@ -3254,6 +3849,10 @@ impl Gpu {
         c.n_back = 0;
         c.back_bytes = 0;
         c.tx_bytes = 0;
+        c.n_picture = 0;
+        c.picture_bytes = 0;
+        c.pictures_dropped = 0;
+        c.pictures_late = 0;
         for l in lines {
             self.report(&l);
         }
@@ -3281,6 +3880,18 @@ impl VirtioDevice for Gpu {
 
     fn queue_event(&self, index: usize) -> Option<&EventFd> {
         self.queue_events.get(index)
+    }
+
+    fn queue_positions(&self) -> Vec<(u16, u16)> {
+        crate::devices::virtio::device::positions_of(&self.queues)
+    }
+
+    fn watched_ranges(&self) -> Vec<(usize, GuestAddress, usize, &'static str)> {
+        crate::devices::virtio::device::watched_of(&self.queues)
+    }
+
+    fn queue_pending(&self) -> Vec<u16> {
+        crate::devices::virtio::device::pending_of(&self.queues)
     }
 
     fn reset_queues(&mut self) {
