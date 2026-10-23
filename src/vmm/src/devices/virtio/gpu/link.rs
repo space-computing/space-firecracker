@@ -8,7 +8,8 @@
 //!
 //! - The resend queue ([`TxQueue`]): reliable messages stay in it until the peer acknowledges
 //!   them, so that a new connection can continue where the old one stopped (as `tx_queue` of
-//!   the QEMU source).
+//!   the QEMU source). Beside it, the lane of the pieces of large writes (`SP_PIECE`), which go
+//!   into the queue one at a time, after everything else in it, while the peer keeps up.
 //! - A writer thread (`fc_gpu_tx`) that takes the next message of the queue, compresses it when
 //!   the connection is compressed, and writes it.
 //! - A reader thread (`fc_gpu_rx`) that reads, takes the peer's HELLO out first, uncompresses,
@@ -36,9 +37,16 @@ use std::thread;
 use gpu_journal::Blob;
 use vmm_sys_util::eventfd::EventFd;
 
-use super::protocol::{Filter, HDR_LEN, Hdr, SP_F_ZSTD, SP_HELLO, ZPacker, ZUnpacker};
+use super::protocol::{Filter, HDR_LEN, Hdr, SP_F_ZSTD, SP_HELLO, SP_RXB, ZPacker, ZUnpacker};
 use crate::logger::error;
 use crate::seccomp::BpfProgram;
+
+/// The writer takes the next piece of the lane only while less than this many bytes that it
+/// wrote on the connection are not yet read by the peer (its `SP_RXB`). Without that the pieces
+/// would fill the socket's, the forward's and TCP's buffers at once, and a small message would
+/// wait behind them again. A small message waits about 22 ms behind 256 KiB at the link's
+/// 11.5 MB/s, and the link stays full while the round trip is under about 20 ms.
+pub(crate) const PIECE_WINDOW: u64 = 256 << 10;
 
 /// Monotonic clock in microseconds (`g_get_monotonic_time`).
 pub(crate) fn now_us() -> i64 {
@@ -80,6 +88,18 @@ pub(crate) struct TxBuf {
     pub filter: Option<Filter>,
 }
 
+/// A piece of a large write, not given to the queue yet: it gets its id when it is.
+#[derive(Debug)]
+struct LanePiece {
+    data: Vec<u8>,
+    ack: u64,
+    t_us: i64,
+    filter: Option<Filter>,
+    /// The write it belongs to (the id of its notice), and whether it is its last piece.
+    w: u64,
+    last: bool,
+}
+
 #[derive(Debug)]
 struct TxEntry {
     buf: Arc<TxBuf>,
@@ -102,6 +122,13 @@ pub(crate) struct TxQueue {
     pub unacked: usize,
     /// The last reliable id given out.
     pub tx_id: u64,
+    /// The pieces of large writes not in the queue yet, and their bytes.
+    lane: VecDeque<LanePiece>,
+    pub lane_bytes: usize,
+    /// The writes whose last piece is in the queue, with that piece's id, oldest first.
+    w_queued: VecDeque<(u64, u64)>,
+    /// The newest write whose last piece the peer has acknowledged (it has all of it).
+    pub w_acked: u64,
 }
 
 impl TxQueue {
@@ -137,6 +164,57 @@ impl TxQueue {
         id
     }
 
+    /// Queue a piece of a large write `w` in the lane (its id and `ack` are written when it goes
+    /// into the queue).
+    pub(crate) fn push_piece(
+        &mut self,
+        data: Vec<u8>,
+        ack: u64,
+        t_us: i64,
+        filter: Option<Filter>,
+        w: u64,
+        last: bool,
+    ) {
+        self.lane_bytes += data.len();
+        self.lane.push_back(LanePiece {
+            data,
+            ack,
+            t_us,
+            filter,
+            w,
+            last,
+        });
+    }
+
+    /// Move the lane's next piece into the queue; false if the lane is empty. Its time is
+    /// that of now (the peer's lateness of a message is taken from it; the pieces wait in the
+    /// lane on purpose).
+    pub(crate) fn feed(&mut self) -> bool {
+        let Some(mut p) = self.lane.pop_front() else {
+            return false;
+        };
+        self.lane_bytes -= self.lane_bytes.min(p.data.len());
+        let t_us = if p.t_us == 0 { 0 } else { now_us() };
+        p.data[64..72].copy_from_slice(&t_us.to_le_bytes());
+        let id = self.push(p.data, true, p.ack, t_us, p.filter);
+        if p.last {
+            self.w_queued.push_back((p.w, id));
+        }
+        true
+    }
+
+    /// Every piece of the lane into the queue (before a snapshot, so that what it keeps as not
+    /// acknowledged is the whole stream).
+    pub(crate) fn flush_lane(&mut self) {
+        while self.feed() {}
+    }
+
+    /// Drop the pieces of the lane (the peer drops the writes they belong to: a state reset).
+    pub(crate) fn drop_lane(&mut self) {
+        self.lane.clear();
+        self.lane_bytes = 0;
+    }
+
     /// The next message to write, marked as being written.
     pub(crate) fn take(&mut self) -> Option<Arc<TxBuf>> {
         if !self.enabled || self.next >= self.entries.len() {
@@ -170,6 +248,13 @@ impl TxQueue {
 
     /// The peer has everything up to `id`: drop it (`sp_acked`).
     pub(crate) fn acked(&mut self, id: u64) {
+        while let Some(&(w, last)) = self.w_queued.front() {
+            if last > id {
+                break;
+            }
+            self.w_acked = w;
+            self.w_queued.pop_front();
+        }
         let mut i = 0;
         while i < self.next && i < self.entries.len() {
             let e = &self.entries[i];
@@ -248,6 +333,9 @@ impl TxQueue {
         self.backlog = 0;
         self.unacked = 0;
         self.tx_id = 0;
+        self.drop_lane();
+        self.w_queued.clear();
+        self.w_acked = 0;
     }
 
     #[cfg(test)]
@@ -270,6 +358,12 @@ impl TxQueue {
                 )
             })
             .collect()
+    }
+
+    /// The compression filter of each queued message.
+    #[cfg(test)]
+    pub(crate) fn filters(&self) -> Vec<Option<Filter>> {
+        self.entries.iter().map(|e| e.buf.filter).collect()
     }
 
     #[cfg(test)]
@@ -304,6 +398,14 @@ pub(crate) struct LinkState {
     pub wire_tx: u64,
     /// Time from queueing a message to having written it.
     pub txd: DelayStat,
+    /// Both ends offered pieces (set with the peer's HELLO): the writer feeds the lane.
+    pub pieces_on: bool,
+    /// Bytes of messages written on this connection, and the peer's last report of the bytes
+    /// it has read of them (`SP_RXB`).
+    pub conn_tx: u64,
+    pub peer_rx: u64,
+    /// Pieces written (since the last statistics).
+    pub n_pieces: u64,
 }
 
 #[derive(Debug)]
@@ -387,6 +489,10 @@ impl Link {
                 z_on: false,
                 wire_tx: 0,
                 txd: DelayStat::default(),
+                pieces_on: false,
+                conn_tx: 0,
+                peer_rx: 0,
+                n_pieces: 0,
             }),
             tx_cond: Condvar::new(),
             rx_cond: Condvar::new(),
@@ -538,6 +644,9 @@ impl Link {
             st.cgen += 1;
             st.q.enabled = false;
             st.z_on = false;
+            st.pieces_on = false;
+            st.conn_tx = 0;
+            st.peer_rx = 0;
             st.cgen
         };
         self.stream = Some(s.clone());
@@ -573,6 +682,48 @@ impl Link {
         self.lock().z_on = z_on;
     }
 
+    /// Whether the current connection takes pieces (both ends offered them).
+    pub(crate) fn set_pieces(&self, on: bool) {
+        self.lock().pieces_on = on;
+        self.shared.tx_cond.notify_one();
+    }
+
+    pub(crate) fn pieces_on(&self) -> bool {
+        self.lock().pieces_on
+    }
+
+    /// Queue a piece of a large write in the lane (see [`TxQueue::push_piece`]).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn push_piece(
+        &self,
+        data: Vec<u8>,
+        ack: u64,
+        t_us: i64,
+        filter: Option<Filter>,
+        w: u64,
+        last: bool,
+    ) {
+        self.lock().q.push_piece(data, ack, t_us, filter, w, last);
+        self.shared.tx_cond.notify_one();
+    }
+
+    pub(crate) fn flush_lane(&self) {
+        self.lock().q.flush_lane();
+        self.shared.tx_cond.notify_one();
+    }
+
+    pub(crate) fn drop_lane(&self) {
+        self.lock().q.drop_lane();
+    }
+
+    pub(crate) fn lane_bytes(&self) -> usize {
+        self.lock().q.lane_bytes
+    }
+
+    pub(crate) fn w_acked(&self) -> u64 {
+        self.lock().q.w_acked
+    }
+
     pub(crate) fn forget(&self) {
         self.lock().q.forget();
     }
@@ -585,7 +736,7 @@ impl Link {
         self.lock().q.backlog
     }
 
-    /// Queue a message (see [`TxQueue::push`]).
+    /// Queue a message (see [`TxQueue::push`]); its id.
     pub(crate) fn push(
         &self,
         data: Vec<u8>,
@@ -593,9 +744,10 @@ impl Link {
         ack: u64,
         t_us: i64,
         filter: Option<Filter>,
-    ) {
-        self.lock().q.push(data, reliable, ack, t_us, filter);
+    ) -> u64 {
+        let id = self.lock().q.push(data, reliable, ack, t_us, filter);
         self.shared.tx_cond.notify_one();
+        id
     }
 }
 
@@ -606,10 +758,19 @@ fn writer(sh: &Shared, mut dump: Option<File>) {
         let (buf, stream, compress, cgen) = {
             let mut st = sh.st.lock().unwrap();
             loop {
-                if st.conn.is_some()
-                    && let Some(b) = st.q.take()
-                {
-                    break (b, st.conn.clone().unwrap(), st.z_on, st.cgen);
+                if st.conn.is_some() {
+                    if let Some(b) = st.q.take() {
+                        break (b, st.conn.clone().unwrap(), st.z_on, st.cgen);
+                    }
+                    // the queue is written: the next piece, while the peer keeps up
+                    if st.q.enabled
+                        && st.pieces_on
+                        && st.conn_tx.saturating_sub(st.peer_rx) < PIECE_WINDOW
+                        && st.q.feed()
+                    {
+                        st.n_pieces += 1;
+                        continue;
+                    }
                 }
                 st = sh.tx_cond.wait(st).unwrap();
             }
@@ -646,6 +807,9 @@ fn writer(sh: &Shared, mut dump: Option<File>) {
         }
         let mut st = sh.st.lock().unwrap();
         st.wire_tx += done as u64;
+        if cgen == st.cgen && done == wire.len() {
+            st.conn_tx += buf.data.len() as u64;
+        }
         st.txd.add(now_us() - buf.t_us);
         st.q.written(&buf);
     }
@@ -722,6 +886,17 @@ fn reader(sh: &Shared, out: &Sender<RxEvent>, ev: &EventFd) {
                     let total = hdr.total();
                     if rx.len() - off < total {
                         break;
+                    }
+                    if hdr.typ == SP_RXB {
+                        // the peer's reading, for the writer's pacing of the pieces
+                        let mut st = sh.st.lock().unwrap();
+                        if st.cgen == cgen {
+                            st.peer_rx = st.peer_rx.max(hdr.arg0);
+                        }
+                        drop(st);
+                        sh.tx_cond.notify_one();
+                        off += total;
+                        continue;
                     }
                     let a_end = off + HDR_LEN + hdr.a_len as usize;
                     let msg = RxEvent::Msg {
@@ -858,6 +1033,152 @@ mod tests {
         q.start(0);
         assert_eq!(q.push(msg(0), true, 0, 0, None), 1);
         assert!(q.take().is_some());
+    }
+
+    fn id_of(b: &TxBuf) -> u64 {
+        u64::from_le_bytes(b.data[8..16].try_into().unwrap())
+    }
+
+    fn ack_of(b: &TxBuf) -> u64 {
+        u64::from_le_bytes(b.data[16..24].try_into().unwrap())
+    }
+
+    #[test]
+    fn pieces_go_after_the_queue_and_get_ids_in_the_order_of_the_wire() {
+        let mut q = TxQueue::default();
+        q.start(0);
+        q.push(msg(0), true, 0, 0, None);
+        q.push_piece(msg(10), 3, 0, None, 7, false);
+        q.push_piece(msg(10), 3, 0, None, 7, true);
+        assert_eq!(q.lane_bytes, 180);
+        // pieces are not in the queue: neither written nor counted as not acknowledged
+        assert_eq!(q.backlog, 80);
+        assert_eq!(q.unacked, 80);
+        let a = q.take().unwrap();
+        assert_eq!(id_of(&a), 1);
+        assert!(q.take().is_none());
+        // a message queued later still goes before the next piece
+        q.push(msg(0), true, 0, 0, None);
+        assert_eq!(id_of(&q.take().unwrap()), 2);
+        assert!(q.feed());
+        let c = q.take().unwrap();
+        assert_eq!((id_of(&c), ack_of(&c)), (3, 3));
+        assert!(q.feed());
+        assert_eq!(id_of(&q.take().unwrap()), 4);
+        assert!(!q.feed());
+        assert_eq!(q.lane_bytes, 0);
+        // the write is whole at the peer when its last piece is acknowledged
+        q.acked(3);
+        assert_eq!(q.w_acked, 0);
+        q.acked(4);
+        assert_eq!(q.w_acked, 7);
+    }
+
+    #[test]
+    fn the_lane_goes_into_the_queue_for_a_snapshot_and_is_dropped_at_a_reset_or_a_new_peer() {
+        let mut q = TxQueue::default();
+        q.start(0);
+        q.push_piece(msg(1), 0, 0, None, 1, false);
+        q.push_piece(msg(1), 0, 0, None, 1, true);
+        q.flush_lane();
+        assert_eq!(q.ids(), vec![1, 2]);
+        assert_eq!(q.unacked_messages().len(), 2);
+        assert_eq!(q.lane_bytes, 0);
+        q.push_piece(msg(1), 0, 0, None, 3, true);
+        q.drop_lane();
+        assert!(!q.feed());
+        assert_eq!(q.lane_bytes, 0);
+        q.push_piece(msg(1), 0, 0, None, 4, true);
+        q.acked(2);
+        assert_eq!(q.w_acked, 1);
+        q.forget();
+        assert_eq!(q.w_acked, 0);
+        assert!(!q.feed());
+        assert_eq!(q.lane_bytes, 0);
+    }
+
+    /// Read what the device writes until nothing comes for `quiet`; the plain bytes after the
+    /// HELLO.
+    fn read_quiet(s: &mut UnixStream, quiet: std::time::Duration) -> usize {
+        s.set_read_timeout(Some(quiet)).unwrap();
+        let mut buf = vec![0u8; 1 << 20];
+        let mut n = 0;
+        loop {
+            match s.read(&mut buf) {
+                Ok(0) => break,
+                Ok(k) => n += k,
+                Err(_) => break,
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn the_writer_paces_the_pieces_by_the_peers_reading() {
+        let dir = std::env::temp_dir().join(format!("fc-gpu-lane-{}", std::process::id()));
+        let _ = std::fs::remove_file(&dir);
+        let listener = UnixListener::bind(&dir).unwrap();
+        let mut link = Link::new(
+            "t",
+            dir.to_string_lossy().into(),
+            0,
+            Arc::new(Vec::new()),
+            None,
+        )
+        .unwrap();
+        assert!(link.connect(&Hdr {
+            typ: SP_HELLO,
+            ..Default::default()
+        }));
+        let (mut peer, _) = listener.accept().unwrap();
+        // the peer's HELLO
+        peer.write_all(
+            &Hdr {
+                typ: SP_HELLO,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .unwrap();
+        link.start(false, 0);
+        link.set_pieces(true);
+        let piece = 64 << 10;
+        for k in 0..10 {
+            link.push_piece(msg(piece), 0, 0, None, 1, k == 9);
+        }
+        let quiet = std::time::Duration::from_millis(300);
+        // the HELLO, then pieces up to the window
+        let got = read_quiet(&mut peer, quiet) - HDR_LEN;
+        let one = HDR_LEN + piece;
+        let window = usize::try_from(PIECE_WINDOW).unwrap();
+        assert!(got >= window && got <= window + one, "{got}");
+        // a small message is not held behind the lane
+        link.push(msg(0), true, 0, 0, None);
+        assert_eq!(read_quiet(&mut peer, quiet), HDR_LEN);
+        // the peer's reading lets more go
+        let report = |n: usize| {
+            Hdr {
+                typ: SP_RXB,
+                arg0: n as u64,
+                ..Default::default()
+            }
+            .encode()
+        };
+        let mut read = got + HDR_LEN;
+        peer.write_all(&report(read)).unwrap();
+        let more = read_quiet(&mut peer, quiet);
+        assert!(more >= one, "{more}");
+        read += more;
+        // and so on to the end
+        while read < 10 * one + HDR_LEN {
+            peer.write_all(&report(read)).unwrap();
+            let k = read_quiet(&mut peer, quiet);
+            assert!(k > 0);
+            read += k;
+        }
+        assert_eq!(read, 10 * one + HDR_LEN);
+        assert_eq!(link.lane_bytes(), 0);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
