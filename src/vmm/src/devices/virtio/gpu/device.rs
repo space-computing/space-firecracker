@@ -56,6 +56,7 @@ use vmm_sys_util::eventfd::EventFd;
 use super::agent::Agent;
 use super::input::{Input, InputKind, translate};
 use super::link::{DelayStat, Link, RxEvent, now_us};
+use super::protocol::EXPECT_LEN;
 use super::protocol::{
     Filter, HDR_LEN, Hdr, SP_ACK, SP_AUDIO, SP_BYE, SP_CTRL, SP_CURSOR, SP_DETACH, SP_DISPLAY,
     SP_EXPECT, SP_EXPORT, SP_EXPORT_DATA, SP_EXPORT_DONE, SP_F_RESTORED, SP_F_SCROLL, SP_F_SPEC,
@@ -63,7 +64,7 @@ use super::protocol::{
     SP_MEMWRITE, SP_PICTURE, SP_RESET, SP_RESP, SP_SCROLL, SP_SPEC, SP_SPEC_REPLY, SP_STATE_KEPT,
     SP_STATE_RESET, SP_STREAM, SP_WMARK, push_expect, u32_at, u64_at,
 };
-use super::protocol::{HOLD_UNKNOWN, SP_F_PIECES, SP_HOLD, SP_PIECE};
+use super::protocol::{HOLD_READS_UNKNOWN, HOLD_UNKNOWN, SP_F_PIECES, SP_HOLD, SP_PIECE};
 use super::spec::Spec;
 use super::{CTRL_QUEUE, CURSOR_QUEUE, GPU_NUM_QUEUES};
 use crate::devices::virtio::ActivateError;
@@ -177,6 +178,9 @@ type Piece = (Vec<u8>, Vec<u8>);
 const HOLD_MIN: usize = 256 << 10;
 /// The size of a piece of such a write.
 const PIECE: usize = 64 << 10;
+/// The guest's commands are taken while less than this many transmit limits wait in the lane
+/// (a 2160p video's player decodes several pictures of 2 to 4 MB ahead at once).
+const LANE_LIMITS: usize = 8;
 
 /// What the device's last save was readied for (`prepare_save`, `prepare_move`,
 /// `prepare_checkpoint`): the saved state says what a rollback to it lacks.
@@ -258,6 +262,28 @@ struct MemWrite {
     data: Vec<u8>,
     watch: u64,
     hint: Option<Hint>,
+}
+
+/// What a command touches, for its notice ([`Gpu::touches`]): the resources it writes (the first
+/// `writes` of `list`), then those it reads, if they are known.
+#[derive(Debug)]
+struct Touches {
+    list: Vec<u32>,
+    writes: usize,
+    reads_known: bool,
+}
+
+impl Touches {
+    /// The notice's arg2 and a.
+    fn notice(t: Option<&Touches>) -> (u64, Vec<u8>) {
+        match t {
+            Some(t) => (
+                t.writes as u64 | if t.reads_known { 0 } else { HOLD_READS_UNKNOWN },
+                t.list.iter().flat_map(|r| r.to_le_bytes()).collect(),
+            ),
+            None => (HOLD_UNKNOWN, Vec::new()),
+        }
+    }
 }
 
 /// A guest command not answered yet: where its answer goes.
@@ -470,6 +496,10 @@ pub(crate) struct Counters {
     n_held_known: u64,
     n_notice: u64,
     n_answer_kept: u64,
+    /// Command streams with a decode that do more than decode (their touches not known), and the
+    /// last command that made them so.
+    n_decode_other: u64,
+    decode_other: u32,
 }
 
 /// The sound device's samples sent on this connection (since the start).
@@ -571,6 +601,9 @@ pub struct Gpu {
     /// its copies read ([`Self::touches`]).
     scan_decode_only: bool,
     scan_reads: Vec<u32>,
+    /// ... else the first command that is not of such a stream; the stream decodes.
+    scan_other: u32,
+    scan_decodes: bool,
     /// The planes of each context's video buffers: context -> buffer handle -> resources.
     video_planes: HashMap<u32, HashMap<u32, Vec<u32>>>,
     /// The contexts created since this device was made: their video buffers are all known.
@@ -801,6 +834,8 @@ impl Gpu {
             cmd_marks: Vec::new(),
             scan_decode_only: false,
             scan_reads: Vec::new(),
+            scan_other: 0,
+            scan_decodes: false,
             video_planes: HashMap::new(),
             video_known: HashSet::new(),
             n_kept: 0,
@@ -1234,6 +1269,8 @@ impl Gpu {
         let mut i = 0usize;
         self.scan_decode_only = true;
         self.scan_reads.clear();
+        self.scan_other = 0;
+        self.scan_decodes = false;
         while i < ndw {
             let hdr = u32_at(cmds, i * 4);
             let len = (hdr >> 16) as usize;
@@ -1247,13 +1284,20 @@ impl Gpu {
                 *w = u32_at(cmds, (i + k) * 4);
             }
             let bx = [c[6], c[7], c[8], c[9], c[10], c[11]];
-            // A stream that only decodes video: the video commands, and transfers to the renderer
-            // (the bitstream's); what it touches is known ([`Self::touches`]).
+            // A stream that only decodes video: the video commands, and writes to the renderer
+            // (the bitstream's transfers, the description's inline writes), with the choice of
+            // the sub-context (Mesa's VA driver sends it first); what it touches is known
+            // ([`Self::touches`]).
             match cmd {
-                0 | 44 | 53..=61 => {}
+                0 | 9 | 28 | 44 | 53..=61 => {}
                 43 if len >= 13 && c[13] == 1 => {}
                 45 if len >= 14 && c[14] & 2 == 0 => self.scan_reads.push(c[12]),
-                _ => self.scan_decode_only = false,
+                _ => {
+                    if self.scan_decode_only {
+                        self.scan_other = cmd;
+                    }
+                    self.scan_decode_only = false;
+                }
             }
             match cmd {
                 // VIRGL_CCMD_TRANSFER3D: res, level, usage, stride, layer_stride, box, data
@@ -1343,6 +1387,7 @@ impl Gpu {
                 // when it gets this command.
                 59 => {
                     self.video_until = now_us() + 1_000_000;
+                    self.scan_decodes = true;
                     if len >= 5 {
                         if let Some(r) = self.resources.get(&c[3]).filter(|r| r.backing.is_some()) {
                             let n = r.backing_size().min(u64::from(r.width));
@@ -1381,6 +1426,10 @@ impl Gpu {
                 _ => {}
             }
             i += 1 + len;
+        }
+        if self.scan_decodes && !self.scan_decode_only {
+            self.counters.n_decode_other += 1;
+            self.counters.decode_other = self.scan_other;
         }
         !expect.is_empty()
     }
@@ -1913,7 +1962,7 @@ impl Gpu {
         let ctx = u32_at(req, 16);
         let data = writes.iter().map(|m| m.data.len()).sum::<usize>() + extra.len();
         if data >= HOLD_MIN && self.conns[ci].link.pieces_on() {
-            let touch = self.touches(req, marks, &writes);
+            let touch = self.touches(req, marks, &writes, &cmd_marks);
             // the write: the memory writes, then the command, as whole messages with no id; and
             // where picture data is in it, for the compression's filter
             let mut w = Vec::with_capacity(data + req.len() + HDR_LEN * (writes.len() + 1));
@@ -1957,11 +2006,7 @@ impl Gpu {
             if let Some(hint) = hint.filter(|h| h.in_b) {
                 pixels.push((at, w.len(), hint));
             }
-            let (list, arg2) = match &touch {
-                Some((list, n)) => (list.as_slice(), *n as u64),
-                None => (&[][..], HOLD_UNKNOWN),
-            };
-            let a: Vec<u8> = list.iter().flat_map(|r| r.to_le_bytes()).collect();
+            let (arg2, a) = Touches::notice(touch.as_ref());
             for (typ, m) in cmd_marks {
                 self.send(typ, 0, &m, &[], 0, 0, 0);
             }
@@ -2005,7 +2050,7 @@ impl Gpu {
             self.counters.tx_bytes += total + (n * HDR_LEN) as u64;
             self.counters.n_held += 1;
             self.counters.held_bytes += total;
-            self.counters.n_held_known += u64::from(touch.is_some());
+            self.counters.n_held_known += u64::from(touch.is_some_and(|t| t.reads_known));
             return;
         }
         if typ == CMD_SUBMIT_3D
@@ -2013,10 +2058,10 @@ impl Gpu {
                 .ctx_w
                 .get(&ctx)
                 .is_some_and(|&w| w > self.conns[ci].link.w_acked())
-            && let Some((list, n)) = self.touches(req, marks, &writes)
+            && let Some(t) = self.touches(req, marks, &writes, &cmd_marks)
         {
-            let a: Vec<u8> = list.iter().flat_map(|r| r.to_le_bytes()).collect();
-            self.send(SP_HOLD, 0, &a, &[], 0, u64::from(ctx), n as u64);
+            let (arg2, a) = Touches::notice(Some(&t));
+            self.send(SP_HOLD, 0, &a, &[], 0, u64::from(ctx), arg2);
             self.counters.n_notice += 1;
         }
         for m in writes {
@@ -2038,25 +2083,45 @@ impl Gpu {
         self.send(SP_CTRL, seq, req, extra, args[0], args[1], args[2]);
     }
 
-    /// What a command touches, for its notice (`SP_HOLD`): the resources it writes (`marks`),
-    /// then those it reads, and the number of the first. Known for a transfer (it reads nothing
-    /// but its own bytes) and for a command stream that only decodes video: it reads its memory
-    /// writes' buffers, the buffers its copies read, and the planes of its context's video
-    /// buffers (more than the pictures it refers to; known only for a context made since this
-    /// device was: a restored device does not know the buffers of before). None otherwise.
-    fn touches(&self, req: &[u8], marks: &[u32], writes: &[MemWrite]) -> Option<(Vec<u32>, usize)> {
+    /// What a command touches, for its notice (`SP_HOLD`). The resources it writes are known for
+    /// a transfer and for a command stream: those the journal says it may write (`marks`), and
+    /// those whose copy of the guest's memory it writes (its expectations, `cmd_marks`). What it
+    /// reads is known for a transfer (nothing but its own bytes) and for a command stream that only
+    /// decodes video: its memory writes' buffers, the buffers its copies read, and the planes of
+    /// its context's video buffers (more than the pictures it refers to; known only for a context
+    /// made since this device was: a restored device does not know the buffers of before). None
+    /// for the other commands (the sink names their touches itself).
+    fn touches(
+        &self,
+        req: &[u8],
+        marks: &[u32],
+        writes: &[MemWrite],
+        cmd_marks: &[(u32, Vec<u8>)],
+    ) -> Option<Touches> {
         let typ = u32_at(req, 0);
         let ctx = u32_at(req, 16);
         let mut list: Vec<u32> = marks.to_vec();
         match typ {
             CMD_TRANSFER_TO_HOST_2D if req.len() >= 56 => list.push(u32_at(req, 48)),
             CMD_TRANSFER_TO_HOST_3D if req.len() >= 72 => list.push(u32_at(req, 56)),
-            CMD_SUBMIT_3D if self.scan_decode_only && self.video_known.contains(&ctx) => {}
+            CMD_SUBMIT_3D => {}
             _ => return None,
+        }
+        for (t, e) in cmd_marks {
+            if *t == SP_EXPECT {
+                list.extend(e.chunks_exact(EXPECT_LEN).map(|x| u32_at(x, 0)));
+            }
         }
         list.sort_unstable();
         list.dedup();
         let n = list.len();
+        if typ == CMD_SUBMIT_3D && !(self.scan_decode_only && self.video_known.contains(&ctx)) {
+            return Some(Touches {
+                list,
+                writes: n,
+                reads_known: false,
+            });
+        }
         if typ == CMD_SUBMIT_3D {
             let mut reads: Vec<u32> = writes.iter().map(|m| m.res).collect();
             reads.extend_from_slice(&self.scan_reads);
@@ -2067,7 +2132,11 @@ impl Gpu {
             reads.dedup();
             list.extend(reads);
         }
-        Some((list, n))
+        Some(Touches {
+            list,
+            writes: n,
+            reads_known: true,
+        })
     }
 
     fn res_create(&mut self, id: u32, format: u32, width: u32, height: u32) {
@@ -2109,8 +2178,14 @@ impl Gpu {
             self.saved_missing = Vec::new();
         }
         loop {
+            // The lane holds what the pacing has not sent yet (with whole messages that sits in
+            // the socket's and the network's buffers, which the queue's backlog does not count);
+            // it delays only the commands in pieces, not the small messages, so it may hold more.
             let link = &self.conns[self.active].link;
-            if !alone && (link.backlog() > self.tx_limit || link.lane_bytes() > self.tx_limit) {
+            if !alone
+                && (link.backlog() > self.tx_limit
+                    || link.lane_bytes() > LANE_LIMITS * self.tx_limit)
+            {
                 // Let the network drain before taking more work from the guest.
                 self.retry_timer.arm(BACKLOG_RETRY, None);
                 break;
@@ -4101,7 +4176,7 @@ impl Gpu {
         lines.push(pend);
         let n_pieces = std::mem::take(&mut link.lock().n_pieces);
         lines.push(format!(
-            "[SPACEBOX-REMOTE] source pieces: commands_in_pieces={} their_bytes={} known_touches={} notices={} pieces={} lane_bytes={} answers_kept={} kept_now={}",
+            "[SPACEBOX-REMOTE] source pieces: commands_in_pieces={} their_bytes={} known_touches={} notices={} pieces={} lane_bytes={} answers_kept={} kept_now={} decode_streams_not_known={} (command {})",
             c.n_held,
             c.held_bytes,
             c.n_held_known,
@@ -4109,7 +4184,9 @@ impl Gpu {
             n_pieces,
             link.lane_bytes(),
             c.n_answer_kept,
-            self.n_kept
+            self.n_kept,
+            c.n_decode_other,
+            c.decode_other
         ));
         for i in 0..64 {
             if self.ctx_qpoll[i] != 0 {
@@ -4254,6 +4331,7 @@ impl Gpu {
         c.n_held_known = 0;
         c.n_notice = 0;
         c.n_answer_kept = 0;
+        c.n_decode_other = 0;
         for l in lines {
             self.report(&l);
         }

@@ -87,8 +87,9 @@ pub(crate) const SP_GPU_STATE: u32 = 32;
 /// To the sink: the notice of the next command (`SP_CTRL`), what it touches. arg0 = 1: the
 /// command's data and the command come in pieces (`SP_PIECE`), numbered by this message's id;
 /// 0: the command follows as usual. arg1: its GL context (0 = none). arg2: the number of
-/// resources it writes, plus [`HOLD_UNKNOWN`] if what it touches is not known. seq: with pieces,
-/// the bytes of the write. a: `u32[]` the resources it writes, then those it reads.
+/// resources it writes, plus [`HOLD_UNKNOWN`] if what it touches is not known, or
+/// [`HOLD_READS_UNKNOWN`] if only what it reads is not known. seq: with pieces, the bytes of the
+/// write. a: `u32[]` the resources it writes, then those it reads.
 pub(crate) const SP_HOLD: u32 = 33;
 /// To the sink: a piece of the write of the `SP_HOLD` whose id is arg0; arg1 the offset of a in
 /// the write. The write is whole messages (header, a, b; id 0): the command's memory writes, then
@@ -100,6 +101,9 @@ pub(crate) const SP_RXB: u32 = 35;
 /// In `SP_HOLD`'s arg2: what the command touches is not known (the sink treats it as touching
 /// everything).
 pub(crate) const HOLD_UNKNOWN: u64 = 1 << 32;
+/// In `SP_HOLD`'s arg2: the resources it writes are named, those it reads are not known (the sink
+/// treats it as reading everything: what writes waits for it, what only reads passes it).
+pub(crate) const HOLD_READS_UNKNOWN: u64 = 1 << 33;
 /// First message on every connection. arg0 own session, arg1 the peer session it was paired
 /// with (0 = none), arg2 highest id received from that peer.
 pub(crate) const SP_HELLO: u32 = 20;
@@ -130,7 +134,6 @@ pub(crate) const SP_F_PIECES: u64 = 64;
 /// Size of the header on the wire (packed).
 pub(crate) const HDR_LEN: usize = 80;
 /// `struct SpExpect { u32 res; u32 pad; u64 off; u64 len; }`.
-#[cfg(test)]
 pub(crate) const EXPECT_LEN: usize = 24;
 
 /// In `SpZHdr::clen`: an `SpZFilter` follows the header.

@@ -915,9 +915,39 @@ fn video_rig(mem: &GuestMemoryMmap) -> Rig<'_> {
     r
 }
 
-/// A decode (DECODE_BITSTREAM, 59) into video buffer 3 of `size` bytes of bitstream.
+/// A decode into video buffer 3 of `size` bytes of bitstream, as Mesa sends it: the description
+/// written inline (RESOURCE_INLINE_WRITE, 9: 16 bytes into 6), then DECODE_BITSTREAM (59).
 fn decode(fence: Option<u64>, size: u32) -> Vec<u8> {
-    submit(fence, 1, &[(5 << 16) | 59, 1, 3, 6, 7, size])
+    submit(
+        fence,
+        1,
+        &[
+            (1 << 16) | 28,
+            0,
+            (15 << 16) | 9,
+            6,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            16,
+            1,
+            1,
+            1,
+            2,
+            3,
+            4,
+            (5 << 16) | 59,
+            1,
+            3,
+            6,
+            7,
+            size,
+        ],
+    )
 }
 
 #[test]
@@ -931,9 +961,10 @@ fn a_decodes_notice_names_what_it_writes_and_reads_and_its_contexts_later_stream
     let types: Vec<u32> = s.iter().map(|m| m.0.typ).collect();
     assert_eq!(types, vec![SP_WMARK, SP_HOLD]);
     let hold = s[1].0;
-    // it writes the planes; it reads its buffers and every plane of its context's buffers
-    assert_eq!((hold.arg0, hold.arg1, hold.arg2), (1, 1, 2));
-    assert_eq!(u32s(&s[1].1), vec![10, 11, 6, 7, 10, 11]);
+    // it writes the description and the planes; it reads its buffers and every plane of its
+    // context's buffers
+    assert_eq!((hold.arg0, hold.arg1, hold.arg2), (1, 1, 3));
+    assert_eq!(u32s(&s[1].1), vec![6, 10, 11, 6, 7, 10, 11]);
     r.gpu.conns[USER].link.flush_lane();
     let all = r.sent();
     let w = write_of(&all, hold.id);
@@ -948,14 +979,29 @@ fn a_decodes_notice_names_what_it_writes_and_reads_and_its_contexts_later_stream
     let s: Vec<_> = r.sent().into_iter().skip(before).collect();
     let types: Vec<u32> = s.iter().map(|m| m.0.typ).collect();
     assert_eq!(types, vec![SP_HOLD, SP_MEMWRITE, SP_MEMWRITE, SP_CTRL]);
-    assert_eq!((s[0].0.arg0, s[0].0.arg1, s[0].0.arg2), (0, 1, 2));
-    assert_eq!(u32s(&s[0].1), vec![10, 11, 6, 7, 10, 11]);
-    // a stream of the context that does more than decode: what it touches is not known, no
-    // notice
+    assert_eq!((s[0].0.arg0, s[0].0.arg1, s[0].0.arg2), (0, 1, 3));
+    assert_eq!(u32s(&s[0].1), vec![6, 10, 11, 6, 7, 10, 11]);
+    // a stream of the context that does more than decode: a notice of what it writes (here the
+    // buffer whose copy of the guest's memory it writes back, its expectation); what it reads
+    // is not known
     let before = r.sent().len();
     r.give(submit(None, 1, &[(1 << 16) | 50, 6]));
-    let types: Vec<u32> = r.sent()[before..].iter().map(|m| m.0.typ).collect();
-    assert_eq!(types, vec![SP_EXPECT, SP_CTRL]);
+    let s: Vec<_> = r.sent().into_iter().skip(before).collect();
+    let types: Vec<u32> = s.iter().map(|m| m.0.typ).collect();
+    assert_eq!(types, vec![SP_HOLD, SP_EXPECT, SP_CTRL]);
+    assert_eq!(s[0].0.arg2, 1 | HOLD_READS_UNKNOWN);
+    assert_eq!(u32s(&s[0].1), vec![6]);
+    assert_eq!(r.gpu.counters.n_decode_other, 0);
+    // (a stream that decodes and does more is counted, with the command)
+    r.give(submit(
+        None,
+        1,
+        &[(1 << 16) | 50, 6, (5 << 16) | 59, 1, 3, 6, 7, 1000],
+    ));
+    assert_eq!(
+        (r.gpu.counters.n_decode_other, r.gpu.counters.decode_other),
+        (1, 50)
+    );
     // once the renderer has acknowledged the write's last piece, no notice
     let last = all.last().unwrap().0.id;
     r.gpu.conns[USER].link.acked(last);
@@ -963,11 +1009,11 @@ fn a_decodes_notice_names_what_it_writes_and_reads_and_its_contexts_later_stream
     r.give(decode(Some(3), 1000));
     let types: Vec<u32> = r.sent()[before..].iter().map(|m| m.0.typ).collect();
     assert_eq!(types, vec![SP_MEMWRITE, SP_MEMWRITE, SP_CTRL]);
-    assert_eq!(r.gpu.counters.n_notice, 1);
+    assert_eq!(r.gpu.counters.n_notice, 3);
 }
 
 #[test]
-fn a_decode_of_a_context_made_before_the_device_and_a_stream_that_draws_are_not_known() {
+fn a_decode_of_a_context_made_before_the_device_names_what_it_writes_but_not_what_it_reads() {
     let mem = single_region_mem(0x400000);
     let mut r = video_rig(&mem);
     // as after a restore: the context's video buffers of before are not known
@@ -976,8 +1022,8 @@ fn a_decode_of_a_context_made_before_the_device_and_a_stream_that_draws_are_not_
     r.give(decode(None, 0x50000));
     let s: Vec<_> = r.sent().into_iter().skip(before).collect();
     let hold = s.iter().find(|m| m.0.typ == SP_HOLD).unwrap();
-    assert_eq!((hold.0.arg0, hold.0.arg2), (1, HOLD_UNKNOWN));
-    assert!(hold.1.is_empty());
+    assert_eq!((hold.0.arg0, hold.0.arg2), (1, 3 | HOLD_READS_UNKNOWN));
+    assert_eq!(u32s(&hold.1), vec![6, 10, 11]);
     assert_eq!(r.gpu.counters.n_held_known, 0);
 }
 
