@@ -172,6 +172,8 @@ pub struct PendingState {
     pub flags: u32,
     pub fence_id: u64,
     pub ctx_id: u32,
+    /// The renderer's answer, kept until an earlier read back has its data.
+    pub resp: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -484,6 +486,7 @@ impl Persist<'_> for Gpu {
                 flags: p.flags,
                 fence_id: p.fence_id,
                 ctx_id: p.ctx_id,
+                resp: p.resp.clone(),
             })
             .collect();
         pending.sort_by_key(|p| p.seq);
@@ -645,6 +648,7 @@ impl Persist<'_> for Gpu {
             gpu.fence_out += u32::from(p.early);
             gpu.wait_out += u32::from(p.fence_wait);
             gpu.hard_out += u32::from(p.hard);
+            gpu.n_kept += usize::from(p.resp.is_some());
             gpu.pending.insert(
                 p.seq,
                 Pending {
@@ -661,6 +665,7 @@ impl Persist<'_> for Gpu {
                     flags: p.flags,
                     fence_id: p.fence_id,
                     ctx_id: p.ctx_id,
+                    resp: p.resp.clone(),
                 },
             );
         }

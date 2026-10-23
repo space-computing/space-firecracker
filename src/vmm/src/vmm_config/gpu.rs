@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 /// The defaults of the QEMU fork's remote GPU source (`SPACEBOX_GPU_REMOTE_*`).
 const DEFAULT_FENCE_WINDOW: u32 = 8;
 const DEFAULT_FENCE_AGE_MS: u32 = 20;
-const DEFAULT_FENCE_AGE_VIDEO_MS: u32 = 100;
+/// The sink's pacing shows video pictures up to 350 ms late (its allowance's cap while video
+/// plays), so the guest running that far ahead of its answers adds nothing the user sees.
+const DEFAULT_FENCE_AGE_VIDEO_MS: u32 = 350;
 const DEFAULT_TX_LIMIT_MIB: u32 = 8;
 const DEFAULT_ZSTD_LEVEL: i32 = 1;
 const MAX_ZSTD_LEVEL: i32 = 19;
@@ -40,8 +42,9 @@ pub struct GpuConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fence_age_ms: Option<u32>,
     /// The same age while the guest decodes video: from each decode command until one second
-    /// after it (default 100, 0 = not beyond the window). The renderer shows a video's frames
-    /// late on purpose, by the guest's clock, so the guest may run further ahead then.
+    /// after it (default 350, 0 = not beyond the window). The renderer shows a video's frames
+    /// late on purpose, by the guest's clock (up to 350 ms), so the guest may run that far ahead
+    /// then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fence_age_video_ms: Option<u32>,
     /// The device stops taking the guest's commands while more than this many MiB wait to be
@@ -173,7 +176,7 @@ mod tests {
         c.validate().unwrap();
         assert_eq!(c.fence_window(), 8);
         assert_eq!(c.fence_age_us(), 20_000);
-        assert_eq!(c.fence_age_video_us(), 100_000);
+        assert_eq!(c.fence_age_video_us(), 350_000);
         assert_eq!(c.tx_limit_bytes(), 8 << 20);
         assert_eq!(c.zstd_level(), 1);
         // Only the given fields are listed back.
