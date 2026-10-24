@@ -95,8 +95,8 @@ pub(crate) const SP_HOLD: u32 = 33;
 /// the write. The write is whole messages (header, a, b; id 0): the command's memory writes, then
 /// the command.
 pub(crate) const SP_PIECE: u32 = 34;
-/// To the source, not resent: arg0 = the bytes of messages (header, a, b) that the sink has read
-/// on this connection after the source's HELLO. The source paces its pieces by it.
+/// To the source, not resent: arg0 = the bytes that the sink has read on this connection after
+/// the source's HELLO, as on the wire (compressed). The source paces its pieces by it.
 pub(crate) const SP_RXB: u32 = 35;
 /// In `SP_HOLD`'s arg2: what the command touches is not known (the sink treats it as touching
 /// everything).

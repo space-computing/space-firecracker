@@ -42,7 +42,8 @@ use crate::logger::error;
 use crate::seccomp::BpfProgram;
 
 /// The writer takes the next piece of the lane only while less than this many bytes that it
-/// wrote on the connection are not yet read by the peer (its `SP_RXB`). Without that the pieces
+/// wrote on the connection (as on the wire, compressed) are not yet read by the peer (its
+/// `SP_RXB`). Without that the pieces
 /// would fill the socket's, the forward's and TCP's buffers at once, and a small message would
 /// wait behind them again. A small message waits about 22 ms behind 256 KiB at the link's
 /// 11.5 MB/s, and the link stays full while the round trip is under about 20 ms.
@@ -400,8 +401,9 @@ pub(crate) struct LinkState {
     pub txd: DelayStat,
     /// Both ends offered pieces (set with the peer's HELLO): the writer feeds the lane.
     pub pieces_on: bool,
-    /// Bytes of messages written on this connection, and the peer's last report of the bytes
-    /// it has read of them (`SP_RXB`).
+    /// Bytes written on this connection after the HELLO, as on the wire (after compression: the
+    /// pieces take the link's time, not their plain size), and the peer's last report of the
+    /// bytes it has read of them (`SP_RXB`).
     pub conn_tx: u64,
     pub peer_rx: u64,
     /// Pieces written (since the last statistics).
@@ -807,8 +809,8 @@ fn writer(sh: &Shared, mut dump: Option<File>) {
         }
         let mut st = sh.st.lock().unwrap();
         st.wire_tx += done as u64;
-        if cgen == st.cgen && done == wire.len() {
-            st.conn_tx += buf.data.len() as u64;
+        if cgen == st.cgen {
+            st.conn_tx += done as u64;
         }
         st.txd.add(now_us() - buf.t_us);
         st.q.written(&buf);
@@ -1178,6 +1180,48 @@ mod tests {
         }
         assert_eq!(read, 10 * one + HDR_LEN);
         assert_eq!(link.lane_bytes(), 0);
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn the_window_counts_the_bytes_on_the_wire() {
+        // pieces that compress well take little of the link: the writer does not hold them to
+        // the window's plain bytes
+        let dir = std::env::temp_dir().join(format!("fc-gpu-lane-z-{}", std::process::id()));
+        let _ = std::fs::remove_file(&dir);
+        let listener = UnixListener::bind(&dir).unwrap();
+        let mut link = Link::new(
+            "t",
+            dir.to_string_lossy().into(),
+            0,
+            Arc::new(Vec::new()),
+            None,
+        )
+        .unwrap();
+        assert!(link.connect(&Hdr {
+            typ: SP_HELLO,
+            ..Default::default()
+        }));
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.write_all(
+            &Hdr {
+                typ: SP_HELLO,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .unwrap();
+        link.start(true, 0);
+        link.set_pieces(true);
+        let piece = 64 << 10;
+        let n = 16;
+        for k in 0..n {
+            link.push_piece(msg(piece), 0, 0, None, 1, k == n - 1);
+        }
+        let got = read_quiet(&mut peer, std::time::Duration::from_millis(300)) - HDR_LEN;
+        // 1 MiB of plain bytes, four windows, all written with no report from the peer
+        assert_eq!(link.lane_bytes(), 0);
+        assert!(got < usize::try_from(PIECE_WINDOW).unwrap() / 4, "{got}");
         let _ = std::fs::remove_file(&dir);
     }
 
