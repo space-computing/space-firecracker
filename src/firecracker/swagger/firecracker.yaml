@@ -2154,6 +2154,16 @@ definitions:
       dump_path:
         type: string
         description: A file that gets a copy of every message written to the renderer.
+      queue_path:
+        type: string
+        description:
+          A file into which the device writes its queue toward the renderer every queue_ms (one
+          JSON line each; the UI evals' harness). The file is made new.
+      queue_ms:
+        type: integer
+        minimum: 1
+        maximum: 1000
+        description: The period of the queue lines in milliseconds (default 10).
       input:
         type: boolean
         description:
