@@ -770,9 +770,12 @@ impl Gpu {
         )?)];
         if let Some(p) = &cfg.queue_path {
             // the UI evals' harness: the queue toward the user's renderer
-            conns[0]
-                .link
-                .log_queue("fc_gpu", File::create(p)?, cfg.queue_period(), filter.clone())?;
+            conns[0].link.log_queue(
+                "fc_gpu",
+                File::create(p)?,
+                cfg.queue_period(),
+                filter.clone(),
+            )?;
         }
         if let Some(p) = &cfg.guest_renderer_socket_path {
             // Inside the guest: not compressed (memory to memory; zstd would cost the guest's CPU
