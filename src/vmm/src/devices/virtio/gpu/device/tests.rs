@@ -3727,3 +3727,32 @@ fn the_toggle_off_waits_5_s_for_the_in_guest_renderer_and_then_stays_on() {
     let (h, _, _) = until(&mut user, SP_GPU_STATE);
     assert_eq!((h.arg0, h.arg1), (1, 1));
 }
+
+#[test]
+fn the_queue_lines_come_at_their_period_with_no_renderer() {
+    let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+    let path = dir.as_path().join("gpu.sock");
+    let q = dir.as_path().join("dq.jsonl");
+    let mem = single_region_mem(0x200000);
+    let mut c = cfg(path.to_str().unwrap());
+    c.queue_path = Some(q.to_str().unwrap().into());
+    c.queue_ms = Some(5);
+    let r = rig_with(&mem, c);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let text = std::fs::read_to_string(&q).unwrap();
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert!(lines.len() >= 10, "{} lines", lines.len());
+    for l in &lines {
+        assert_eq!(l["k"], "dq");
+        assert!(l["queued_bytes"].is_u64() && l["lane_bytes"].is_u64());
+        assert_eq!(l["taking"], true);
+        assert_eq!(l["connected"], false);
+    }
+    let t: Vec<i64> = lines.iter().map(|l| l["t_us"].as_i64().unwrap()).collect();
+    assert!(t.windows(2).all(|w| w[1] > w[0]));
+    assert!(t[t.len() - 1] - t[0] >= 5_000 * (i64::try_from(t.len()).unwrap() - 1));
+    drop(r);
+}

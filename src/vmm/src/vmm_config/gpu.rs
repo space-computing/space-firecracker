@@ -12,6 +12,8 @@ const DEFAULT_FENCE_AGE_VIDEO_MS: u32 = 350;
 const DEFAULT_TX_LIMIT_MIB: u32 = 8;
 const DEFAULT_ZSTD_LEVEL: i32 = 1;
 const MAX_ZSTD_LEVEL: i32 = 19;
+const DEFAULT_QUEUE_MS: u32 = 10;
+const MAX_QUEUE_MS: u32 = 1000;
 
 /// The GPU device: a virtio-gpu device (virgl) whose commands are rendered by a renderer
 /// outside Firecracker (the sink of the Spacebox QEMU fork), reached through a unix socket.
@@ -63,6 +65,16 @@ pub struct GpuConfig {
     /// (for debugging).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dump_path: Option<String>,
+    /// A file into which the device writes its queue toward the renderer every `queue_ms`
+    /// while it runs: one JSON line with the bytes and messages not yet written, the oldest
+    /// one's age, the pieces of large writes not queued yet, the bytes written that the
+    /// renderer has not read, and whether the device takes the guest's commands (the UI evals'
+    /// harness of the spacebox repository, `screen/ui/README.md`). The file is made new.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_path: Option<String>,
+    /// The period of the queue lines in milliseconds (default 10, 1 to 1000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_ms: Option<u32>,
     /// Two virtio-input devices, a keyboard and a tablet (absolute axes, buttons, wheels), fed
     /// by the renderer's input (default false).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -121,6 +133,10 @@ impl GpuConfig {
         self.sound.unwrap_or(false)
     }
 
+    pub(crate) fn queue_period(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(u64::from(self.queue_ms.unwrap_or(DEFAULT_QUEUE_MS)))
+    }
+
     /// Check the values.
     pub fn validate(&self) -> Result<(), GpuConfigError> {
         if self.socket_path.is_empty() {
@@ -143,6 +159,14 @@ impl GpuConfig {
         if self.guest_renderer_socket_path.as_deref() == Some("") {
             return Err(GpuConfigError::GuestRendererSocketPath);
         }
+        if self.queue_path.as_deref() == Some("") {
+            return Err(GpuConfigError::QueuePath);
+        }
+        if let Some(ms) = self.queue_ms
+            && !(1..=MAX_QUEUE_MS).contains(&ms)
+        {
+            return Err(GpuConfigError::QueueMs(ms));
+        }
         Ok(())
     }
 }
@@ -162,6 +186,10 @@ pub enum GpuConfigError {
     AgentSocketPath,
     /// The socket path of the renderer inside the guest is empty.
     GuestRendererSocketPath,
+    /// The path of the queue lines is empty.
+    QueuePath,
+    /// The period of the queue lines {0} ms is not between 1 and 1000.
+    QueueMs(u32),
 }
 
 #[cfg(test)]
@@ -179,6 +207,7 @@ mod tests {
         assert_eq!(c.fence_age_video_us(), 350_000);
         assert_eq!(c.tx_limit_bytes(), 8 << 20);
         assert_eq!(c.zstd_level(), 1);
+        assert_eq!(c.queue_period(), std::time::Duration::from_millis(10));
         // Only the given fields are listed back.
         assert_eq!(
             serde_json::to_string(&c).unwrap(),
@@ -192,10 +221,12 @@ mod tests {
                 "fence_age_video_ms": 0,
                 "tx_limit_mib": 2, "zstd_level": 0, "debug_wait": true, "dump_path": "/d",
                 "input": true, "sound": true, "agent_socket_path": "/v.sock_5000",
-                "guest_renderer_socket_path": "/v.sock_5001"}"#,
+                "guest_renderer_socket_path": "/v.sock_5001", "queue_path": "/q", "queue_ms": 5}"#,
         )
         .unwrap();
         c.validate().unwrap();
+        assert_eq!(c.queue_path.as_deref(), Some("/q"));
+        assert_eq!(c.queue_period(), std::time::Duration::from_millis(5));
         assert_eq!(c.fence_window(), 0);
         assert_eq!(c.fence_age_us(), 5_000);
         assert_eq!(c.fence_age_video_us(), 0);
@@ -238,6 +269,14 @@ mod tests {
         assert_eq!(
             bad(r#"{"socket_path": "/s", "spec_path": "/g", "guest_renderer_socket_path": ""}"#),
             Err(GpuConfigError::GuestRendererSocketPath)
+        );
+        assert_eq!(
+            bad(r#"{"socket_path": "/s", "spec_path": "/g", "queue_path": ""}"#),
+            Err(GpuConfigError::QueuePath)
+        );
+        assert_eq!(
+            bad(r#"{"socket_path": "/s", "spec_path": "/g", "queue_ms": 0}"#),
+            Err(GpuConfigError::QueueMs(0))
         );
         // the CPU renderer on the host is gone: its field is refused
         serde_json::from_str::<GpuConfig>(

@@ -15,6 +15,9 @@
 //! - A reader thread (`fc_gpu_rx`) that reads, takes the peer's HELLO out first, uncompresses,
 //!   cuts the stream into messages and hands them to the device's thread through a channel and an
 //!   eventfd.
+//! - With the GPU config's `queue_path`, a third thread (`fc_gpu_q`) that writes a line of the
+//!   queue every `queue_ms` ([`Link::log_queue`]: the UI evals' harness of the spacebox
+//!   repository, `screen/ui/README.md`, "The device's queue line").
 //!
 //! The device's thread connects (a unix socket connects at once or fails), writes its HELLO, and
 //! decides about everything that arrives. The link of the renderer inside the guest listens
@@ -29,10 +32,11 @@ use std::io::ErrorKind;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
+use std::time::Duration;
 
 use gpu_journal::Blob;
 use vmm_sys_util::eventfd::EventFd;
@@ -214,6 +218,17 @@ impl TxQueue {
     pub(crate) fn drop_lane(&mut self) {
         self.lane.clear();
         self.lane_bytes = 0;
+    }
+
+    /// The messages not yet given to the writer and the time of the oldest one, and the
+    /// pieces of the lane and the time of the oldest one (0: a message with no time).
+    pub(crate) fn waiting(&self) -> (usize, Option<i64>, usize, Option<i64>) {
+        (
+            self.entries.len().saturating_sub(self.next),
+            self.entries.get(self.next).map(|e| e.buf.t_us),
+            self.lane.len(),
+            self.lane.front().map(|p| p.t_us),
+        )
     }
 
     /// The next message to write, marked as being written.
@@ -423,6 +438,9 @@ struct Shared {
     /// Bytes read from the socket since the link was made (never reset).
     rx_total: AtomicU64,
     z_level: i32,
+    /// The device takes the guest's commands (false while it waits for the queue to drain at
+    /// its limits); for the queue's lines.
+    taking: AtomicBool,
 }
 
 /// The device's end of the connection.
@@ -502,6 +520,7 @@ impl Link {
             rx_bytes: AtomicU64::new(0),
             rx_total: AtomicU64::new(0),
             z_level,
+            taking: AtomicBool::new(true),
         });
         let (in_tx, rx) = mpsc::channel();
         let rx_event = EventFd::new(libc::EFD_NONBLOCK)?;
@@ -738,6 +757,26 @@ impl Link {
         self.lock().q.backlog
     }
 
+    /// Whether the device takes the guest's commands, for the queue's lines.
+    pub(crate) fn set_taking(&self, on: bool) {
+        self.shared.taking.store(on, Ordering::Relaxed);
+    }
+
+    /// Write a line of the queue into `out` every `period`, from a thread of its own
+    /// (`<name>_q`) that runs under `filter` as the other two.
+    pub(crate) fn log_queue(
+        &self,
+        name: &str,
+        out: File,
+        period: Duration,
+        filter: Arc<BpfProgram>,
+    ) -> std::io::Result<()> {
+        let s = self.shared.clone();
+        spawn_filtered(&format!("{name}_q"), filter, move || {
+            queue_log(&s, out, period)
+        })
+    }
+
     /// Queue a message (see [`TxQueue::push`]); its id.
     pub(crate) fn push(
         &self,
@@ -750,6 +789,49 @@ impl Link {
         let id = self.lock().q.push(data, reliable, ack, t_us, filter);
         self.shared.tx_cond.notify_one();
         id
+    }
+}
+
+/// The queue's line every `period`: the bytes not yet written (the message being written
+/// included) and the messages not yet given to the writer with the oldest one's age, the lane's
+/// bytes and pieces with the oldest one's age, the bytes written on the connection that the
+/// peer has not read (with pieces), the bytes not acknowledged, whether the device takes the
+/// guest's commands, and whether a connection is up; times on [`now_us`], the clock of the
+/// messages' times. The thread waits on a condition variable of its own, which nothing
+/// signals: the `vmm` seccomp filter allows a futex wait with a timeout, not a sleep.
+fn queue_log(sh: &Shared, mut out: File, period: Duration) {
+    let pause = Mutex::new(());
+    let cond = Condvar::new();
+    let mut g = pause.lock().unwrap();
+    let age = |now: i64, t: Option<i64>| t.filter(|t| *t != 0).map_or(0, |t| now - t);
+    loop {
+        g = cond.wait_timeout(g, period).unwrap().0;
+        let line = {
+            let st = sh.st.lock().unwrap();
+            let now = now_us();
+            let (msgs, oldest, pieces, lane_oldest) = st.q.waiting();
+            format!(
+                "{{\"k\":\"dq\",\"t_us\":{now},\"queued_bytes\":{},\"queued_msgs\":{msgs},\
+                 \"oldest_us\":{},\"lane_bytes\":{},\"lane_pieces\":{pieces},\
+                 \"lane_oldest_us\":{},\"unread_bytes\":{},\"unacked_bytes\":{},\
+                 \"taking\":{},\"connected\":{}}}\n",
+                st.q.backlog,
+                age(now, oldest),
+                st.q.lane_bytes,
+                age(now, lane_oldest),
+                if st.pieces_on {
+                    st.conn_tx.saturating_sub(st.peer_rx)
+                } else {
+                    0
+                },
+                st.q.unacked,
+                sh.taking.load(Ordering::Relaxed),
+                st.conn.is_some(),
+            )
+        };
+        if out.write_all(line.as_bytes()).is_err() {
+            return;
+        }
     }
 }
 

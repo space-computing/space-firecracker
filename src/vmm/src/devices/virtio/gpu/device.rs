@@ -768,6 +768,12 @@ impl Gpu {
             filter.clone(),
             dump,
         )?)];
+        if let Some(p) = &cfg.queue_path {
+            // the UI evals' harness: the queue toward the user's renderer
+            conns[0]
+                .link
+                .log_queue("fc_gpu", File::create(p)?, cfg.queue_period(), filter.clone())?;
+        }
         if let Some(p) = &cfg.guest_renderer_socket_path {
             // Inside the guest: not compressed (memory to memory; zstd would cost the guest's CPU
             // and the device's). It connects to the device; paired when it takes over.
@@ -2187,9 +2193,11 @@ impl Gpu {
                     || link.lane_bytes() > LANE_LIMITS * self.tx_limit)
             {
                 // Let the network drain before taking more work from the guest.
+                link.set_taking(false);
                 self.retry_timer.arm(BACKLOG_RETRY, None);
                 break;
             }
+            link.set_taking(true);
             let Some((cmd, req)) = self.pop_request(&mem)? else {
                 break;
             };
