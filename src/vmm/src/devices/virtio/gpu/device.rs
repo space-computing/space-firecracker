@@ -12,7 +12,11 @@
 //!
 //! - Commands whose answer carries nothing are answered at once; fenced ones up to a window of
 //!   commands and an age ahead of the sink, a longer age while the guest decodes video
-//!   ([`Gpu::may_answer_early`]).
+//!   ([`Gpu::may_answer_early`]). No fence is answered, here or by the sink, before an earlier
+//!   fenced read back has its data in guest memory ([`Gpu::resp`]).
+//! - A command whose data is large goes as a notice of what it touches and a write in pieces,
+//!   and the messages that do not depend on it pass it ([`Gpu::send_cmd`], `screen/protocol.md`
+//!   of the spacebox repository, "Large writes in pieces").
 //! - Reads of query result buffers are answered from guest memory, which the sink keeps current
 //!   (it watches the buffers), and parked while the result is not in yet.
 //! - Capability queries are answered from the GPU spec ([`super::spec`], `spec_path`) from the
@@ -52,6 +56,7 @@ use vmm_sys_util::eventfd::EventFd;
 use super::agent::Agent;
 use super::input::{Input, InputKind, translate};
 use super::link::{DelayStat, Link, RxEvent, now_us};
+use super::protocol::EXPECT_LEN;
 use super::protocol::{
     Filter, HDR_LEN, Hdr, SP_ACK, SP_AUDIO, SP_BYE, SP_CTRL, SP_CURSOR, SP_DETACH, SP_DISPLAY,
     SP_EXPECT, SP_EXPORT, SP_EXPORT_DATA, SP_EXPORT_DONE, SP_F_RESTORED, SP_F_SCROLL, SP_F_SPEC,
@@ -59,6 +64,7 @@ use super::protocol::{
     SP_MEMWRITE, SP_PICTURE, SP_RESET, SP_RESP, SP_SCROLL, SP_SPEC, SP_SPEC_REPLY, SP_STATE_KEPT,
     SP_STATE_RESET, SP_STREAM, SP_WMARK, push_expect, u32_at, u64_at,
 };
+use super::protocol::{HOLD_READS_UNKNOWN, HOLD_UNKNOWN, SP_F_PIECES, SP_HOLD, SP_PIECE};
 use super::spec::Spec;
 use super::{CTRL_QUEUE, CURSOR_QUEUE, GPU_NUM_QUEUES};
 use crate::devices::virtio::ActivateError;
@@ -93,6 +99,7 @@ const CMD_GET_CAPSET: u32 = 0x0109;
 const CMD_GET_EDID: u32 = 0x010a;
 const CMD_RESOURCE_CREATE_BLOB: u32 = 0x010c;
 const CMD_CTX_CREATE: u32 = 0x0200;
+const CMD_CTX_DESTROY: u32 = 0x0201;
 const CMD_RESOURCE_CREATE_3D: u32 = 0x0204;
 const CMD_TRANSFER_TO_HOST_3D: u32 = 0x0205;
 const CMD_TRANSFER_FROM_HOST_3D: u32 = 0x0206;
@@ -165,6 +172,15 @@ const OFF_WAIT_US: i64 = 5_000_000;
 const CURSOR_BYTES: u64 = 64 * 64 * 4;
 /// A piece of a renderer's export, as an `SP_IMPORT` (the header, the bytes).
 type Piece = (Vec<u8>, Vec<u8>);
+/// A command whose data (its command stream's memory writes and its transfer's bytes) is this
+/// large or larger goes as a notice and a write in pieces, when the renderer takes them. A
+/// whole message of this size holds the link about 22 ms at its 11.5 MB/s.
+const HOLD_MIN: usize = 256 << 10;
+/// The size of a piece of such a write.
+const PIECE: usize = 64 << 10;
+/// The guest's commands are taken while less than this many transmit limits wait in the lane
+/// (a 2160p video's player decodes several pictures of 2 to 4 MB ahead at once).
+const LANE_LIMITS: usize = 8;
 
 /// What the device's last save was readied for (`prepare_save`, `prepare_move`,
 /// `prepare_checkpoint`): the saved state says what a rollback to it lacks.
@@ -237,6 +253,39 @@ impl Resource {
     }
 }
 
+/// A memory write of a command stream (`sp_source_push_mem`), sent with its command
+/// ([`Gpu::send_cmd`]): `SP_MEMWRITE` resource, offset, bytes, watch.
+#[derive(Debug)]
+struct MemWrite {
+    res: u32,
+    off: u64,
+    data: Vec<u8>,
+    watch: u64,
+    hint: Option<Hint>,
+}
+
+/// What a command touches, for its notice ([`Gpu::touches`]): the resources it writes (the first
+/// `writes` of `list`), then those it reads, if they are known.
+#[derive(Debug)]
+struct Touches {
+    list: Vec<u32>,
+    writes: usize,
+    reads_known: bool,
+}
+
+impl Touches {
+    /// The notice's arg2 and a.
+    fn notice(t: Option<&Touches>) -> (u64, Vec<u8>) {
+        match t {
+            Some(t) => (
+                t.writes as u64 | if t.reads_known { 0 } else { HOLD_READS_UNKNOWN },
+                t.list.iter().flat_map(|r| r.to_le_bytes()).collect(),
+            ),
+            None => (HOLD_UNKNOWN, Vec::new()),
+        }
+    }
+}
+
 /// A guest command not answered yet: where its answer goes.
 #[derive(Debug)]
 struct Cmd {
@@ -264,6 +313,8 @@ struct Pending {
     flags: u32,
     fence_id: u64,
     ctx_id: u32,
+    /// The sink's answer, kept until every earlier fenced read back has its data ([`Gpu::resp`]).
+    resp: Option<Vec<u8>>,
 }
 
 /// `SpParked`: a guest read of a query result buffer whose result is not in yet.
@@ -313,6 +364,10 @@ pub(crate) struct Conn {
     refused_at: i64,
     /// Its refusals (logged at 1, 2, 4, ...).
     n_refused: u64,
+    /// For each GL context, its last write in pieces (the id of its notice) on this pairing: its
+    /// later command streams may wait behind it at the renderer until it has all of it, so they
+    /// get notices ([`Gpu::send_cmd`]).
+    ctx_w: HashMap<u32, u64>,
 }
 
 impl Conn {
@@ -433,6 +488,18 @@ pub(crate) struct Counters {
     picture_bytes: u64,
     pub(crate) pictures_dropped: u64,
     pub(crate) pictures_late: u64,
+    /// Commands sent with their data in pieces, those data's bytes, and of them the notices
+    /// whose touches were known; notices with no pieces; answers of the sink kept behind an
+    /// earlier read back (in the interval).
+    n_held: u64,
+    held_bytes: u64,
+    n_held_known: u64,
+    n_notice: u64,
+    n_answer_kept: u64,
+    /// Command streams with a decode that do more than decode (their touches not known), and the
+    /// last command that made them so.
+    n_decode_other: u64,
+    decode_other: u32,
 }
 
 /// The sound device's samples sent on this connection (since the start).
@@ -526,6 +593,23 @@ pub struct Gpu {
     edid: Option<Vec<u8>>,
     /// The guest decodes video until about then: one second after its last decode command.
     video_until: i64,
+    /// The memory writes of the command being sent ([`Self::push_mem`]), and its expectations
+    /// and write marks (`SP_EXPECT`, `SP_WMARK`): they go just before it ([`Self::send_cmd`]).
+    mem_writes: Vec<MemWrite>,
+    cmd_marks: Vec<(u32, Vec<u8>)>,
+    /// The scan of the command stream being sent: it only decodes video, and the buffers that
+    /// its copies read ([`Self::touches`]).
+    scan_decode_only: bool,
+    scan_reads: Vec<u32>,
+    /// ... else the first command that is not of such a stream; the stream decodes.
+    scan_other: u32,
+    scan_decodes: bool,
+    /// The planes of each context's video buffers: context -> buffer handle -> resources.
+    video_planes: HashMap<u32, HashMap<u32, Vec<u32>>>,
+    /// The contexts created since this device was made: their video buffers are all known.
+    video_known: HashSet<u32>,
+    /// The sink's answers kept in `pending` ([`Self::resp`]).
+    n_kept: usize,
 
     tx_limit: usize,
     fence_window: u32,
@@ -675,6 +759,7 @@ impl Gpu {
             refused: false,
             refused_at: 0,
             n_refused: 0,
+            ctx_w: HashMap::new(),
         };
         let mut conns = vec![conn(Link::new(
             "fc_gpu",
@@ -745,6 +830,15 @@ impl Gpu {
             dinfo: None,
             edid: None,
             video_until: 0,
+            mem_writes: Vec::new(),
+            cmd_marks: Vec::new(),
+            scan_decode_only: false,
+            scan_reads: Vec::new(),
+            scan_other: 0,
+            scan_decodes: false,
+            video_planes: HashMap::new(),
+            video_known: HashSet::new(),
+            n_kept: 0,
             tx_limit: cfg.tx_limit_bytes(),
             fence_window: cfg.fence_window(),
             fence_out: 0,
@@ -870,11 +964,29 @@ impl Gpu {
         arg1: u64,
         arg2: u64,
     ) {
+        let _ = self.queue_on(ci, reliable, typ, seq, a, b, arg0, arg1, arg2);
+    }
+
+    /// [`Self::send_on`], with the message's id (0 for one not resent), or None if it was not
+    /// queued.
+    #[allow(clippy::too_many_arguments)]
+    fn queue_on(
+        &mut self,
+        ci: usize,
+        reliable: bool,
+        typ: u32,
+        seq: u64,
+        a: &[u8],
+        b: &[u8],
+        arg0: u64,
+        arg1: u64,
+        arg2: u64,
+    ) -> Option<u64> {
         let t_us = now_us();
         let hint = self.tx_hint.take();
         let c = &mut self.conns[ci];
         if !reliable && !c.link.is_connected() {
-            return;
+            return None;
         }
         if reliable && c.hello_done && !c.spec_ok {
             // A new pairing before the renderer's yes to the spec: the renderer drops what comes
@@ -882,7 +994,7 @@ impl Gpu {
             // given again after the queue is forgotten; the renderer then took the next message
             // with that id as one it had (a switch that waited for ever, G4's F4). What the
             // guest does meanwhile is in the journal, which the renderer gets after its yes.
-            return;
+            return None;
         }
         let h = Hdr {
             typ,
@@ -913,8 +1025,9 @@ impl Gpu {
         data.extend_from_slice(a);
         data.extend_from_slice(b);
         self.counters.tx_bytes += data.len() as u64;
-        c.link.push(data, reliable, c.rx_id, t_us, filter);
+        let id = c.link.push(data, reliable, c.rx_id, t_us, filter);
         c.rx_id_acked = c.rx_id;
+        Some(id)
     }
 
     /// A message for the renderer that runs the guest's commands.
@@ -1076,7 +1189,8 @@ impl Gpu {
         true
     }
 
-    /// `sp_source_push_mem`: send a piece of a resource's guest memory to the sink's copy of it.
+    /// `sp_source_push_mem`: a piece of a resource's guest memory for the sink's copy of it,
+    /// sent with its command ([`Self::send_cmd`]).
     fn push_mem(&mut self, mem: &GuestMemoryMmap, res: u32, off: u64, len: u64, watch: u64) {
         if len == 0
             || self
@@ -1090,11 +1204,18 @@ impl Gpu {
         let data = self.read_backing(mem, res, off, len);
         self.counters.n_mem += 1;
         self.counters.mem_bytes += data.len() as u64;
-        self.send(SP_MEMWRITE, 0, &data, &[], u64::from(res), off, watch);
         if watch == 0 {
             // an in-stream upload's bytes, for the journal
-            self.pushed.insert((res, off), data);
+            self.pushed.insert((res, off), data.clone());
         }
+        let hint = self.tx_hint.take();
+        self.mem_writes.push(MemWrite {
+            res,
+            off,
+            data,
+            watch,
+            hint,
+        });
     }
 
     /// `sp_source_defer`: an upload of 4096 bytes or more into a buffer that lives only in the
@@ -1146,6 +1267,10 @@ impl Gpu {
     ) -> bool {
         let ndw = cmds.len() / 4;
         let mut i = 0usize;
+        self.scan_decode_only = true;
+        self.scan_reads.clear();
+        self.scan_other = 0;
+        self.scan_decodes = false;
         while i < ndw {
             let hdr = u32_at(cmds, i * 4);
             let len = (hdr >> 16) as usize;
@@ -1159,6 +1284,21 @@ impl Gpu {
                 *w = u32_at(cmds, (i + k) * 4);
             }
             let bx = [c[6], c[7], c[8], c[9], c[10], c[11]];
+            // A stream that only decodes video: the video commands, and writes to the renderer
+            // (the bitstream's transfers, the description's inline writes), with the choice of
+            // the sub-context (Mesa's VA driver sends it first); what it touches is known
+            // ([`Self::touches`]).
+            match cmd {
+                0 | 9 | 28 | 44 | 53..=61 => {}
+                43 if len >= 13 && c[13] == 1 => {}
+                45 if len >= 14 && c[14] & 2 == 0 => self.scan_reads.push(c[12]),
+                _ => {
+                    if self.scan_decode_only {
+                        self.scan_other = cmd;
+                    }
+                    self.scan_decode_only = false;
+                }
+            }
             match cmd {
                 // VIRGL_CCMD_TRANSFER3D: res, level, usage, stride, layer_stride, box, data
                 // offset, direction (1 = to the renderer)
@@ -1247,6 +1387,7 @@ impl Gpu {
                 // when it gets this command.
                 59 => {
                     self.video_until = now_us() + 1_000_000;
+                    self.scan_decodes = true;
                     if len >= 5 {
                         if let Some(r) = self.resources.get(&c[3]).filter(|r| r.backing.is_some()) {
                             let n = r.backing_size().min(u64::from(r.width));
@@ -1258,6 +1399,24 @@ impl Gpu {
                         }
                     }
                 }
+                // VIRGL_CCMD_CREATE_VIDEO_BUFFER: handle, format, width, height, the planes'
+                // resources
+                55 if len >= 1 => {
+                    let planes = (5..=len.min(15))
+                        .map(|k| c[k])
+                        .filter(|&r| r != 0)
+                        .collect();
+                    self.video_planes
+                        .entry(ctx_id)
+                        .or_default()
+                        .insert(c[1], planes);
+                }
+                // VIRGL_CCMD_DESTROY_VIDEO_BUFFER: handle
+                56 if len >= 1 => {
+                    if let Some(m) = self.video_planes.get_mut(&ctx_id) {
+                        m.remove(&c[1]);
+                    }
+                }
                 // VIRGL_CCMD_GET_MEMORY_INFO: resource
                 50 if len >= 1 => {
                     if let Some(r) = self.resources.get(&c[1]).filter(|r| r.backing.is_some()) {
@@ -1267,6 +1426,10 @@ impl Gpu {
                 _ => {}
             }
             i += 1 + len;
+        }
+        if self.scan_decodes && !self.scan_decode_only {
+            self.counters.n_decode_other += 1;
+            self.counters.decode_other = self.scan_other;
         }
         !expect.is_empty()
     }
@@ -1389,10 +1552,12 @@ impl Gpu {
     ///
     /// The age is `fence_age_video` while the guest decodes video (until one second after its
     /// last decode, the time of `SP_F_VIDEO`, so the pauses between a clip's frames keep it).
-    /// Decoding a large video loads the link, the sink's answers come up to about 150 ms late,
-    /// and with the short age the guest's player waits for them and drops frames. The sink
-    /// shows video frames by the guest's clock anyway. Without video the short age bounds how
-    /// much later than the guest the user sees an answer to the input.
+    /// Decoding a large video loads the link, the sink's answers come up to about 150 ms late
+    /// (more behind a large picture), and with the short age the guest's player waits for them
+    /// and drops frames. The sink shows video frames by the guest's clock anyway, up to 350 ms
+    /// late (its pacing allowance's cap while video plays), so the default age of video is that.
+    /// Without video the short age bounds how much later than the guest the user sees an answer
+    /// to the input.
     fn may_answer_early(&mut self) -> bool {
         let out = self.fence_out + self.wait_out;
         let rtt_min = self.rtt_min_cur.min(self.rtt_min_prev);
@@ -1443,8 +1608,8 @@ impl Gpu {
 
     /// The journal takes a command that is about to be sent, and the renderer learns what the
     /// command may write (`SP_WMARK`). The bytes of the command's in-stream uploads are those
-    /// [`Self::push_mem`] sent.
-    fn journal_ctrl(&mut self, req: &[u8], data: &[u8]) {
+    /// [`Self::push_mem`] read. Returns every resource the command may write.
+    fn journal_ctrl(&mut self, req: &[u8], data: &[u8]) -> Vec<u32> {
         let mut pushed = std::mem::take(&mut self.pushed);
         let marks = self.journal.ctrl(req, data, &mut |res, off, len| {
             pushed.remove(&(res, off)).filter(|d| d.len() as u64 == len)
@@ -1468,7 +1633,15 @@ impl Gpu {
         if !a.is_empty() {
             self.counters.n_wmark += 1;
             self.counters.wmark_ids += (a.len() / 4) as u64;
-            self.send(SP_WMARK, 0, &a, &[], 0, 0, 0);
+            self.cmd_marks.push((SP_WMARK, a));
+        }
+        marks
+    }
+
+    /// The expectations and write marks of a command that is not sent (it is answered here).
+    fn send_cmd_marks(&mut self) {
+        for (typ, a) in std::mem::take(&mut self.cmd_marks) {
+            self.send(typ, 0, &a, &[], 0, 0, 0);
         }
     }
 
@@ -1507,6 +1680,7 @@ impl Gpu {
             flags,
             fence_id,
             ctx_id,
+            resp: None,
         };
         let (mut off, mut len) = (0u64, 0u64);
         let mut needs_sink = false;
@@ -1516,6 +1690,12 @@ impl Gpu {
                 let name = &req[32..32 + 23];
                 let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
                 self.ctx_name[ctx_id as usize] = String::from_utf8_lossy(&name[..end]).into_owned();
+                self.video_planes.remove(&ctx_id);
+                self.video_known.insert(ctx_id);
+            }
+            CMD_CTX_DESTROY => {
+                self.video_planes.remove(&ctx_id);
+                self.video_known.remove(&ctx_id);
             }
             CMD_RESOURCE_CREATE_2D if req.len() >= 40 => {
                 self.res_create(
@@ -1622,11 +1802,11 @@ impl Gpu {
                 let mut expect = Vec::new();
                 needs_sink = self.scan_submit(mem, ctx_id, &req[32..32 + size], &mut expect);
                 if !expect.is_empty() {
-                    self.send(SP_EXPECT, 0, &expect, &[], 0, 0, 0);
+                    self.cmd_marks.push((SP_EXPECT, expect));
                 }
             }
         }
-        self.journal_ctrl(&req, &extra);
+        let marks = self.journal_ctrl(&req, &extra);
         self.tx_hint = hint;
         self.counters.n_ctrl += 1;
         p.off = off;
@@ -1639,6 +1819,7 @@ impl Gpu {
         {
             // The guest's copy of a query result buffer is kept current by the sink's watch,
             // so there is nothing to fetch.
+            self.send_cmd_marks();
             self.counters.n_local += 1;
             self.seq -= 1;
             if ctx_id < 64 {
@@ -1693,7 +1874,7 @@ impl Gpu {
         if !needs_sink && self.fence_window != 0 {
             if !fenced {
                 self.counters.n_local += 1;
-                self.send(SP_CTRL, 0, &req, &extra, resp_cap, off, len);
+                self.send_cmd(0, &req, &extra, [resp_cap, off, len], &marks);
                 let cmd = p.cmd.take().unwrap();
                 self.answer(mem, CTRL_QUEUE, &cmd, &Self::nodata(0, 0, 0));
                 return;
@@ -1709,7 +1890,7 @@ impl Gpu {
                 p.early = true;
                 let cmd = p.cmd.take().unwrap();
                 self.pending.insert(seq, p);
-                self.send(SP_CTRL, seq, &req, &extra, resp_cap, off, len);
+                self.send_cmd(seq, &req, &extra, [resp_cap, off, len], &marks);
                 self.answer(
                     mem,
                     CTRL_QUEUE,
@@ -1760,7 +1941,202 @@ impl Gpu {
             }
         }
         self.pending.insert(seq, p);
-        self.send(SP_CTRL, seq, &req, &extra, resp_cap, off, len);
+        self.send_cmd(seq, &req, &extra, [resp_cap, off, len], &marks);
+    }
+
+    /// Send a guest's command (`SP_CTRL` with `args`) and the memory writes of its command stream
+    /// ([`Self::push_mem`]). A command whose data (those writes and its transfer's bytes `extra`)
+    /// is [`HOLD_MIN`] or more goes, when the renderer takes pieces, as a notice of what it
+    /// touches (`SP_HOLD`) and a write in pieces (`SP_PIECE`: the memory writes, then the
+    /// command), so that the messages behind it that do not depend on it pass it; the pieces wait
+    /// in the link's lane and go while the renderer keeps up. A command stream of a context
+    /// whose last write in pieces the renderer has not acknowledged whole may wait behind it at
+    /// the renderer: it gets a notice of what it touches (when that is known), so that it holds
+    /// no other context there. `marks`: what the command may write (the journal's).
+    fn send_cmd(&mut self, seq: u64, req: &[u8], extra: &[u8], args: [u64; 3], marks: &[u32]) {
+        let writes = std::mem::take(&mut self.mem_writes);
+        let cmd_marks = std::mem::take(&mut self.cmd_marks);
+        let hint = self.tx_hint.take();
+        let ci = self.active;
+        let typ = u32_at(req, 0);
+        let ctx = u32_at(req, 16);
+        let data = writes.iter().map(|m| m.data.len()).sum::<usize>() + extra.len();
+        if data >= HOLD_MIN && self.conns[ci].link.pieces_on() {
+            let touch = self.touches(req, marks, &writes, &cmd_marks);
+            // the write: the memory writes, then the command, as whole messages with no id; and
+            // where picture data is in it, for the compression's filter
+            let mut w = Vec::with_capacity(data + req.len() + HDR_LEN * (writes.len() + 1));
+            let mut pixels: Vec<(usize, usize, Hint)> = Vec::new();
+            let flags = if self.video_until > now_us() {
+                SP_F_VIDEO
+            } else {
+                0
+            };
+            let inner = |typ: u32, seq: u64, a: usize, b: usize, args: [u64; 3]| Hdr {
+                typ,
+                seq,
+                a_len: u32::try_from(a).unwrap_or(u32::MAX),
+                b_len: u32::try_from(b).unwrap_or(u32::MAX),
+                arg0: args[0],
+                arg1: args[1],
+                arg2: args[2],
+                t_us: now_us(),
+                flags,
+                ..Default::default()
+            };
+            for m in &writes {
+                let h = inner(
+                    SP_MEMWRITE,
+                    0,
+                    m.data.len(),
+                    0,
+                    [u64::from(m.res), m.off, m.watch],
+                );
+                w.extend_from_slice(&h.encode());
+                let at = w.len();
+                w.extend_from_slice(&m.data);
+                if let Some(hint) = m.hint {
+                    pixels.push((at, w.len(), hint));
+                }
+            }
+            w.extend_from_slice(&inner(SP_CTRL, seq, req.len(), extra.len(), args).encode());
+            w.extend_from_slice(req);
+            let at = w.len();
+            w.extend_from_slice(extra);
+            if let Some(hint) = hint.filter(|h| h.in_b) {
+                pixels.push((at, w.len(), hint));
+            }
+            let (arg2, a) = Touches::notice(touch.as_ref());
+            for (typ, m) in cmd_marks {
+                self.send(typ, 0, &m, &[], 0, 0, 0);
+            }
+            // the write is numbered by its notice's id
+            let total = w.len() as u64;
+            let Some(wid) =
+                self.queue_on(ci, true, SP_HOLD, total, &a, &[], 1, u64::from(ctx), arg2)
+            else {
+                return;
+            };
+            let c = &mut self.conns[ci];
+            let n = w.len().div_ceil(PIECE);
+            for (k, piece) in w.chunks(PIECE).enumerate() {
+                let o = k * PIECE;
+                let h = Hdr {
+                    typ: SP_PIECE,
+                    a_len: u32::try_from(piece.len()).unwrap(),
+                    arg0: wid,
+                    arg1: o as u64,
+                    t_us: now_us(),
+                    flags,
+                    ..Default::default()
+                };
+                let mut d = Vec::with_capacity(HDR_LEN + piece.len());
+                d.extend_from_slice(&h.encode());
+                d.extend_from_slice(piece);
+                let filter = pixels
+                    .iter()
+                    .find(|p| p.0 < o + piece.len() && p.1 > o)
+                    .map(|p| Filter {
+                        off: u32::try_from(HDR_LEN + p.0.saturating_sub(o)).unwrap(),
+                        bpp: p.2.bpp,
+                        stride: p.2.stride,
+                    });
+                c.link
+                    .push_piece(d, c.rx_id, h.t_us, filter, wid, k + 1 == n);
+            }
+            if ctx != 0 {
+                c.ctx_w.insert(ctx, wid);
+            }
+            self.counters.tx_bytes += total + (n * HDR_LEN) as u64;
+            self.counters.n_held += 1;
+            self.counters.held_bytes += total;
+            self.counters.n_held_known += u64::from(touch.is_some_and(|t| t.reads_known));
+            return;
+        }
+        if typ == CMD_SUBMIT_3D
+            && self.conns[ci]
+                .ctx_w
+                .get(&ctx)
+                .is_some_and(|&w| w > self.conns[ci].link.w_acked())
+            && let Some(t) = self.touches(req, marks, &writes, &cmd_marks)
+        {
+            let (arg2, a) = Touches::notice(Some(&t));
+            self.send(SP_HOLD, 0, &a, &[], 0, u64::from(ctx), arg2);
+            self.counters.n_notice += 1;
+        }
+        for m in writes {
+            self.tx_hint = m.hint;
+            self.send(
+                SP_MEMWRITE,
+                0,
+                &m.data,
+                &[],
+                u64::from(m.res),
+                m.off,
+                m.watch,
+            );
+        }
+        for (typ, m) in cmd_marks {
+            self.send(typ, 0, &m, &[], 0, 0, 0);
+        }
+        self.tx_hint = hint;
+        self.send(SP_CTRL, seq, req, extra, args[0], args[1], args[2]);
+    }
+
+    /// What a command touches, for its notice (`SP_HOLD`). The resources it writes are known for
+    /// a transfer and for a command stream: those the journal says it may write (`marks`), and
+    /// those whose copy of the guest's memory it writes (its expectations, `cmd_marks`). What it
+    /// reads is known for a transfer (nothing but its own bytes) and for a command stream that only
+    /// decodes video: its memory writes' buffers, the buffers its copies read, and the planes of
+    /// its context's video buffers (more than the pictures it refers to; known only for a context
+    /// made since this device was: a restored device does not know the buffers of before). None
+    /// for the other commands (the sink names their touches itself).
+    fn touches(
+        &self,
+        req: &[u8],
+        marks: &[u32],
+        writes: &[MemWrite],
+        cmd_marks: &[(u32, Vec<u8>)],
+    ) -> Option<Touches> {
+        let typ = u32_at(req, 0);
+        let ctx = u32_at(req, 16);
+        let mut list: Vec<u32> = marks.to_vec();
+        match typ {
+            CMD_TRANSFER_TO_HOST_2D if req.len() >= 56 => list.push(u32_at(req, 48)),
+            CMD_TRANSFER_TO_HOST_3D if req.len() >= 72 => list.push(u32_at(req, 56)),
+            CMD_SUBMIT_3D => {}
+            _ => return None,
+        }
+        for (t, e) in cmd_marks {
+            if *t == SP_EXPECT {
+                list.extend(e.chunks_exact(EXPECT_LEN).map(|x| u32_at(x, 0)));
+            }
+        }
+        list.sort_unstable();
+        list.dedup();
+        let n = list.len();
+        if typ == CMD_SUBMIT_3D && !(self.scan_decode_only && self.video_known.contains(&ctx)) {
+            return Some(Touches {
+                list,
+                writes: n,
+                reads_known: false,
+            });
+        }
+        if typ == CMD_SUBMIT_3D {
+            let mut reads: Vec<u32> = writes.iter().map(|m| m.res).collect();
+            reads.extend_from_slice(&self.scan_reads);
+            if let Some(v) = self.video_planes.get(&ctx) {
+                reads.extend(v.values().flatten());
+            }
+            reads.sort_unstable();
+            reads.dedup();
+            list.extend(reads);
+        }
+        Some(Touches {
+            list,
+            writes: n,
+            reads_known: true,
+        })
     }
 
     fn res_create(&mut self, id: u32, format: u32, width: u32, height: u32) {
@@ -1802,7 +2178,14 @@ impl Gpu {
             self.saved_missing = Vec::new();
         }
         loop {
-            if !alone && self.conns[self.active].link.backlog() > self.tx_limit {
+            // The lane holds what the pacing has not sent yet (with whole messages that sits in
+            // the socket's and the network's buffers, which the queue's backlog does not count);
+            // it delays only the commands in pieces, not the small messages, so it may hold more.
+            let link = &self.conns[self.active].link;
+            if !alone
+                && (link.backlog() > self.tx_limit
+                    || link.lane_bytes() > LANE_LIMITS * self.tx_limit)
+            {
                 // Let the network drain before taking more work from the guest.
                 self.retry_timer.arm(BACKLOG_RETRY, None);
                 break;
@@ -2041,10 +2424,21 @@ impl Gpu {
 
     // ---- what the sink sends -------------------------------------------------------------
 
-    /// `sp_source_resp`.
+    /// `sp_source_resp`. The guest's fences complete in order on their timeline: an answer with a
+    /// fence also completes the earlier fences (the guest kernel signals every older one). The
+    /// renderer may run a command before an earlier one that waits for its data (pieces), so its
+    /// answer can come first; a fenced answer is then kept while an earlier fenced command that
+    /// brings data to the guest (a read back) does not have its data in guest memory, and given
+    /// in order when it does ([`Self::release_answers`]). The virgl guest driver puts every
+    /// context's fences on one timeline; the device treats all fences as one.
     fn resp(&mut self, mem: &GuestMemoryMmap, h: &Hdr, a: &[u8], b: &[u8]) {
         let seq = h.seq;
-        let Some(t0) = self.pending.get(&seq).map(|p| p.t0) else {
+        let Some(t0) = self
+            .pending
+            .get(&seq)
+            .filter(|p| p.resp.is_none())
+            .map(|p| p.t0)
+        else {
             return; // dropped by a reset
         };
         self.rtt_us = now_us() - t0;
@@ -2055,7 +2449,7 @@ impl Gpu {
         }
         self.rtt_min_cur = self.rtt_min_cur.min(self.rtt_us);
         self.counters.delay.add(self.rtt_us);
-        let p = self.pending.remove(&seq).unwrap();
+        let mut p = self.pending.remove(&seq).unwrap();
         if p.early || p.fence_wait {
             self.fq_pop();
         }
@@ -2073,8 +2467,51 @@ impl Gpu {
             let n = usize::try_from((b.len() as u64).min(p.len)).unwrap();
             self.write_backing(mem, p.res, p.off, &b[..n]);
         }
+        if p.cmd.is_some()
+            && p.flags & FLAG_FENCE != 0
+            && self.pending.values().any(|q| q.hard && q.seq < seq)
+        {
+            // an earlier read back waits for its data: this fence would complete it
+            p.fence_wait = false;
+            p.hard = false;
+            p.resp = Some(a.to_vec());
+            self.pending.insert(seq, p);
+            self.n_kept += 1;
+            self.counters.n_answer_kept += 1;
+            return;
+        }
         if let Some(cmd) = p.cmd {
             self.answer(mem, CTRL_QUEUE, &cmd, a);
+        }
+        self.release_answers(mem);
+    }
+
+    /// Give the answers that [`Self::resp`] kept, in order, up to the first fenced read back that
+    /// still waits for its data.
+    fn release_answers(&mut self, mem: &GuestMemoryMmap) {
+        if self.n_kept == 0 {
+            return;
+        }
+        let first_hard = self
+            .pending
+            .values()
+            .filter(|p| p.hard)
+            .map(|p| p.seq)
+            .min()
+            .unwrap_or(u64::MAX);
+        let mut ready: Vec<u64> = self
+            .pending
+            .values()
+            .filter(|p| p.resp.is_some() && p.seq < first_hard)
+            .map(|p| p.seq)
+            .collect();
+        ready.sort_unstable();
+        for s in ready {
+            let p = self.pending.remove(&s).unwrap();
+            self.n_kept -= 1;
+            if let (Some(cmd), Some(r)) = (p.cmd, p.resp) {
+                self.answer(mem, CTRL_QUEUE, &cmd, &r);
+            }
         }
     }
 
@@ -2313,6 +2750,7 @@ impl Gpu {
         let resume = c.peer_session != 0 && h.arg0 == c.peer_session && h.arg1 == session;
         let z_on = c.link.z_level() != 0 && h.flags & SP_F_ZSTD != 0;
         c.link.set_z_on(z_on);
+        c.link.set_pieces(h.flags & SP_F_PIECES != 0);
         c.hello_done = true;
         let restored = std::mem::take(&mut c.restored);
         let tx_id = c.link.lock().q.tx_id;
@@ -2350,6 +2788,7 @@ impl Gpu {
             c.link.forget();
             c.rx_id = 0;
             c.rx_id_acked = 0;
+            c.ctx_w.clear();
             c.peer_session = h.arg0;
             c.detaching = false;
             c.marked.clear();
@@ -2574,7 +3013,11 @@ impl Gpu {
         };
         sw.phase = Phase::Reset;
         let (to, n) = (sw.to, sw.reset_to);
-        self.conns[to].marked.clear();
+        let c = &mut self.conns[to];
+        c.marked.clear();
+        // the renderer drops what waits for writes in pieces; their pieces not sent are dropped
+        c.link.drop_lane();
+        c.ctx_w.clear();
         self.send_on(to, true, SP_STATE_RESET, 0, &[], &[], n, 0, 0);
     }
 
@@ -3067,19 +3510,20 @@ impl Gpu {
     fn drop_pending(&mut self) {
         let Some(mem) = self.mem() else {
             self.pending.clear();
+            self.n_kept = 0;
             return;
         };
         let mut pend: Vec<Pending> = self.pending.drain().map(|(_, p)| p).collect();
         pend.sort_by_key(|p| p.seq);
         let n = pend.len();
+        self.n_kept = 0;
         for p in pend {
             if let Some(cmd) = p.cmd {
-                self.answer(
-                    &mem,
-                    CTRL_QUEUE,
-                    &cmd,
-                    &Self::nodata(p.flags, p.fence_id, p.ctx_id),
-                );
+                // the sink's answer if it came (kept behind a read back), else done here
+                let r = p
+                    .resp
+                    .unwrap_or_else(|| Self::nodata(p.flags, p.fence_id, p.ctx_id).to_vec());
+                self.answer(&mem, CTRL_QUEUE, &cmd, &r);
             }
         }
         self.fence_out = 0;
@@ -3304,6 +3748,7 @@ impl Gpu {
                 arg2: c.rx_id,
                 seq: if c.restored { c.link.lock().q.tx_id } else { 0 },
                 flags: SP_F_SPEC
+                    | SP_F_PIECES
                     | if c.link.z_level() != 0 { SP_F_ZSTD } else { 0 }
                     | if self.agent.is_some() { SP_F_SCROLL } else { 0 }
                     | if c.restored { SP_F_RESTORED } else { 0 },
@@ -3422,7 +3867,18 @@ impl Gpu {
         self.switch.is_none()
             && self.pending.is_empty()
             && self.parked.is_empty()
-            && self.conns.iter().all(|c| c.link.lock().q.unacked == 0)
+            && self.conns.iter().all(|c| {
+                let st = c.link.lock();
+                st.q.unacked == 0 && st.q.lane_bytes == 0
+            })
+    }
+
+    /// Before a snapshot, a move's stop or a checkpoint: the pieces of the lanes go into the
+    /// queues, so that what the state keeps as not acknowledged is the whole stream.
+    fn flush_lanes(&mut self) {
+        for c in &self.conns {
+            c.link.flush_lane();
+        }
     }
 
     /// Before a snapshot (the VM is paused): take no more commands, and wait at most 2 s until
@@ -3432,6 +3888,7 @@ impl Gpu {
     /// connection, and the connections close: what a renderer sends from now on is for the
     /// VM that resumes (it reconnects, `kick`), not for the snapshot.
     fn save_prepare(&mut self) {
+        self.flush_lanes();
         if self.active == GUEST {
             self.guest_save_prepare();
             return;
@@ -3548,6 +4005,7 @@ impl Gpu {
     /// (the way back of a move whose destination ran) says that it was restored, so that a
     /// renderer that the destination's device ran on goes back to this stop.
     fn move_prepare(&mut self) {
+        self.flush_lanes();
         let wanted = self.conns.iter().map(|c| c.wanted).collect();
         let pending = self.pending.len();
         let unacked: u64 = self
@@ -3575,6 +4033,7 @@ impl Gpu {
     /// connection: a resource written after it is marked again, so that a renderer that ran on
     /// after it can be reset to it (a takeover from it).
     fn checkpoint_prepare(&mut self) {
+        self.flush_lanes();
         for c in &mut self.conns {
             c.marked.clear();
         }
@@ -3715,6 +4174,20 @@ impl Gpu {
             c.n_ahead_video
         ));
         lines.push(pend);
+        let n_pieces = std::mem::take(&mut link.lock().n_pieces);
+        lines.push(format!(
+            "[SPACEBOX-REMOTE] source pieces: commands_in_pieces={} their_bytes={} known_touches={} notices={} pieces={} lane_bytes={} answers_kept={} kept_now={} decode_streams_not_known={} (command {})",
+            c.n_held,
+            c.held_bytes,
+            c.n_held_known,
+            c.n_notice,
+            n_pieces,
+            link.lane_bytes(),
+            c.n_answer_kept,
+            self.n_kept,
+            c.n_decode_other,
+            c.decode_other
+        ));
         for i in 0..64 {
             if self.ctx_qpoll[i] != 0 {
                 lines.push(format!(
@@ -3853,6 +4326,12 @@ impl Gpu {
         c.picture_bytes = 0;
         c.pictures_dropped = 0;
         c.pictures_late = 0;
+        c.n_held = 0;
+        c.held_bytes = 0;
+        c.n_held_known = 0;
+        c.n_notice = 0;
+        c.n_answer_kept = 0;
+        c.n_decode_other = 0;
         for l in lines {
             self.report(&l);
         }

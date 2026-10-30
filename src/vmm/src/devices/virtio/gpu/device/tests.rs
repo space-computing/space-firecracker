@@ -350,7 +350,7 @@ fn beyond_the_window_a_longer_age_while_the_guest_decodes_video() {
     let mut c = cfg("/nonexistent");
     c.fence_window = Some(2);
     c.fence_age_ms = Some(20);
-    // fence_age_video_ms: the default, 100
+    // fence_age_video_ms: the default, 350
     let mut r = rig_with(&mem, c);
     r.gpu.rtt_min_cur = 1000;
     r.give(submit(Some(1), 1, &[]));
@@ -371,8 +371,13 @@ fn beyond_the_window_a_longer_age_while_the_guest_decodes_video() {
     let n = r.give(submit(Some(5), 1, &[59]));
     assert!(r.answer_of(n).is_some());
     assert_eq!(r.gpu.counters.n_ahead_video, 2);
-    // Over 100 ms (and two round trips): no more, even with video.
-    r.gpu.fq[head] = now_us() - 150_000;
+    // Older than 350 ms and two round trips (the default age is the sink's pacing allowance's
+    // cap while video plays): no more, even with video.
+    r.gpu.fq[head] = now_us() - 300_000;
+    let n = r.give(submit(Some(51), 1, &[59]));
+    assert!(r.answer_of(n).is_some());
+    assert_eq!(r.gpu.counters.n_ahead_video, 3);
+    r.gpu.fq[head] = now_us() - 400_000;
     let n = r.give(submit(Some(6), 1, &[59]));
     assert!(r.answer_of(n).is_none());
     // A second after the last decode the short age is back.
@@ -380,7 +385,7 @@ fn beyond_the_window_a_longer_age_while_the_guest_decodes_video() {
     r.gpu.video_until = now_us() - 1;
     let n = r.give(submit(Some(7), 1, &[]));
     assert!(r.answer_of(n).is_none());
-    assert_eq!(r.gpu.counters.n_ahead, 2);
+    assert_eq!(r.gpu.counters.n_ahead, 3);
 }
 
 #[test]
@@ -745,6 +750,369 @@ fn the_stream_scan_pushes_and_expects() {
     assert!(s[4..].iter().all(|m| m.0.flags & SP_F_VIDEO != 0));
 }
 
+/// The messages of the write of notice `w`, put together from its pieces among `sent`.
+fn write_of(sent: &[(Hdr, Vec<u8>, Vec<u8>)], w: u64) -> Vec<(Hdr, Vec<u8>, Vec<u8>)> {
+    let mut bytes = Vec::new();
+    for (h, a, _) in sent.iter().filter(|m| m.0.typ == SP_PIECE && m.0.arg0 == w) {
+        assert_eq!(h.arg1, bytes.len() as u64);
+        bytes.extend_from_slice(a);
+    }
+    let mut out = Vec::new();
+    let mut o = 0;
+    while o < bytes.len() {
+        let h = Hdr::decode(&bytes[o..]).unwrap();
+        let a_end = o + HDR_LEN + h.a_len as usize;
+        let end = a_end + h.b_len as usize;
+        out.push((
+            h,
+            bytes[o + HDR_LEN..a_end].to_vec(),
+            bytes[a_end..end].to_vec(),
+        ));
+        o = end;
+    }
+    out
+}
+
+fn u32s(a: &[u8]) -> Vec<u32> {
+    a.chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect()
+}
+
+#[test]
+fn a_large_transfer_goes_as_a_notice_and_pieces_that_later_messages_pass() {
+    let mem = single_region_mem(0x400000);
+    let mut r = rig_with(&mem, cfg("/nonexistent"));
+    r.gpu.conns[USER].link.set_pieces(true);
+    // R8G8B8A8 (format 67), 512 x 256: 512 KiB.
+    let len = 512 * 256 * 4;
+    r.give(create_3d(5, 2, 67, 0, 512, 256));
+    r.give(attach(5, 0x100000, len));
+    let pix: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+    mem.write_slice(&pix, GuestAddress(0x100000)).unwrap();
+    let before = r.sent().len();
+    let t = transfer_3d(
+        CMD_TRANSFER_TO_HOST_3D,
+        Some(1),
+        5,
+        [0, 0, 0, 512, 256, 1],
+        0,
+        0,
+        0,
+    );
+    let n = r.give(t.clone());
+    let seq = r.gpu.seq;
+    // the guest's answer is as before
+    assert!(r.answer_of(n).is_some());
+    // a later small command goes before the pieces
+    r.give(hdr(CMD_RESOURCE_FLUSH, None, 0));
+    let s: Vec<_> = r.sent().into_iter().skip(before).collect();
+    let types: Vec<u32> = s.iter().map(|m| m.0.typ).collect();
+    assert_eq!(types, vec![SP_WMARK, SP_HOLD, SP_CTRL]);
+    // the notice: in pieces, no context, it writes 5 and reads nothing
+    let hold = s[1].0;
+    assert_eq!((hold.arg0, hold.arg1, hold.arg2), (1, 0, 1));
+    assert_eq!(u32s(&s[1].1), vec![5]);
+    let total = (HDR_LEN + t.len()) as u64 + u64::from(len);
+    assert_eq!(hold.seq, total);
+    let pieces = total.div_ceil(PIECE as u64);
+    assert_eq!(pieces, 9);
+    assert_eq!(
+        r.gpu.conns[USER].link.lane_bytes() as u64,
+        total + pieces * HDR_LEN as u64
+    );
+    assert_eq!(r.gpu.counters.n_held, 1);
+    assert_eq!(r.gpu.counters.n_held_known, 1);
+    // the pieces go into the queue as the writer takes them: the write is the command whole
+    let first = r.sent().len();
+    r.gpu.conns[USER].link.flush_lane();
+    let all = r.sent();
+    assert!(all[first..].iter().all(|m| m.0.typ == SP_PIECE));
+    let ids: Vec<u64> = all[first..].iter().map(|m| m.0.id).collect();
+    assert_eq!(
+        ids,
+        (all[first - 1].0.id + 1..=all[first - 1].0.id + pieces).collect::<Vec<_>>()
+    );
+    let w = write_of(&all, hold.id);
+    assert_eq!(w.len(), 1);
+    let (h, a, b) = &w[0];
+    assert_eq!(
+        (h.typ, h.seq, h.id, h.arg1, h.arg2),
+        (SP_CTRL, seq, 0, 0, u64::from(len))
+    );
+    assert_eq!(a, &t);
+    assert_eq!(b, &pix);
+    // the pixels' pieces keep the compression's filter: from the bytes after the command
+    let f = r.gpu.conns[USER].link.lock().q.filters();
+    let f = &f[f.len() - usize::try_from(pieces).unwrap()..];
+    let fil = |off| {
+        Some(Filter {
+            off,
+            bpp: 4,
+            stride: 2048,
+        })
+    };
+    assert_eq!(f[0], fil(u32::try_from(HDR_LEN * 2 + t.len()).unwrap()));
+    assert!(f[1..].iter().all(|x| *x == fil(80)));
+    // the renderer has all of it once its last piece is acknowledged
+    let last = all.last().unwrap().0.id;
+    r.gpu.conns[USER].link.acked(last - 1);
+    assert_eq!(r.gpu.conns[USER].link.w_acked(), 0);
+    r.gpu.conns[USER].link.acked(last);
+    assert_eq!(r.gpu.conns[USER].link.w_acked(), hold.id);
+}
+
+#[test]
+fn a_small_command_and_a_renderer_without_pieces_go_whole() {
+    let mem = single_region_mem(0x400000);
+    let mut r = rig_with(&mem, cfg("/nonexistent"));
+    let len = 512 * 256 * 4;
+    r.give(create_3d(5, 2, 67, 0, 512, 256));
+    r.give(attach(5, 0x100000, len));
+    let before = r.sent().len();
+    // no pieces: whole, as before
+    r.give(transfer_3d(
+        CMD_TRANSFER_TO_HOST_3D,
+        None,
+        5,
+        [0, 0, 0, 512, 256, 1],
+        0,
+        0,
+        0,
+    ));
+    // with pieces but below 256 KiB: whole
+    r.gpu.conns[USER].link.set_pieces(true);
+    r.give(transfer_3d(
+        CMD_TRANSFER_TO_HOST_3D,
+        None,
+        5,
+        [0, 0, 0, 512, 127, 1],
+        0,
+        0,
+        0,
+    ));
+    let s: Vec<_> = r.sent().into_iter().skip(before).collect();
+    let types: Vec<u32> = s.iter().map(|m| m.0.typ).collect();
+    assert_eq!(types, vec![SP_WMARK, SP_CTRL, SP_CTRL]);
+    assert_eq!(s[1].2.len(), len as usize);
+    assert_eq!(s[2].2.len(), 512 * 127 * 4);
+    assert_eq!(r.gpu.conns[USER].link.lane_bytes(), 0);
+}
+
+/// A context with a video buffer of two planes (10, 11), a description buffer (6) and a
+/// bitstream buffer that lives only in the renderer (7, 512 KiB).
+fn video_rig(mem: &GuestMemoryMmap) -> Rig<'_> {
+    let mut r = rig_with(mem, cfg("/nonexistent"));
+    r.gpu.conns[USER].link.set_pieces(true);
+    r.give(ctx_create(1));
+    r.resource(10, 2, 1, 0, 64, 64, BACKING_AT);
+    r.resource(11, 2, 1, 0, 32, 32, BACKING_AT + 0x10000);
+    r.resource(6, 0, 64, 0, 256, 1, BACKING_AT + 0x20000);
+    r.give(create_3d(7, 0, 64, 1 << 17, 0x80000, 1));
+    r.give(attach(7, 0x100000, 0x80000));
+    // CREATE_VIDEO_BUFFER (55): handle 3, format, width, height, the planes
+    r.give(submit(None, 1, &[(7 << 16) | 55, 3, 1, 64, 64, 10, 11, 0]));
+    r
+}
+
+/// A decode into video buffer 3 of `size` bytes of bitstream, as Mesa sends it: the description
+/// written inline (RESOURCE_INLINE_WRITE, 9: 16 bytes into 6), then DECODE_BITSTREAM (59).
+fn decode(fence: Option<u64>, size: u32) -> Vec<u8> {
+    submit(
+        fence,
+        1,
+        &[
+            (1 << 16) | 28,
+            0,
+            (15 << 16) | 9,
+            6,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            16,
+            1,
+            1,
+            1,
+            2,
+            3,
+            4,
+            (5 << 16) | 59,
+            1,
+            3,
+            6,
+            7,
+            size,
+        ],
+    )
+}
+
+#[test]
+fn a_decodes_notice_names_what_it_writes_and_reads_and_its_contexts_later_streams_get_one() {
+    let mem = single_region_mem(0x400000);
+    let mut r = video_rig(&mem);
+    let before = r.sent().len();
+    // 320 KiB of bitstream: in pieces
+    r.give(decode(Some(1), 0x50000));
+    let s: Vec<_> = r.sent().into_iter().skip(before).collect();
+    let types: Vec<u32> = s.iter().map(|m| m.0.typ).collect();
+    assert_eq!(types, vec![SP_WMARK, SP_HOLD]);
+    let hold = s[1].0;
+    // it writes the description and the planes; it reads its buffers and every plane of its
+    // context's buffers
+    assert_eq!((hold.arg0, hold.arg1, hold.arg2), (1, 1, 3));
+    assert_eq!(u32s(&s[1].1), vec![6, 10, 11, 6, 7, 10, 11]);
+    r.gpu.conns[USER].link.flush_lane();
+    let all = r.sent();
+    let w = write_of(&all, hold.id);
+    let types: Vec<u32> = w.iter().map(|m| m.0.typ).collect();
+    assert_eq!(types, vec![SP_MEMWRITE, SP_MEMWRITE, SP_CTRL]);
+    assert_eq!((w[0].0.arg0, w[0].1.len()), (6, 256));
+    assert_eq!((w[1].0.arg0, w[1].1.len()), (7, 0x50000));
+    // the next decode of the context is small: whole, with a notice of what it touches (it may
+    // wait behind the first at the renderer)
+    let before = r.sent().len();
+    r.give(decode(Some(2), 1000));
+    let s: Vec<_> = r.sent().into_iter().skip(before).collect();
+    let types: Vec<u32> = s.iter().map(|m| m.0.typ).collect();
+    assert_eq!(types, vec![SP_HOLD, SP_MEMWRITE, SP_MEMWRITE, SP_CTRL]);
+    assert_eq!((s[0].0.arg0, s[0].0.arg1, s[0].0.arg2), (0, 1, 3));
+    assert_eq!(u32s(&s[0].1), vec![6, 10, 11, 6, 7, 10, 11]);
+    // a stream of the context that does more than decode: a notice of what it writes (here the
+    // buffer whose copy of the guest's memory it writes back, its expectation); what it reads
+    // is not known
+    let before = r.sent().len();
+    r.give(submit(None, 1, &[(1 << 16) | 50, 6]));
+    let s: Vec<_> = r.sent().into_iter().skip(before).collect();
+    let types: Vec<u32> = s.iter().map(|m| m.0.typ).collect();
+    assert_eq!(types, vec![SP_HOLD, SP_EXPECT, SP_CTRL]);
+    assert_eq!(s[0].0.arg2, 1 | HOLD_READS_UNKNOWN);
+    assert_eq!(u32s(&s[0].1), vec![6]);
+    assert_eq!(r.gpu.counters.n_decode_other, 0);
+    // (a stream that decodes and does more is counted, with the command)
+    r.give(submit(
+        None,
+        1,
+        &[(1 << 16) | 50, 6, (5 << 16) | 59, 1, 3, 6, 7, 1000],
+    ));
+    assert_eq!(
+        (r.gpu.counters.n_decode_other, r.gpu.counters.decode_other),
+        (1, 50)
+    );
+    // once the renderer has acknowledged the write's last piece, no notice
+    let last = all.last().unwrap().0.id;
+    r.gpu.conns[USER].link.acked(last);
+    let before = r.sent().len();
+    r.give(decode(Some(3), 1000));
+    let types: Vec<u32> = r.sent()[before..].iter().map(|m| m.0.typ).collect();
+    assert_eq!(types, vec![SP_MEMWRITE, SP_MEMWRITE, SP_CTRL]);
+    assert_eq!(r.gpu.counters.n_notice, 3);
+}
+
+#[test]
+fn a_decode_of_a_context_made_before_the_device_names_what_it_writes_but_not_what_it_reads() {
+    let mem = single_region_mem(0x400000);
+    let mut r = video_rig(&mem);
+    // as after a restore: the context's video buffers of before are not known
+    r.gpu.video_known.clear();
+    let before = r.sent().len();
+    r.give(decode(None, 0x50000));
+    let s: Vec<_> = r.sent().into_iter().skip(before).collect();
+    let hold = s.iter().find(|m| m.0.typ == SP_HOLD).unwrap();
+    assert_eq!((hold.0.arg0, hold.0.arg2), (1, 3 | HOLD_READS_UNKNOWN));
+    assert_eq!(u32s(&hold.1), vec![6, 10, 11]);
+    assert_eq!(r.gpu.counters.n_held_known, 0);
+}
+
+#[test]
+fn a_fenced_answer_waits_for_an_earlier_read_back_on_the_timeline() {
+    let mem = single_region_mem(0x200000);
+    let mut r = rig_with(&mem, cfg("/nonexistent"));
+    r.resource(5, 2, 1, 0, 64, 64, BACKING_AT);
+    // a fenced read back, and a fenced command of another context after it
+    let n0 = r.give(transfer_3d(
+        CMD_TRANSFER_FROM_HOST_3D,
+        Some(1),
+        5,
+        [0, 0, 0, 4, 1, 1],
+        0,
+        0,
+        0,
+    ));
+    let n1 = r.give(submit(Some(2), 2, &[]));
+    let seqs: Vec<u64> = r.sent().iter().rev().take(2).map(|m| m.0.seq).collect();
+    let (s1, s0) = (seqs[0], seqs[1]);
+    let base = r.used();
+    // the renderer ran the later one first (the read back waits for an earlier upload's
+    // pieces): its answer would complete fence 1 too, so it is kept
+    let a1 = hdr(RESP_OK_NODATA, Some(2), 2);
+    r.sink_says(SP_RESP, s1, &a1, &[], [0; 3]);
+    assert!(r.answer_of(n1).is_none());
+    assert_eq!(r.used(), base);
+    assert_eq!(r.gpu.n_kept, 1);
+    assert_eq!(r.gpu.counters.n_answer_kept, 1);
+    assert_eq!((r.gpu.hard_out, r.gpu.wait_out), (1, 1));
+    // no early answer meanwhile, as before
+    let n2 = r.give(submit(Some(3), 2, &[]));
+    assert!(r.answer_of(n2).is_none());
+    // the read back's data comes: it is answered with the data in memory, then the kept one
+    let data = [7u8; 16];
+    r.sink_says(SP_RESP, s0, &hdr(RESP_OK_NODATA, Some(1), 0), &data, [0; 3]);
+    let mut got = [0u8; 16];
+    mem.read_slice(&mut got, GuestAddress(BACKING_AT)).unwrap();
+    assert_eq!(got, data);
+    assert_eq!(r.used(), base + 2);
+    let heads: Vec<u32> = (base..base + 2)
+        .map(|i| r.ctrl.used.ring[i as usize].get().id)
+        .collect();
+    assert_eq!(
+        heads,
+        vec![
+            u32::try_from(n0 % 16).unwrap(),
+            u32::try_from(n1 % 16).unwrap()
+        ]
+    );
+    assert_eq!(&r.answer_of(n1).unwrap()[..24], &a1[..]);
+    assert_eq!((r.gpu.n_kept, r.gpu.hard_out), (0, 0));
+}
+
+#[test]
+fn a_kept_answer_is_given_when_the_renderer_is_lost_and_goes_through_a_snapshot() {
+    let mem = single_region_mem(0x200000);
+    let mut r = rig_with(&mem, cfg("/nonexistent"));
+    r.resource(5, 2, 1, 0, 64, 64, BACKING_AT);
+    let n0 = r.give(transfer_3d(
+        CMD_TRANSFER_FROM_HOST_3D,
+        Some(1),
+        5,
+        [0, 0, 0, 4, 1, 1],
+        0,
+        0,
+        0,
+    ));
+    let n1 = r.give(submit(Some(2), 2, &[]));
+    let s1 = r.sent().last().unwrap().0.seq;
+    let mut a1 = hdr(RESP_OK_NODATA, Some(2), 2);
+    a1[20] = 0x33;
+    r.sink_says(SP_RESP, s1, &a1, &[], [0; 3]);
+    assert!(r.answer_of(n1).is_none());
+    // through a snapshot: the kept answer is in the state
+    let st = through_a_snapshot(&r.gpu);
+    let side = st.side.as_ref().unwrap();
+    assert_eq!(side.pending.iter().filter(|p| p.resp.is_some()).count(), 1);
+    let mut g = restored(&mem, &st);
+    assert_eq!((g.n_kept, g.hard_out), (1, 1));
+    // the renderer lost: everything is answered here, the kept one with the renderer's answer
+    g.drop_pending();
+    g.notify_used();
+    assert_eq!(resp_type(&r.answer_of(n0).unwrap()), RESP_OK_NODATA);
+    assert_eq!(&r.answer_of(n1).unwrap()[..24], &a1[..]);
+    assert_eq!(g.n_kept, 0);
+}
+
 #[test]
 fn a_resource_is_marked_once_until_the_next_mark_point() {
     let mem = single_region_mem(0x200000);
@@ -984,7 +1352,7 @@ fn hello_compression_resume_and_a_new_sink() {
     let h = sink.read_hello();
     assert_eq!(
         (h.typ, h.arg1, h.arg2, h.flags),
-        (SP_HELLO, 0, 0, SP_F_SPEC | SP_F_ZSTD)
+        (SP_HELLO, 0, 0, SP_F_SPEC | SP_F_PIECES | SP_F_ZSTD)
     );
     let session = h.arg0;
     assert_ne!(session, 0);
@@ -1146,7 +1514,7 @@ fn input_scroll_and_sound_go_through_the_connection() {
     };
     // With an agent's channel the HELLO says that the scroll goes in the stream.
     let h = sink.read_hello();
-    assert_eq!(h.flags, SP_F_SPEC | SP_F_ZSTD | SP_F_SCROLL);
+    assert_eq!(h.flags, SP_F_SPEC | SP_F_PIECES | SP_F_ZSTD | SP_F_SCROLL);
     sink.hello(0xabc, h.arg0, 0, false);
     pump(&mut r.gpu, |g| g.conns[USER].up());
 

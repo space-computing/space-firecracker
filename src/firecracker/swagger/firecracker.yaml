@@ -2134,7 +2134,7 @@ definitions:
         minimum: 0
         description:
           The same age while the guest decodes video, from each decode command until one
-          second after it (default 100).
+          second after it (default 350).
       tx_limit_mib:
         type: integer
         minimum: 1
