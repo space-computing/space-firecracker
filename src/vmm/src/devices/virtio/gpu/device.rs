@@ -140,6 +140,9 @@ const BACKLOG_RETRY: Duration = Duration::from_millis(1);
 /// With an in-guest renderer: how long the user's renderer may be gone or silent before the
 /// in-guest renderer takes over.
 const TAKEOVER_US: i64 = 10_000_000;
+/// How long the old renderer of a planned switch may give the switch nothing before it counts as
+/// lost ([`Gpu::check_switch`]). Its export takes longer on a slow link, and each piece counts.
+const SWITCH_OLD_US: i64 = 10_000_000;
 /// With no in-guest renderer: how long a renderer that was paired and is lost is waited for (the
 /// guest's commands wait for it, and it resumes) before the device serves the guest alone and
 /// the renderer starts empty when it comes back: longer than the cut of 60 s that the screen
@@ -399,6 +402,8 @@ pub(crate) struct Switch {
     pub(crate) to: usize,
     pub(crate) phase: Phase,
     t0: i64,
+    /// When the old renderer last gave the switch something ([`Gpu::check_switch`]).
+    old_seen: i64,
     kept: BTreeSet<u32>,
     scanout: Option<u32>,
     msgs: u64,
@@ -2596,6 +2601,7 @@ impl Gpu {
                 if let Some(mem) = mem {
                     self.resp(&mem, h, a, b);
                 }
+                self.switch_old_seen(ci);
                 self.switch_drained();
             }
             SP_INPUT => self.input(a),
@@ -2996,6 +3002,7 @@ impl Gpu {
             to,
             phase: Phase::Connect,
             t0: now_us(),
+            old_seen: 0,
             kept: BTreeSet::new(),
             scanout: None,
             msgs: 0,
@@ -3045,6 +3052,7 @@ impl Gpu {
             .collect();
         if sw.from.is_some() {
             sw.phase = Phase::Drain;
+            sw.old_seen = now_us();
             self.switch_drained();
         } else {
             let kept = sw.kept.clone();
@@ -3280,6 +3288,15 @@ impl Gpu {
         }
     }
 
+    /// The old renderer gave the switch something.
+    fn switch_old_seen(&mut self, ci: usize) {
+        if let Some(sw) = self.switch.as_mut()
+            && sw.from == Some(ci)
+        {
+            sw.old_seen = now_us();
+        }
+    }
+
     /// In a planned switch, once the old renderer has answered everything: first the scanout,
     /// so that the picture comes back after one resource, then the rest.
     fn switch_drained(&mut self) {
@@ -3339,6 +3356,7 @@ impl Gpu {
         }
         sw.chunks += 1;
         sw.chunk_bytes += b.len() as u64;
+        sw.old_seen = now_us();
         let to = sw.to;
         self.send_on(to, true, SP_IMPORT, 0, a, b, 0, 0, 0);
     }
@@ -3827,6 +3845,36 @@ impl Gpu {
         self.start_switch(None, GUEST, "the user's renderer was gone for 10 s");
     }
 
+    /// A planned switch waits for its old renderer only while that gives it something: a renderer
+    /// that has not answered a command of the guest, or stopped in its export, for
+    /// [`SWITCH_OLD_US`] is closed as lost. The guest is waiting for what it did not answer (a
+    /// fence of a cursor's upload stops the compositor), so the switch goes on with the journal.
+    fn check_switch(&mut self) {
+        let Some(sw) = self.switch.as_ref() else {
+            return;
+        };
+        let Some(from) = sw.from else {
+            return;
+        };
+        if !matches!(sw.phase, Phase::Drain | Phase::Scanout | Phase::Rest)
+            || now_us() - sw.old_seen <= SWITCH_OLD_US
+        {
+            return;
+        }
+        let msg = format!(
+            "spacebox remote gpu: {} has given the switch nothing for 10 s ({:?}, {} commands not answered, oldest {:?}), closing",
+            CONN_NAMES[from],
+            sw.phase,
+            self.pending.len(),
+            self.pending.values().min_by_key(|p| p.seq).map(|p| p.seq)
+        );
+        self.log_error(&msg);
+        // (the in-guest renderer starts empty the next time, as after a switch)
+        self.conns[from].wanted = from == USER;
+        self.disconnected(from);
+        self.conns[from].peer_session = 0;
+    }
+
     /// `sp_ack_timer`, every 100 ms.
     pub(crate) fn process_ack_timer(&mut self) {
         self.ack_timer.read();
@@ -3854,6 +3902,7 @@ impl Gpu {
             self.redraw();
         }
         self.check_takeover();
+        self.check_switch();
         self.say_answered_lost();
         if self.gpu_off && self.active == USER && self.switch.is_none() {
             // a toggle off that waits for the in-guest renderer's link

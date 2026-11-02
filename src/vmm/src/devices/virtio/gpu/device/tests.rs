@@ -3666,6 +3666,48 @@ fn the_users_toggle_switches_to_the_in_guest_renderer_and_back_with_the_users_li
 }
 
 #[test]
+fn a_planned_switch_closes_an_old_renderer_that_does_not_answer() {
+    let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+    let mem = single_region_mem(0x200000);
+    let (mut r, mut user, cp, _ul) = with_user_and_guest_socket(&mem, dir.as_path());
+    let mut g = toggled_off(&mut r, &mut user, &cp, 1);
+    // a fenced command that the in-guest renderer never answers, and the guest waits for
+    r.gpu.fence_window = 0;
+    r.give(hdr(CMD_RESOURCE_FLUSH, Some(7), 0));
+    assert_eq!(g.take(1), [(SP_CTRL, CMD_RESOURCE_FLUSH)]);
+    assert!(!r.gpu.pending.is_empty());
+    // On: the switch waits for it, and goes no further with time left
+    user.say(2, SP_GPU, &[], &[], 1);
+    pump2(&mut r.gpu, |g| {
+        g.switch
+            .as_ref()
+            .is_some_and(|s| s.to == USER && s.phase == Phase::Reset)
+    });
+    let (h, _, _) = until(&mut user, SP_STATE_RESET);
+    assert_eq!(h.arg0, 0);
+    user.say(3, SP_STATE_KEPT, &[], &[], 0);
+    pump2(&mut r.gpu, |g| {
+        g.switch.as_ref().is_some_and(|s| s.phase == Phase::Drain)
+    });
+    r.gpu.process_ack_timer();
+    assert_eq!(r.gpu.switch.as_ref().map(|s| s.phase), Some(Phase::Drain));
+    // Its time has passed: it is closed, the guest has its answer, the switch starts again from
+    // the journal with the new renderer reset once more
+    r.gpu.switch.as_mut().unwrap().old_seen -= SWITCH_OLD_US + 1;
+    r.gpu.process_ack_timer();
+    assert!(r.gpu.pending.is_empty());
+    assert!(!r.gpu.conns[GUEST].link.is_connected());
+    assert!(!r.gpu.conns[GUEST].wanted);
+    let (h, _, _) = until(&mut user, SP_STATE_RESET);
+    assert_eq!(h.arg0, 0);
+    user.say(4, SP_STATE_KEPT, &[], &[], 0);
+    pump2(&mut r.gpu, |g| g.switch.is_none());
+    assert_eq!(r.gpu.active, USER);
+    assert!(!r.gpu.gpu_off);
+    drop(g);
+}
+
+#[test]
 fn a_sudden_loss_with_the_toggle_off_stops_the_pictures_and_the_renderer_back_starts_on() {
     let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
     let mem = single_region_mem(0x200000);
